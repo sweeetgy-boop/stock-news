@@ -29,6 +29,7 @@ stocknews/
   exits.py       청산 규칙 엔진 (8계층 우선순위)
   flags.py       배제 플래그 공급원 (FDR 관리종목 · DART · 로컬 · 수동)
   krx_credit.py  신용잔고 자동 수집 가능성 진단 (결론: 불가 — 아래 절)
+  kiwoom.py      키움 OpenAPI+ 호출제한·계획·환경진단 (OCX 미접촉)
   backtest.py    워크포워드 이벤트 스터디 (운영 코드 절단 호출)
   trading_day.py 거래일 판정 (주말 · 공휴일 자기학습 캐시)
   joblock.py     잡 단위 파일 락
@@ -36,7 +37,8 @@ stocknews/
   notify.py      4중 게이트 + 발송
   data.py        pykrx / FinanceDataReader 로더
 run_screen.py    실행부
-smoke_test.py    스모크 테스트 146건 (네트워크·실DB 미사용)
+kiwoom_bridge.py 키움 OCX 브릿지 (★ 32비트 파이썬 전용, 조회만)
+smoke_test.py    스모크 테스트 158건 (네트워크·실DB 미사용)
 verify_env.py    requirements.txt 핀 대조 + 런타임 기능 점검
 hermes/run.cmd   실행 래퍼 (에이전트는 반드시 이걸 쓴다)
 ```
@@ -85,7 +87,7 @@ ElementTree) · 미선언 전이 의존성 경고를 확인한다.
 반드시 먼저 돌리십시오.
 
 ```bash
-hermes\run.cmd smoke        # 146건 검사 (권장 — 인코딩·인터프리터 처리됨)
+hermes\run.cmd smoke        # 158건 검사 (권장 — 인코딩·인터프리터 처리됨)
 hermes\run.cmd smoke -v     # 실패 시 트레이스백까지
 ```
 
@@ -502,10 +504,12 @@ data/export/tickers_20260824.csv        종목 마스터
 
 ## 미완성 항목
 
-- 종목별 신용잔고 자동 수집은 **불가능하다.** 데이터가 공개되지 않는다
-  (위 '신용잔고' 절의 실측 근거 참조). 수동 CSV 경로를 쓰고, 넣지 않은
-  종목은 평균단가 P0 를 매물대 POC 로 추정하므로 청산 밴드의 정확도가
-  떨어진다. 실측 자동화는 증권사 API 연결이 유일한 방법이다.
+- 종목별 신용잔고는 **공개 소스로 자동 수집이 불가능하다.** 데이터가
+  공개되지 않는다(위 '신용잔고' 절의 실측 근거 참조). 키움 OpenAPI+
+  경로를 넣어뒀지만 **아직 실제 조회로 검증하지 않았다.** 32비트 파이썬
+  환경(`venv32`)이 아직 없고, OPT10013 의 출력 필드명도 `--discover` 로
+  확정해야 한다. 그때까지는 수동 CSV 경로를 쓰고, 넣지 않은 종목은
+  평균단가 P0 를 매물대 POC 로 추정하므로 청산 밴드 정확도가 떨어진다.
 - 섹터 분산 제한이 **비활성 상태다.** `fill_sectors` 가 FDR 상장목록에서
   업종 컬럼을 찾는데, 현재 응답에 `Sector`/`Industry` 가 없다(`Dept` 는
   소속부라 업종이 아니다). 추천 10선의 섹터 편중을 막지 못한다.
@@ -769,12 +773,101 @@ hermes\run.cmd --mode credit         # 수동 CSV 주입 (현재 유일하게 �
 `--bld` 로 확인한 뒤 `.env` 의 `KRX_CREDIT_BLD` 에 고정하면 코드 수정 없이
 살아납니다.
 
-실측을 자동화하려면 **증권사 API 가 유일한 경로**입니다. 키움 OpenAPI+ 의
-`opt10013`(신용매매동향)이 종목별 융자잔고를 줍니다. 다만 32비트 파이썬 +
-OCX + 계좌 로그인이 필요해 이 저장소만으로는 구성할 수 없습니다.
-
 `KRX_CREDIT_BLD` 를 지정하지 않으면 **네트워크 요청조차 하지 않습니다.**
 수동 값은 항상 자동 수집을 덮어씁니다.
+
+## 키움 OpenAPI+ — 신용잔고 실측 자동화
+
+종목별 신용잔고를 실제로 주는 유일한 자동 경로다. TR 규격은
+`C:\OpenAPI` 의 키움 정의 파일에서 직접 확인했다(추측 아님).
+
+```
+OPT10013  신용매매동향요청   화면 0141
+          입력: 종목코드 / 일자(YYYYMMDD) / 조회구분(1:융자, 2:대주)
+OPT10033  신용비율상위요청   상위 랭킹. 요청 1회로 과열 종목
+OPT10014  공매도추이요청     화면 0142. 죽은 pykrx 공매도 경로 대체 가능
+OPW20016  신용융자 가능종목요청
+```
+
+출처: `koatrinputlegend.ini`(입력 필드), `koascreentrmap.ini`(화면↔TR).
+
+### 프로세스가 분리된 이유
+
+OpenAPI+ 는 **32비트 OCX(COM)** 다. 본체는 64비트 파이썬이고, 64비트
+프로세스는 32비트 OCX 를 인프로세스로 로드할 수 없다. 레지스트리 실측:
+`InprocServer32` 가 `WOW6432Node` 아래에만 있다(32비트 전용 등록).
+
+```
+[32비트] kiwoom_bridge.py  -->  data/credit_kiwoom.csv
+[64비트] run.cmd --mode credit   (기존 적재 경로, 테스트됨)
+```
+
+`credit_manual.csv` 와 다른 파일에 쓴다. 사람이 넣은 값을 덮어쓰지 않기
+위해서다. 적재 순서가 자동 → 수동이라 사람 값이 이긴다.
+
+### 호출 제한이 설계를 결정한다
+
+```
+초당 5건 / 분당 100건 / 시간당 1,000건
+```
+
+**시간당 1,000건이 지배적이다.** 안전마진 900/시간으로 계산한 실측값:
+
+```
+  300종목  ->    3.1분     <- 이걸 쓴다
+  900종목  ->    9.4분
+1,000종목  ->   61.0분     <- 시간 절벽
+2,874종목  ->  3.02시간    <- 전종목. 매일 불가
+```
+
+900건을 넘는 순간 첫 요청이 창을 벗어날 때까지 최대 1시간을 기다린다.
+게다가 제한에 걸리면 키움이 프로그램 재실행을 요구한다(`rc=-200`).
+
+그래서 전수조사를 하지 않는다. 대상은 이 값이 판정을 바꾸는 종목만
+고른다.
+
+```
+1순위  보유 포지션      청산 계층 6(신용 재급증)이 여기서만 작동한다
+2순위  최근 추천 종목    진입 전에 실측이 있어야 한다
+3순위  밴드 근처 종목    band_pos 낮은 순. 다음 후보군
+```
+
+나머지는 지금처럼 매물대 POC 프록시로 남는다. 그게 정직하다.
+
+### 준비 (한 번만)
+
+```bash
+hermes\run.cmd --mode kiwoom-plan          # 환경·계획 확인 (조회 없음)
+
+py -3.12-32 -m venv venv32                 # 32비트 파이썬 필요
+venv32\Scripts\pip install pywin32 PyQt5
+venv32\Scripts\python kiwoom_bridge.py --check
+venv32\Scripts\python kiwoom_bridge.py --discover
+```
+
+`--discover` 가 필요한 이유: OPT10013 의 **출력** 필드명이
+`C:\OpenAPI\data\opt10013.enc` 로 암호화돼 있어 오프라인으로 읽을 수
+없다. 후보를 실제 응답에 대보고 맞는 것만 `data/kiwoom_fields.json` 에
+고정한다. 다음 실행부터는 탐침을 건너뛴다.
+
+### 일상 사용
+
+```bash
+hermes\run.cmd --mode kiwoom-plan --write-targets data/kiwoom_targets.txt
+venv32\Scripts\python kiwoom_bridge.py --plan-file data/kiwoom_targets.txt
+hermes\run.cmd --mode credit
+```
+
+### 주의
+
+- 브릿지는 **로그인 창이 뜨는 대화형 프로그램**이다. 자동화 에이전트가
+  실행하면 안 된다. `AGENTS.md` 11장에 그렇게 적어뒀다.
+- **로그인은 실서버로 하라.** 모의투자만 3개월 접속하면 서비스가 자동
+  해지된다.
+- 브릿지는 조회 함수만 쓴다. `SendOrder` / `SendOrderCredit` 를 호출하지
+  않는다. 이 시스템은 주문을 내지 않는다.
+- 키움 규정상 OpenAPI 사용 계좌는 한국거래소에 **알고리즘 계좌로 등록될
+  수 있다.** 조회만 해도 해당된다.
 
 ## 전종목 시세 소스 — KRX 엔드포인트 중단 대응
 

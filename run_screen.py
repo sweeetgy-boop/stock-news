@@ -52,6 +52,8 @@ from stocknews.backtest import (BacktestConfig, control_random, control_rsi,
                                 run_backtest, simulate_exit_rules,
                                 summarize, summarize_exits, sweep_thresholds)
 from stocknews.flags import flag_summary, refresh_credit, refresh_flags
+from stocknews.kiwoom import build_plan as kiwoom_plan
+from stocknews.kiwoom import check_environment as kiwoom_env
 from stocknews.krx_credit import diagnose as krx_diagnose
 from stocknews.krx_credit import refresh_credit_auto
 from stocknews.joblock import JobLock, clear_locks
@@ -508,6 +510,77 @@ def mode_credit_probe(store: Store, args) -> int:
     return EXIT_OK if rep.get("verdict") == "가능" else EXIT_PRECOND
 
 
+def mode_kiwoom_plan(store: Store, args) -> int:
+    """키움 OpenAPI+ 수집 계획 + 환경 준비도.
+
+    OCX 를 건드리지 않으므로 64비트 본체에서 그대로 돌아간다. 실제 조회는
+    32비트 `kiwoom_bridge.py` 가 한다.
+
+    전종목이 왜 안 되는지를 말이 아니라 수치로 낸다. 시간당 1,000건
+    제한이 지배적이라 2,800종목은 세 시간이 걸린다.
+    """
+    env = kiwoom_env()
+    plan = kiwoom_plan(store, limit=args.kw_limit, scan_days=args.kw_days)
+    SUMMARY["kiwoom_env"] = {k: v for k, v in env.items() if k != "missing"}
+    SUMMARY["kiwoom_plan"] = {k: v for k, v in plan.items() if k != "tickers"}
+
+    bit_note = ""
+    if env.get("ocx_wow64_only"):
+        bit_note = "  (InprocServer32 가 WOW6432Node 에만 = 32비트 전용)"
+    print(f"\n키움 OpenAPI+ 환경  (파이썬 {env['python_bits']}비트)")
+    print(f"  OCX 파일       {env['ocx_inproc_path'] or '없음'}")
+    print(f"  COM 등록       {env['ocx_registered']}{bit_note}")
+    print(f"  TR 정의 파일   {env['tr_defs']}")
+    print(f"  pywin32 {env['win32com']}   PyQt5 {env['PyQt5']}   "
+          f"KOA Studio {env['koa_studio']}")
+    print(f"  준비 완료      {env['ready']}")
+    if env["missing"]:
+        print("\n  남은 준비:")
+        for i, m in enumerate(env["missing"], 1):
+            print(f"    {i}. {m}")
+
+    lim = plan["limits"]
+    print(f"\n호출 제한  초당 {lim['per_second']} / 분당 {lim['per_minute']} "
+          f"/ 시간당 {lim['per_hour']}  (안전마진 적용 "
+          f"{plan['safe_limits']['per_hour']}/시간)")
+    print("  분당·시간당 제한에 걸리면 프로그램을 재실행해야 하므로 "
+          "여유를 둡니다.")
+
+    print(f"\n수집 대상  {plan['targets']}종목 / 활성 {plan['active_tickers']}종목")
+    for reason, n in plan["by_reason"].items():
+        print(f"    {reason:12s} {n}종목")
+    print(f"\n  예상 소요    {plan['eta_sec'] / 60:.1f}분  "
+          f"({plan['requests']}건)")
+    print(f"  전수조사면   {plan['full_scan_eta_sec'] / 3600:.2f}시간  "
+          f"({plan['full_scan_requests']}건)  <- 매일 불가")
+    if not plan["feasible_daily"]:
+        print("  ! 대상이 많아 1시간을 넘습니다. --kw-limit 을 줄이십시오.")
+
+    cov = plan.get("coverage_now")
+    if cov:
+        print(f"\n현재 신용잔고 커버리지  {cov['with_credit']}/{cov['active']}종목"
+              f" · 기준일 {cov['asof'] or '-'}")
+
+    if args.write_targets:
+        p = Path(args.write_targets)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(plan["tickers"]) + "\n", encoding="utf-8")
+        print(f"\n대상 목록 기록 -> {p}  ({len(plan['tickers'])}종목)")
+        print("  32비트 브릿지에서:")
+        print(f"    venv32\\Scripts\\python kiwoom_bridge.py "
+              f"--plan-file {p}")
+    else:
+        print("\n  목록을 파일로 뽑으려면: --write-targets "
+              "data/kiwoom_targets.txt")
+    print()
+
+    if not plan["targets"]:
+        log.warning("대상이 0종목입니다. 먼저 --mode daily 로 스캔 이력을 "
+                    "만들거나 포지션을 등록하십시오.")
+        return EXIT_PRECOND
+    return EXIT_OK if env["ready"] else EXIT_PRECOND
+
+
 def mode_credit(store: Store, args) -> int:
     """신용잔고 주입. 이 시스템 핵심 가설의 데이터 구멍을 메운다.
 
@@ -911,6 +984,7 @@ MODES = {
     "flags": mode_flags,
     "credit": mode_credit,
     "credit-probe": mode_credit_probe,
+    "kiwoom-plan": mode_kiwoom_plan,
     "backtest": mode_backtest,
     "export": mode_export,
     "exits": mode_exits,
@@ -1013,6 +1087,13 @@ def main(argv=None) -> int:
     ap.add_argument("--bld", help="credit/credit-probe: KRX bld 코드 직접 지정")
     ap.add_argument("--no-krx", action="store_true",
                     help="credit: KRX 자동 수집 없이 수동 CSV 만 사용")
+    # ── 키움 OpenAPI+ ──
+    ap.add_argument("--kw-limit", type=int, default=300,
+                    help="kiwoom-plan: 수집 대상 상한 (기본 300)")
+    ap.add_argument("--kw-days", type=int, default=5,
+                    help="kiwoom-plan: 스캔/추천 이력 조회 일수 (기본 5)")
+    ap.add_argument("--write-targets",
+                    help="kiwoom-plan: 대상 종목코드를 이 파일에 기록")
     # ── 백테스트 ──
     ap.add_argument("--bt-step", type=int, default=5,
                     help="backtest: 평가 간격(거래일). 1이면 전수")

@@ -8,6 +8,8 @@
 venv/
 .venv/
 env/
+# 키움 OCX 브릿지용 32비트 전용 환경
+venv32/
 
 # ── 파이썬 산출물 ──
 __pycache__/

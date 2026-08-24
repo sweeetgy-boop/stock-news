@@ -1502,6 +1502,153 @@ def test_market_source(tmp: Path):
     check("market_source", "주말 즉시 생략", t_weekend_short_circuits)
 
 
+def test_kiwoom(tmp: Path):
+    """키움 OpenAPI+ 제한기·계획기·CSV. OCX 없이 검증되는 부분만.
+
+    호출 제한이 이 연동의 설계를 결정한다. 시간당 1,000건이 지배적이라
+    전종목은 불가능하다. 그 계산이 맞는지 확인한다.
+    """
+    from stocknews.flags import load_manual_credit
+    from stocknews.kiwoom import (CREDIT_FIELD_CANDIDATES, LIMIT_PER_HOUR,
+                                  LIMIT_PER_MINUTE, LIMIT_PER_SECOND,
+                                  RateLimiter, SAFE_PER_HOUR, TR_CREDIT_TREND,
+                                  TR_INPUTS, build_plan, check_environment,
+                                  estimate_seconds, load_field_map,
+                                  save_field_map, select_targets,
+                                  write_credit_csv)
+    from stocknews.store import Store
+
+    def t_official_limits():
+        # 키움 공식값. 바뀌면 여기서 잡힌다.
+        assert (LIMIT_PER_SECOND, LIMIT_PER_MINUTE, LIMIT_PER_HOUR) \
+            == (5, 100, 1000)
+
+    def t_tr_inputs_verified():
+        # koatrinputlegend.ini 실측 입력 필드
+        assert TR_CREDIT_TREND == "opt10013"
+        assert TR_INPUTS[TR_CREDIT_TREND] == ("종목코드", "일자", "조회구분")
+
+    def t_limiter_second_window():
+        lim = RateLimiter(per_second=2, per_minute=99, per_hour=999,
+                          clock=lambda: 0.0)
+        lim.record(now=0.0)
+        lim.record(now=0.1)
+        near(lim.wait_seconds(now=0.1), 0.9, tol=1e-9, label="초당 대기")
+        near(lim.wait_seconds(now=1.05), 0.0, tol=1e-9, label="창 벗어남")
+
+    def t_limiter_hour_cliff():
+        # 시간당 상한을 채우면 창이 비워질 때까지 기다려야 한다.
+        lim = RateLimiter(per_second=5, per_minute=100, per_hour=3,
+                          clock=lambda: 0.0)
+        for t in (0.0, 1.0, 2.0):
+            lim.record(now=t)
+        near(lim.wait_seconds(now=2.0), 3598.0, tol=1e-9, label="시간 절벽")
+
+    def t_limiter_never_exceeds():
+        """가상 시계로 500건을 돌려 어느 창도 상한을 넘지 않는지 확인."""
+        caps = (3, 20, 50)
+        lim = RateLimiter(*caps, clock=lambda: 0.0)
+        t = 0.0
+        stamps = []
+        for _ in range(120):
+            t += lim.wait_seconds(now=t)
+            lim.record(now=t)
+            stamps.append(t)
+        for span, cap in ((1.0, caps[0]), (60.0, caps[1]), (3600.0, caps[2])):
+            for s in stamps:
+                n = sum(1 for x in stamps if s - span < x <= s)
+                assert n <= cap, f"{span}s 창에서 {n} > {cap}"
+
+    def t_eta_matches_limiter():
+        # 예측과 실제 제한기가 같은 로직이어야 한다.
+        n = 40
+        lim = RateLimiter(4, 10, 999, clock=lambda: 0.0)
+        t = 0.0
+        for _ in range(n):
+            t += lim.wait_seconds(now=t)
+            lim.record(now=t)
+        near(estimate_seconds(n, 4, 10, 999), t, tol=1e-9, label="ETA 일치")
+
+    def t_full_scan_infeasible():
+        """전종목이 왜 안 되는지가 수치로 나와야 한다."""
+        assert estimate_seconds(0) == 0.0
+        short = estimate_seconds(300, per_hour=SAFE_PER_HOUR)
+        full = estimate_seconds(2874, per_hour=SAFE_PER_HOUR)
+        assert short < 600, short          # 300종목은 10분 안
+        assert full > 2 * 3600, full       # 전종목은 2시간 초과
+        # 시간당 상한을 넘는 순간 절벽이 생긴다
+        assert estimate_seconds(SAFE_PER_HOUR + 1, per_hour=SAFE_PER_HOUR) \
+            > 3000
+
+    def t_env_shape():
+        env = check_environment(openapi_dir=str(tmp / "nope"))
+        for k in ("python_bits", "ocx_present", "ocx_registered",
+                  "missing", "ready"):
+            assert k in env, k
+        assert env["ocx_present"] is False
+        assert any("없습니다" in m for m in env["missing"])
+
+    def t_plan_and_targets():
+        st = Store(tmp / "kw.db")
+        st.upsert_tickers([{"ticker": "005930", "name": "삼성전자",
+                            "market": "KOSPI"},
+                           {"ticker": "000660", "name": "SK하이닉스",
+                            "market": "KOSPI"}])
+        # 스캔 이력이 없으면 대상 0
+        assert select_targets(st, limit=10) == []
+        plan = build_plan(st, limit=10)
+        assert plan["targets"] == 0
+        assert plan["active_tickers"] == 2
+        assert plan["full_scan_requests"] == 2
+        assert plan["feasible_daily"] is True
+
+    def t_csv_roundtrip():
+        """브릿지가 쓴 CSV 가 기존 적재 파서로 읽혀야 한다."""
+        p = tmp / "credit_kiwoom.csv"
+        n = write_credit_csv([
+            {"ticker": "5930", "ratio": 0.42, "shares": None,
+             "asof": "2026-08-24", "note": "kiwoom:opt10013"},
+            {"ticker": "086520", "ratio": None, "shares": 1234567,
+             "asof": "2026-08-24", "note": None},
+            {"ticker": "bad", "ratio": 1.0, "shares": None, "asof": ""},
+            {"ticker": "329180", "ratio": None, "shares": None, "asof": ""},
+        ], p)
+        assert n == 2, n
+        rows = load_manual_credit(p)
+        assert len(rows) == 2, rows
+        by = {r["ticker"]: r for r in rows}
+        assert "005930" in by, list(by)          # zfill 되어야 한다
+        near(by["005930"]["ratio"], 0.42, label="비율 왕복")
+        assert by["005930"]["asof"] == "2026-08-24"
+        near(by["086520"]["shares"], 1234567, label="주식수 왕복")
+        assert by["086520"]["ratio"] is None
+
+    def t_field_map_roundtrip():
+        p = tmp / "fields.json"
+        assert load_field_map(p) == {}
+        save_field_map({"_recordname": "신용매매동향", "loan_ratio": "잔고비율"}, p)
+        got = load_field_map(p)
+        assert got["loan_ratio"] == "잔고비율", got
+
+    def t_field_candidates_are_probes():
+        # 후보는 '탐침용'이다. 잔고/비율 후보가 반드시 있어야 한다.
+        assert CREDIT_FIELD_CANDIDATES["loan_balance"]
+        assert CREDIT_FIELD_CANDIDATES["loan_ratio"]
+
+    check("kiwoom", "공식 호출 제한값", t_official_limits)
+    check("kiwoom", "TR 입력 규격 (실측)", t_tr_inputs_verified)
+    check("kiwoom", "초당 창", t_limiter_second_window)
+    check("kiwoom", "시간당 절벽", t_limiter_hour_cliff)
+    check("kiwoom", "어떤 창도 초과 안 함", t_limiter_never_exceeds)
+    check("kiwoom", "ETA = 제한기 동일 로직", t_eta_matches_limiter)
+    check("kiwoom", "전종목 불가 · 샷리스트 가능", t_full_scan_infeasible)
+    check("kiwoom", "환경 진단 형태", t_env_shape)
+    check("kiwoom", "수집 계획", t_plan_and_targets)
+    check("kiwoom", "CSV 왕복 (기존 파서 호환)", t_csv_roundtrip)
+    check("kiwoom", "필드 매핑 왕복", t_field_map_roundtrip)
+    check("kiwoom", "필드 후보 존재", t_field_candidates_are_probes)
+
+
 def test_docs():
     """라이선스와 면책 조항이 있어야 한다. 금융 코드의 필수 요건이다."""
     root = Path(__file__).parent
@@ -1633,7 +1780,7 @@ def test_agent_contract():
         unknown = mod._WRITE_MODES - set(mod.MODES)
         assert not unknown, f"_WRITE_MODES 에 없는 모드: {unknown}"
         for ro in ("weekly", "fib", "export", "pos-list", "brief-weekly",
-                   "backtest", "credit-probe"):
+                   "backtest", "credit-probe", "kiwoom-plan"):
             assert ro not in mod._WRITE_MODES, f"{ro} 는 읽기 전용이어야 한다"
         for rw in ("daily", "update", "flags", "exits", "credit"):
             assert rw in mod._WRITE_MODES, f"{rw} 가 락 대상이 아니다"
@@ -1846,7 +1993,8 @@ def test_imports():
         expect = {"master", "backfill", "update", "daily", "weekly", "fib",
                   "flash", "news", "brief-morning", "brief-evening",
                   "brief-weekly", "flags", "exits", "pos-open", "pos-list",
-                  "fill", "pos-close", "credit", "credit-probe", "export",
+                  "fill", "pos-close", "credit", "credit-probe",
+                  "kiwoom-plan", "export",
                   "backtest"}
         missing = expect - set(mod.MODES)
         assert not missing, f"MODES 누락: {missing}"
@@ -1966,6 +2114,7 @@ def main() -> int:
         test_backtest(tmp)
         test_krx_credit()
         test_market_source(tmp)
+        test_kiwoom(tmp)
         test_docs()
         test_joblock(tmp)
         test_agent_contract()
