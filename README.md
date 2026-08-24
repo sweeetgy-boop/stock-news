@@ -28,7 +28,7 @@ stocknews/
   news.py        뉴스 정리 (중복제거 · 사건 클러스터 · 종목태깅 · 중요도)
   exits.py       청산 규칙 엔진 (8계층 우선순위)
   flags.py       배제 플래그 공급원 (FDR 관리종목 · DART · 로컬 · 수동)
-  krx_credit.py  종목별 신용잔고 수집 (bld 코드 미확정 — 아래 '신용잔고' 절)
+  krx_credit.py  신용잔고 자동 수집 가능성 진단 (결론: 불가 — 아래 절)
   backtest.py    워크포워드 이벤트 스터디 (운영 코드 절단 호출)
   trading_day.py 거래일 판정 (주말 · 공휴일 자기학습 캐시)
   joblock.py     잡 단위 파일 락
@@ -36,7 +36,7 @@ stocknews/
   notify.py      4중 게이트 + 발송
   data.py        pykrx / FinanceDataReader 로더
 run_screen.py    실행부
-smoke_test.py    스모크 테스트 135건 (네트워크·실DB 미사용)
+smoke_test.py    스모크 테스트 146건 (네트워크·실DB 미사용)
 verify_env.py    requirements.txt 핀 대조 + 런타임 기능 점검
 hermes/run.cmd   실행 래퍼 (에이전트는 반드시 이걸 쓴다)
 ```
@@ -85,7 +85,7 @@ ElementTree) · 미선언 전이 의존성 경고를 확인한다.
 반드시 먼저 돌리십시오.
 
 ```bash
-hermes\run.cmd smoke        # 135건 검사 (권장 — 인코딩·인터프리터 처리됨)
+hermes\run.cmd smoke        # 146건 검사 (권장 — 인코딩·인터프리터 처리됨)
 hermes\run.cmd smoke -v     # 실패 시 트레이스백까지
 ```
 
@@ -502,12 +502,13 @@ data/export/tickers_20260824.csv        종목 마스터
 
 ## 미완성 항목
 
-- 종목별 신용잔고 자동 수집은 **코드는 있고 bld 코드가 미확정**이다.
-  `krx_credit.py` 가 KRX 정보데이터시스템을 호출하지만 '신용거래융자
-  종목별 잔고'의 bld 값을 확인하지 못했다. `--mode credit-probe` 로 후보를
-  탐침한 뒤 `.env` 의 `KRX_CREDIT_BLD` 에 고정해야 동작한다. 확정 전까지는
-  수동 CSV 경로를 쓰고, 넣지 않은 종목은 평균단가 P0 를 매물대 POC 로
-  추정하므로 청산 밴드의 정확도가 떨어진다.
+- 종목별 신용잔고 자동 수집은 **불가능하다.** 데이터가 공개되지 않는다
+  (위 '신용잔고' 절의 실측 근거 참조). 수동 CSV 경로를 쓰고, 넣지 않은
+  종목은 평균단가 P0 를 매물대 POC 로 추정하므로 청산 밴드의 정확도가
+  떨어진다. 실측 자동화는 증권사 API 연결이 유일한 방법이다.
+- 섹터 분산 제한이 **비활성 상태다.** `fill_sectors` 가 FDR 상장목록에서
+  업종 컬럼을 찾는데, 현재 응답에 `Sector`/`Industry` 가 없다(`Dept` 는
+  소속부라 업종이 아니다). 추천 10선의 섹터 편중을 막지 못한다.
 - 감사의견 판정은 공시 **제목** 키워드 스캔이라 취약하다. 의견거절이 제목에
   드러나지 않는 경우가 많다. 다만 그런 종목은 대개 관리종목으로 지정되어
   ①에서 잡힌다. 확실히 하려면 `flags_manual.csv`로 직접 지정하십시오.
@@ -725,34 +726,86 @@ python run_screen.py --mode backtest --bt-no-controls --bt-no-exits  # 빠른 �
 
 **결과는 실제보다 낙관적입니다.** 리포트 하단에 이 경고가 항상 출력됩니다.
 
-## 신용잔고 자동 수집
+## 신용잔고 — 자동 수집은 불가능합니다
+
+결론부터 적습니다. **종목별 신용거래융자 잔고는 공개되지 않습니다.**
+bld 코드를 못 찾은 게 아니라 데이터가 없습니다. 2026-08-24 에 후보 소스를
+전부 직접 두드려 확인했습니다.
+
+```
+KRX 정보데이터시스템   통계 메뉴 464개 전량 덤프 후 검색
+                       '융자' -> "인프라투융자회사 시세" 1건. 무관.
+                       '신용' -> 6건 전부 채권 발행사 신용등급
+                                 (13210 13211 14023 14024)
+                       '잔고' -> 5건 전부 공매도 순보유잔고 (33001~33004)
+                       신용거래융자 잔고 화면 자체가 없음
+
+KRX getJsonData.cmd    알려진 bld(MDCSTAT01501/01701)에도
+                       HTTP 400, 본문 "LOGOUT"
+                       로더 페이지로 JSESSIONID 받아도 동일
+                       익명 조회 경로가 닫혔음
+
+네이버 금융            main.naver / frgn.naver 에서 '신용' 0건 '융자' 0건
+
+FinanceDataReader      StockListing 키는 KRX / KRX-DELISTING /
+                       KRX-ADMINISTRATIVE 뿐. 신용 컬럼 없음
+```
+
+그래서 후보 bld 목록을 **비웠습니다**. 찾을 대상이 없는데 후보를 돌리면
+영원히 실패하고, 더 나쁘게는 빈 응답을 '신용잔고 0'으로 오해합니다.
+스모크 테스트가 `CANDIDATE_BLDS == ()` 를 확인해 추측이 다시 들어오는 것을
+막습니다.
+
+### 실제로 쓸 수 있는 경로
 
 ```bash
-python run_screen.py --mode credit-probe    # bld 코드 탐침 (최초 1회)
-python run_screen.py --mode credit          # KRX 자동 + 수동 CSV 덮어쓰기
-python run_screen.py --mode credit --no-krx # 수동 CSV 만
+hermes\run.cmd --mode credit-probe   # 위 판정을 실행 시점에 재검증
+hermes\run.cmd --mode credit         # 수동 CSV 주입 (현재 유일하게 동작)
 ```
 
-KRX 정보데이터시스템의 통계 조회는 `getJsonData.cmd` 엔드포인트에 `bld`
-파라미터로 접근합니다. 다만 **'신용거래융자 종목별 잔고'의 정확한 bld 코드는
-확인되지 않았습니다.** 추측을 코드에 박으면 조용히 빈 결과가 나오고 그걸
-'신용잔고 0'으로 오해하게 됩니다. 그래서 탐침 도구를 함께 넣었습니다.
+`credit-probe` 는 엔드포인트 응답과 KRX 메뉴를 매번 다시 확인합니다.
+결론을 문서에만 적어두면 KRX 가 정책을 바꿨을 때 아무도 모릅니다.
+메뉴에 신용거래융자 화면이 생기면 `credit_hits` 에 잡히고, 그때
+`--bld` 로 확인한 뒤 `.env` 의 `KRX_CREDIT_BLD` 에 고정하면 코드 수정 없이
+살아납니다.
 
-`credit-probe` 가 후보를 시험하고 어느 코드가 어떤 컬럼을 주는지 보고합니다.
-전부 실패하면 직접 찾는 절차를 안내합니다.
+실측을 자동화하려면 **증권사 API 가 유일한 경로**입니다. 키움 OpenAPI+ 의
+`opt10013`(신용매매동향)이 종목별 융자잔고를 줍니다. 다만 32비트 파이썬 +
+OCX + 계좌 로그인이 필요해 이 저장소만으로는 구성할 수 없습니다.
+
+`KRX_CREDIT_BLD` 를 지정하지 않으면 **네트워크 요청조차 하지 않습니다.**
+수동 값은 항상 자동 수집을 덮어씁니다.
+
+## 전종목 시세 소스 — KRX 엔드포인트 중단 대응
+
+2026-08 에 KRX 전종목 계열 엔드포인트가 로그인 뒤로 들어갔습니다.
+pykrx 가 이 엔드포인트를 쓰기 때문에 전종목 함수들이 빈 결과를 줍니다.
 
 ```
-1. https://data.krx.co.kr 접속
-2. [통계] > [주식] 에서 신용융자 잔고 화면을 연다
-3. F12 > Network 탭 > 조회 버튼 클릭
-4. getJsonData.cmd 요청의 Payload 에서 bld 값 복사
-5. --mode credit-probe --bld <복사한값> 으로 재확인
-6. .env 에 KRX_CREDIT_BLD= 로 고정
+동작함   stock.get_market_ohlcv(start, end, ticker)      종목 1개 시계열
+동작함   fdr.StockListing('KRX')                         전종목 스냅샷
+동작함   fdr.StockListing('KRX-ADMINISTRATIVE')          관리종목
+중단     stock.get_market_ohlcv_by_ticker(date, ...)     일자별 전종목
+중단     stock.get_market_ticker_list(date, ...)         종목 목록
+중단     stock.get_market_cap_by_ticker(date, ...)       시총
+중단     stock.get_market_trading_value_by_investor(...) 투자자별
+중단     stock.get_shorting_balance_by_ticker(...)       공매도 잔고
 ```
 
-응답 컬럼명도 하드코딩하지 않고 패턴으로 탐색합니다. KRX 는 컬럼명을 자주
-바꿉니다. 확정 전까지는 `data/credit_manual.csv` 수동 주입이 그대로 유효하고,
-수동 값이 항상 자동 수집을 덮어씁니다.
+전종목 경로를 FinanceDataReader 스냅샷으로 바꿨습니다. 요청 1회로 약
+2,900종목의 시가·고가·저가·종가·거래량·거래대금·시가총액·상장주식수가
+들어옵니다.
+
+**주의: 스냅샷에는 날짜 파라미터가 없습니다.** 항상 '최신'을 주므로 장중에
+부르면 종가가 아닌 현재가가 섞입니다. 그 값을 그날의 종가로 적재하면 DB 가
+조용히 오염됩니다. 그래서 기준 종목(삼성전자·SK하이닉스·현대차)의 종가를
+종목별 엔드포인트로 받아 대조하고, **일치한 경우에만** 적재합니다.
+확인이 안 되면 종목별 폴백으로 내려갑니다(2,800종목 × 0.3초 ≈ 15분).
+
+`--mode update` 가 0건일 때 휴장일로 기록하던 동작도 고쳤습니다. 소스
+장애로도 0건이 나오는데, 그 상태로 기록하면 실제 거래일이 영구히 휴장일로
+박혀 그 날짜를 두 번 다시 받지 못합니다. 지금은 기준 종목을 따로 조회해
+'거래일인지'를 독립 판정한 뒤에만 기록합니다.
 
 ## 라이선스
 

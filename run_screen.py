@@ -52,7 +52,7 @@ from stocknews.backtest import (BacktestConfig, control_random, control_rsi,
                                 run_backtest, simulate_exit_rules,
                                 summarize, summarize_exits, sweep_thresholds)
 from stocknews.flags import flag_summary, refresh_credit, refresh_flags
-from stocknews.krx_credit import probe as krx_probe
+from stocknews.krx_credit import diagnose as krx_diagnose
 from stocknews.krx_credit import refresh_credit_auto
 from stocknews.joblock import JobLock, clear_locks
 from stocknews.notify import TelegramNotConfigured, now_kst
@@ -459,45 +459,53 @@ def mode_brief_weekly(store: Store, args) -> int:
 
 
 def mode_credit_probe(store: Store, args) -> int:
-    """KRX 신용잔고 bld 코드 탐침.
+    """신용잔고 자동 수집 가능성 진단.
 
-    '신용거래융자 종목별 잔고'의 정확한 bld 코드는 확인되지 않았다.
-    추측을 코드에 박는 대신 후보를 시험해 어느 것이 동작하는지 보고한다.
+    2026-08 조사 결론은 '불가'다. KRX 는 종목별 신용거래융자 잔고를
+    공개하지 않는다. 그 결론을 문서에만 적어두면 KRX 가 정책을 바꿨을 때
+    아무도 모르므로, 실행 시점에 엔드포인트와 메뉴를 다시 확인한다.
     """
     td = (args.date or store.last_price_date() or
           now_kst().strftime("%Y-%m-%d"))
     ymd = str(td).replace("-", "")[:8]
     extra = (args.bld,) if args.bld else ()
-    report = krx_probe(ymd, extra_blds=extra)
+    rep = krx_diagnose(ymd, extra_blds=extra)
+    SUMMARY["diagnose"] = rep
 
-    print(f"\nKRX 신용잔고 bld 탐침 (기준일 {ymd})\n")
-    hit = None
-    for it in report:
-        mark = "OK  " if it.get("usable") else "    "
-        print(f"{mark}{it['bld']}  rows={it['rows']}")
-        if it.get("columns"):
-            print(f"      컬럼: {', '.join(str(c) for c in it['columns'])}")
-            print(f"      매핑: 종목={it.get('ticker_col')} "
-                  f"수량={it.get('qty_col')} 비율={it.get('ratio_col')}")
-        if it.get("usable") and hit is None:
-            hit = it["bld"]
-    SUMMARY["probe"] = report
-    SUMMARY["usable_bld"] = hit
+    print(f"\n신용잔고 자동 수집 진단 (기준일 {ymd})\n")
 
-    if hit:
-        print(f"\n사용 가능: {hit}")
-        print(f"  고정하려면:  setx KRX_CREDIT_BLD {hit}")
-        print("  또는 .env 에 KRX_CREDIT_BLD= 로 추가\n")
-        return EXIT_OK
+    ep = rep.get("endpoint", {})
+    if ep.get("reachable"):
+        print(f"  엔드포인트   응답함 (HTTP {ep.get('status')})")
+    elif ep.get("login_required"):
+        print(f"  엔드포인트   로그인 필요 — HTTP {ep.get('status')} "
+              f"{ep.get('body')}")
+        print("               익명 조회 경로가 닫혔습니다.")
+    else:
+        print(f"  엔드포인트   실패 — {ep.get('status') or ep.get('note')}")
 
-    print("\n동작하는 후보가 없습니다. 직접 찾으십시오 (1분):")
-    print("  1. https://data.krx.co.kr 접속")
-    print("  2. [통계] > [주식] 에서 신용융자 잔고 화면을 연다")
-    print("  3. F12 > Network 탭 > 조회 버튼 클릭")
-    print("  4. getJsonData.cmd 요청의 Payload 에서 bld 값 복사")
-    print("  5. --mode credit-probe --bld <복사한값> 으로 재확인")
-    print("\n  확정 전까지는 data/credit_manual.csv 수동 주입을 쓰십시오.\n")
-    return EXIT_PRECOND
+    mn = rep.get("menu", {})
+    hits = mn.get("credit_hits") or []
+    if mn.get("ok"):
+        print(f"  통계 메뉴     {mn.get('menus')}개 중 신용거래융자 화면 "
+              f"{len(hits)}건")
+        for h in hits:
+            print(f"                - {h}")
+    else:
+        print(f"  통계 메뉴     확인 실패 — {mn.get('status') or mn.get('note')}")
+
+    for t in rep.get("bld_tested") or []:
+        mark = "OK " if t["usable"] else "   "
+        print(f"  {mark}bld       {t['bld']}  rows={t['rows']}")
+
+    cov = store.credit_coverage()
+    print(f"\n  수동 주입     {cov['with_credit']}/{cov['active']}종목")
+    print(f"\n  판정: {rep.get('verdict')}\n")
+    for i, s in enumerate(rep.get("next_steps") or [], 1):
+        print(f"    {i}. {s}")
+    print()
+
+    return EXIT_OK if rep.get("verdict") == "가능" else EXIT_PRECOND
 
 
 def mode_credit(store: Store, args) -> int:

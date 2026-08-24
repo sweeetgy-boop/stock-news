@@ -1303,7 +1303,11 @@ def test_backtest(tmp: Path):
 
 def test_krx_credit():
     """KRX 신용잔고 수집기. 네트워크 없이 파싱 로직만 검증한다."""
-    from stocknews.krx_credit import (CANDIDATE_BLDS, _num, _pick, _rows_of)
+    import os
+
+    from stocknews.krx_credit import (CANDIDATE_BLDS, _num, _pick, _rows_of,
+                                      configured_bld, fetch_credit_balance,
+                                      menu_credit_hits, refresh_credit_auto)
 
     def t_rows_of():
         assert _rows_of({"output": [{"a": 1}], "x": []}) == [{"a": 1}]
@@ -1325,15 +1329,177 @@ def test_krx_credit():
         assert _num("-") is None and _num("") is None and _num(None) is None
         assert _num("abc") is None
 
-    def t_candidates():
-        assert CANDIDATE_BLDS, "후보 bld 목록이 비었다"
-        for b in CANDIDATE_BLDS:
-            assert b.startswith("dbms/MDC/STAT/"), b
+    def t_no_guessed_blds():
+        # KRX 는 종목별 신용거래융자 잔고를 공개하지 않는다(2026-08 실측).
+        # 추측한 bld 를 다시 넣으면 빈 응답을 '신용잔고 0'으로 오해한다.
+        # 이 테스트는 그 회귀를 막는다.
+        assert CANDIDATE_BLDS == (), \
+            f"추측 bld 가 들어왔다: {CANDIDATE_BLDS}"
+
+    def t_no_network_without_bld():
+        # bld 미지정이면 네트워크를 쓰지 않고 즉시 빈 결과여야 한다.
+        saved = os.environ.pop("KRX_CREDIT_BLD", None)
+        try:
+            assert configured_bld() is None
+            df, used = fetch_credit_balance("20260821")
+            assert df.empty and used == "", (len(df), used)
+        finally:
+            if saved is not None:
+                os.environ["KRX_CREDIT_BLD"] = saved
+
+    def t_auto_skips_cleanly():
+        saved = os.environ.pop("KRX_CREDIT_BLD", None)
+        try:
+            r = refresh_credit_auto(None)   # store 를 건드리지 않고 빠져야 한다
+            assert r["ok"] is False and r.get("skipped") is True, r
+            assert "공개하지 않" in r["note"], r["note"]
+        finally:
+            if saved is not None:
+                os.environ["KRX_CREDIT_BLD"] = saved
+
+    def t_menu_hits():
+        # '신용등급'(채권 발행사)은 신용거래융자가 아니므로 걸러야 한다.
+        html = ('<span data-menu-name="발행사 신용등급 및 NCR"></span>'
+                '<span data-menu-name="신용등급별 상장현황"></span>'
+                '<span data-menu-name="인프라투융자회사 시세"></span>'
+                '<span data-menu-name="전종목 시세"></span>')
+        assert menu_credit_hits(html) == [], menu_credit_hits(html)
+        # 실제로 생기면 잡아야 한다
+        html2 = html + '<span data-menu-name="신용거래융자 종목별 잔고"></span>'
+        assert menu_credit_hits(html2) == ["신용거래융자 종목별 잔고"]
 
     check("krx_credit", "결과 배열 탐색", t_rows_of)
     check("krx_credit", "컬럼 패턴 매칭", t_pick)
     check("krx_credit", "숫자 파싱", t_num)
-    check("krx_credit", "후보 bld 목록", t_candidates)
+    check("krx_credit", "추측 bld 미포함", t_no_guessed_blds)
+    check("krx_credit", "bld 없으면 무네트워크", t_no_network_without_bld)
+    check("krx_credit", "자동 수집 정상 생략", t_auto_skips_cleanly)
+    check("krx_credit", "메뉴 신용등급 오탐 방지", t_menu_hits)
+
+
+def test_market_source(tmp: Path):
+    """전종목 소스 교체 + 휴장일 오염 방어.
+
+    KRX 전종목 엔드포인트가 로그인 뒤로 들어가(2026-08) 빈 결과를 준다.
+    예전 fetch_day 는 0건이면 무조건 휴장일로 기록해서, 소스 장애가 실제
+    거래일을 영구히 휴장일로 박아버렸다. 그 회귀를 막는다.
+    """
+    import pandas as _pd
+
+    from stocknews import universe as uni
+    from stocknews.data import REQUIRED, _SNAP_PRICE, verify_snapshot_date
+    from stocknews.store import Store
+
+    st = Store(tmp / "src.db")
+    WED = "20260819"          # 수요일. 주말/기지정 공휴일이 아니다.
+    ISO = "2026-08-19"
+
+    def _snap(close=1000.0):
+        return _pd.DataFrame(
+            {"시가": [close], "고가": [close], "저가": [close],
+             "종가": [close], "거래량": [10.0], "거래대금": [close * 10]},
+            index=["005930"])
+
+    def t_snap_mapping():
+        # 스냅샷 매핑이 필수 컬럼을 모두 덮어야 한다.
+        mapped = set(_SNAP_PRICE.values())
+        missing = [c for c in REQUIRED if c not in mapped]
+        assert not missing, missing
+
+    def t_verify_empty():
+        ok, why = verify_snapshot_date(_pd.DataFrame(), WED)
+        assert ok is False and "비었" in why, why
+
+    def t_verify_no_refs():
+        # 기준 종목이 스냅샷에 없으면 네트워크를 쓰지 않고 실패해야 한다.
+        ok, why = verify_snapshot_date(_snap(), WED, refs=("999999",))
+        assert ok is False and "확인 불가" in why, why
+
+    def t_verify_match():
+        saved = uni.close_on
+        import stocknews.data as d
+        d_saved = d.close_on
+        try:
+            d.close_on = lambda t, td: 1000.0
+            ok, why = verify_snapshot_date(_snap(1000.0), WED,
+                                           refs=("005930",), need=1)
+            assert ok is True, why
+            # 장중 현재가가 섞이면 통과시키면 안 된다
+            ok2, why2 = verify_snapshot_date(_snap(1234.0), WED,
+                                             refs=("005930",), need=1)
+            assert ok2 is False and "종가가 아님" in why2, why2
+        finally:
+            d.close_on = d_saved
+            uni.close_on = saved
+
+    def t_source_outage_is_not_holiday():
+        """소스 장애 = 휴장일 아님. 이게 이 테스트의 핵심이다."""
+        assert not st.is_known_non_trading(ISO)
+        s_snap, s_close = uni.market_snapshot, uni.close_on
+        try:
+            uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
+            # 기준 종목은 데이터가 있다 → 거래일이다
+            uni.close_on = lambda t, td: (100.0 if t in uni.REF_TICKERS
+                                          else None)
+            n = uni.fetch_day(st, WED)
+            assert n == 0, n
+            assert not st.is_known_non_trading(ISO), \
+                "소스 장애를 휴장일로 기록했다 (거래일 영구 소실)"
+        finally:
+            uni.market_snapshot, uni.close_on = s_snap, s_close
+
+    def t_real_holiday_is_marked():
+        s_snap, s_close = uni.market_snapshot, uni.close_on
+        try:
+            uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
+            uni.close_on = lambda t, td: None      # 기준 종목도 데이터 없음
+            n = uni.fetch_day(st, "20260817")      # 다른 날짜(월)
+            assert n == 0, n
+            assert st.is_known_non_trading("2026-08-17"), \
+                "기준 종목도 데이터가 없으면 휴장일로 기록해야 한다"
+        finally:
+            uni.market_snapshot, uni.close_on = s_snap, s_close
+
+    def t_snapshot_path_used():
+        """스냅샷이 검증되면 요청 1회로 적재된다."""
+        s_snap, s_close = uni.market_snapshot, uni.close_on
+        import stocknews.data as d
+        d_saved = d.close_on
+        try:
+            uni.market_snapshot = lambda: (_snap(1000.0), _pd.DataFrame())
+            uni.close_on = lambda t, td: 1000.0
+            d.close_on = lambda t, td: 1000.0
+            n = uni.fetch_day(st, "20260818")
+            assert n == 1, n
+            got = st.load_ohlcv("005930", days=5)
+            assert len(got) == 1 and float(got["종가"].iloc[-1]) == 1000.0
+        finally:
+            uni.market_snapshot, uni.close_on = s_snap, s_close
+            d.close_on = d_saved
+
+    def t_weekend_short_circuits():
+        """주말은 네트워크를 쓰지 않고 생략한다."""
+        s_snap, s_close = uni.market_snapshot, uni.close_on
+        called = []
+        try:
+            uni.market_snapshot = lambda: (called.append("snap"),
+                                           (_pd.DataFrame(),
+                                            _pd.DataFrame()))[1]
+            uni.close_on = lambda t, td: called.append("close")
+            n = uni.fetch_day(st, "20260822")      # 토요일
+            assert n == 0 and called == [], called
+            assert st.is_known_non_trading("2026-08-22")
+        finally:
+            uni.market_snapshot, uni.close_on = s_snap, s_close
+
+    check("market_source", "스냅샷 컬럼 매핑", t_snap_mapping)
+    check("market_source", "빈 스냅샷 거부", t_verify_empty)
+    check("market_source", "기준종목 없으면 거부", t_verify_no_refs)
+    check("market_source", "날짜 대조 (장중가 거부)", t_verify_match)
+    check("market_source", "소스 장애를 휴장일로 안 씀", t_source_outage_is_not_holiday)
+    check("market_source", "실제 휴장일은 기록", t_real_holiday_is_marked)
+    check("market_source", "스냅샷 경로 적재", t_snapshot_path_used)
+    check("market_source", "주말 즉시 생략", t_weekend_short_circuits)
 
 
 def test_docs():
@@ -1799,6 +1965,7 @@ def main() -> int:
         test_trading_day(tmp)
         test_backtest(tmp)
         test_krx_credit()
+        test_market_source(tmp)
         test_docs()
         test_joblock(tmp)
         test_agent_contract()
