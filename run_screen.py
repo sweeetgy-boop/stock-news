@@ -52,7 +52,9 @@ from stocknews.backtest import (BacktestConfig, control_random, control_rsi,
                                 run_backtest, simulate_exit_rules,
                                 summarize, summarize_exits, sweep_thresholds)
 from stocknews.flags import flag_summary, refresh_credit, refresh_flags
-from stocknews.krx_credit import probe as krx_probe
+from stocknews.kiwoom import build_plan as kiwoom_plan
+from stocknews.kiwoom import check_environment as kiwoom_env
+from stocknews.krx_credit import diagnose as krx_diagnose
 from stocknews.krx_credit import refresh_credit_auto
 from stocknews.joblock import JobLock, clear_locks
 from stocknews.notify import TelegramNotConfigured, now_kst
@@ -459,45 +461,124 @@ def mode_brief_weekly(store: Store, args) -> int:
 
 
 def mode_credit_probe(store: Store, args) -> int:
-    """KRX 신용잔고 bld 코드 탐침.
+    """신용잔고 자동 수집 가능성 진단.
 
-    '신용거래융자 종목별 잔고'의 정확한 bld 코드는 확인되지 않았다.
-    추측을 코드에 박는 대신 후보를 시험해 어느 것이 동작하는지 보고한다.
+    2026-08 조사 결론은 '불가'다. KRX 는 종목별 신용거래융자 잔고를
+    공개하지 않는다. 그 결론을 문서에만 적어두면 KRX 가 정책을 바꿨을 때
+    아무도 모르므로, 실행 시점에 엔드포인트와 메뉴를 다시 확인한다.
     """
     td = (args.date or store.last_price_date() or
           now_kst().strftime("%Y-%m-%d"))
     ymd = str(td).replace("-", "")[:8]
     extra = (args.bld,) if args.bld else ()
-    report = krx_probe(ymd, extra_blds=extra)
+    rep = krx_diagnose(ymd, extra_blds=extra)
+    SUMMARY["diagnose"] = rep
 
-    print(f"\nKRX 신용잔고 bld 탐침 (기준일 {ymd})\n")
-    hit = None
-    for it in report:
-        mark = "OK  " if it.get("usable") else "    "
-        print(f"{mark}{it['bld']}  rows={it['rows']}")
-        if it.get("columns"):
-            print(f"      컬럼: {', '.join(str(c) for c in it['columns'])}")
-            print(f"      매핑: 종목={it.get('ticker_col')} "
-                  f"수량={it.get('qty_col')} 비율={it.get('ratio_col')}")
-        if it.get("usable") and hit is None:
-            hit = it["bld"]
-    SUMMARY["probe"] = report
-    SUMMARY["usable_bld"] = hit
+    print(f"\n신용잔고 자동 수집 진단 (기준일 {ymd})\n")
 
-    if hit:
-        print(f"\n사용 가능: {hit}")
-        print(f"  고정하려면:  setx KRX_CREDIT_BLD {hit}")
-        print("  또는 .env 에 KRX_CREDIT_BLD= 로 추가\n")
-        return EXIT_OK
+    ep = rep.get("endpoint", {})
+    if ep.get("reachable"):
+        print(f"  엔드포인트   응답함 (HTTP {ep.get('status')})")
+    elif ep.get("login_required"):
+        print(f"  엔드포인트   로그인 필요 — HTTP {ep.get('status')} "
+              f"{ep.get('body')}")
+        print("               익명 조회 경로가 닫혔습니다.")
+    else:
+        print(f"  엔드포인트   실패 — {ep.get('status') or ep.get('note')}")
 
-    print("\n동작하는 후보가 없습니다. 직접 찾으십시오 (1분):")
-    print("  1. https://data.krx.co.kr 접속")
-    print("  2. [통계] > [주식] 에서 신용융자 잔고 화면을 연다")
-    print("  3. F12 > Network 탭 > 조회 버튼 클릭")
-    print("  4. getJsonData.cmd 요청의 Payload 에서 bld 값 복사")
-    print("  5. --mode credit-probe --bld <복사한값> 으로 재확인")
-    print("\n  확정 전까지는 data/credit_manual.csv 수동 주입을 쓰십시오.\n")
-    return EXIT_PRECOND
+    mn = rep.get("menu", {})
+    hits = mn.get("credit_hits") or []
+    if mn.get("ok"):
+        print(f"  통계 메뉴     {mn.get('menus')}개 중 신용거래융자 화면 "
+              f"{len(hits)}건")
+        for h in hits:
+            print(f"                - {h}")
+    else:
+        print(f"  통계 메뉴     확인 실패 — {mn.get('status') or mn.get('note')}")
+
+    for t in rep.get("bld_tested") or []:
+        mark = "OK " if t["usable"] else "   "
+        print(f"  {mark}bld       {t['bld']}  rows={t['rows']}")
+
+    cov = store.credit_coverage()
+    print(f"\n  수동 주입     {cov['with_credit']}/{cov['active']}종목")
+    print(f"\n  판정: {rep.get('verdict')}\n")
+    for i, s in enumerate(rep.get("next_steps") or [], 1):
+        print(f"    {i}. {s}")
+    print()
+
+    return EXIT_OK if rep.get("verdict") == "가능" else EXIT_PRECOND
+
+
+def mode_kiwoom_plan(store: Store, args) -> int:
+    """키움 OpenAPI+ 수집 계획 + 환경 준비도.
+
+    OCX 를 건드리지 않으므로 64비트 본체에서 그대로 돌아간다. 실제 조회는
+    32비트 `kiwoom_bridge.py` 가 한다.
+
+    전종목이 왜 안 되는지를 말이 아니라 수치로 낸다. 시간당 1,000건
+    제한이 지배적이라 2,800종목은 세 시간이 걸린다.
+    """
+    env = kiwoom_env()
+    plan = kiwoom_plan(store, limit=args.kw_limit, scan_days=args.kw_days)
+    SUMMARY["kiwoom_env"] = {k: v for k, v in env.items() if k != "missing"}
+    SUMMARY["kiwoom_plan"] = {k: v for k, v in plan.items() if k != "tickers"}
+
+    bit_note = ""
+    if env.get("ocx_wow64_only"):
+        bit_note = "  (InprocServer32 가 WOW6432Node 에만 = 32비트 전용)"
+    print(f"\n키움 OpenAPI+ 환경  (파이썬 {env['python_bits']}비트)")
+    print(f"  OCX 파일       {env['ocx_inproc_path'] or '없음'}")
+    print(f"  COM 등록       {env['ocx_registered']}{bit_note}")
+    print(f"  TR 정의 파일   {env['tr_defs']}")
+    print(f"  pywin32 {env['win32com']}   PyQt5 {env['PyQt5']}   "
+          f"KOA Studio {env['koa_studio']}")
+    print(f"  준비 완료      {env['ready']}")
+    if env["missing"]:
+        print("\n  남은 준비:")
+        for i, m in enumerate(env["missing"], 1):
+            print(f"    {i}. {m}")
+
+    lim = plan["limits"]
+    print(f"\n호출 제한  초당 {lim['per_second']} / 분당 {lim['per_minute']} "
+          f"/ 시간당 {lim['per_hour']}  (안전마진 적용 "
+          f"{plan['safe_limits']['per_hour']}/시간)")
+    print("  분당·시간당 제한에 걸리면 프로그램을 재실행해야 하므로 "
+          "여유를 둡니다.")
+
+    print(f"\n수집 대상  {plan['targets']}종목 / 활성 {plan['active_tickers']}종목")
+    for reason, n in plan["by_reason"].items():
+        print(f"    {reason:12s} {n}종목")
+    print(f"\n  예상 소요    {plan['eta_sec'] / 60:.1f}분  "
+          f"({plan['requests']}건)")
+    print(f"  전수조사면   {plan['full_scan_eta_sec'] / 3600:.2f}시간  "
+          f"({plan['full_scan_requests']}건)  <- 매일 불가")
+    if not plan["feasible_daily"]:
+        print("  ! 대상이 많아 1시간을 넘습니다. --kw-limit 을 줄이십시오.")
+
+    cov = plan.get("coverage_now")
+    if cov:
+        print(f"\n현재 신용잔고 커버리지  {cov['with_credit']}/{cov['active']}종목"
+              f" · 기준일 {cov['asof'] or '-'}")
+
+    if args.write_targets:
+        p = Path(args.write_targets)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(plan["tickers"]) + "\n", encoding="utf-8")
+        print(f"\n대상 목록 기록 -> {p}  ({len(plan['tickers'])}종목)")
+        print("  32비트 브릿지에서:")
+        print(f"    venv32\\Scripts\\python kiwoom_bridge.py "
+              f"--plan-file {p}")
+    else:
+        print("\n  목록을 파일로 뽑으려면: --write-targets "
+              "data/kiwoom_targets.txt")
+    print()
+
+    if not plan["targets"]:
+        log.warning("대상이 0종목입니다. 먼저 --mode daily 로 스캔 이력을 "
+                    "만들거나 포지션을 등록하십시오.")
+        return EXIT_PRECOND
+    return EXIT_OK if env["ready"] else EXIT_PRECOND
 
 
 def mode_credit(store: Store, args) -> int:
@@ -903,6 +984,7 @@ MODES = {
     "flags": mode_flags,
     "credit": mode_credit,
     "credit-probe": mode_credit_probe,
+    "kiwoom-plan": mode_kiwoom_plan,
     "backtest": mode_backtest,
     "export": mode_export,
     "exits": mode_exits,
@@ -1005,6 +1087,13 @@ def main(argv=None) -> int:
     ap.add_argument("--bld", help="credit/credit-probe: KRX bld 코드 직접 지정")
     ap.add_argument("--no-krx", action="store_true",
                     help="credit: KRX 자동 수집 없이 수동 CSV 만 사용")
+    # ── 키움 OpenAPI+ ──
+    ap.add_argument("--kw-limit", type=int, default=300,
+                    help="kiwoom-plan: 수집 대상 상한 (기본 300)")
+    ap.add_argument("--kw-days", type=int, default=5,
+                    help="kiwoom-plan: 스캔/추천 이력 조회 일수 (기본 5)")
+    ap.add_argument("--write-targets",
+                    help="kiwoom-plan: 대상 종목코드를 이 파일에 기록")
     # ── 백테스트 ──
     ap.add_argument("--bt-step", type=int, default=5,
                     help="backtest: 평가 간격(거래일). 1이면 전수")

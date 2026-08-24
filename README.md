@@ -28,7 +28,8 @@ stocknews/
   news.py        뉴스 정리 (중복제거 · 사건 클러스터 · 종목태깅 · 중요도)
   exits.py       청산 규칙 엔진 (8계층 우선순위)
   flags.py       배제 플래그 공급원 (FDR 관리종목 · DART · 로컬 · 수동)
-  krx_credit.py  종목별 신용잔고 수집 (bld 코드 미확정 — 아래 '신용잔고' 절)
+  krx_credit.py  신용잔고 자동 수집 가능성 진단 (결론: 불가 — 아래 절)
+  kiwoom.py      키움 OpenAPI+ 호출제한·계획·환경진단 (OCX 미접촉)
   backtest.py    워크포워드 이벤트 스터디 (운영 코드 절단 호출)
   trading_day.py 거래일 판정 (주말 · 공휴일 자기학습 캐시)
   joblock.py     잡 단위 파일 락
@@ -36,7 +37,8 @@ stocknews/
   notify.py      4중 게이트 + 발송
   data.py        pykrx / FinanceDataReader 로더
 run_screen.py    실행부
-smoke_test.py    스모크 테스트 135건 (네트워크·실DB 미사용)
+kiwoom_bridge.py 키움 OCX 브릿지 (★ 32비트 파이썬 전용, 조회만)
+smoke_test.py    스모크 테스트 158건 (네트워크·실DB 미사용)
 verify_env.py    requirements.txt 핀 대조 + 런타임 기능 점검
 hermes/run.cmd   실행 래퍼 (에이전트는 반드시 이걸 쓴다)
 ```
@@ -85,7 +87,7 @@ ElementTree) · 미선언 전이 의존성 경고를 확인한다.
 반드시 먼저 돌리십시오.
 
 ```bash
-hermes\run.cmd smoke        # 135건 검사 (권장 — 인코딩·인터프리터 처리됨)
+hermes\run.cmd smoke        # 158건 검사 (권장 — 인코딩·인터프리터 처리됨)
 hermes\run.cmd smoke -v     # 실패 시 트레이스백까지
 ```
 
@@ -502,12 +504,15 @@ data/export/tickers_20260824.csv        종목 마스터
 
 ## 미완성 항목
 
-- 종목별 신용잔고 자동 수집은 **코드는 있고 bld 코드가 미확정**이다.
-  `krx_credit.py` 가 KRX 정보데이터시스템을 호출하지만 '신용거래융자
-  종목별 잔고'의 bld 값을 확인하지 못했다. `--mode credit-probe` 로 후보를
-  탐침한 뒤 `.env` 의 `KRX_CREDIT_BLD` 에 고정해야 동작한다. 확정 전까지는
-  수동 CSV 경로를 쓰고, 넣지 않은 종목은 평균단가 P0 를 매물대 POC 로
-  추정하므로 청산 밴드의 정확도가 떨어진다.
+- 종목별 신용잔고는 **공개 소스로 자동 수집이 불가능하다.** 데이터가
+  공개되지 않는다(위 '신용잔고' 절의 실측 근거 참조). 키움 OpenAPI+
+  경로를 넣어뒀지만 **아직 실제 조회로 검증하지 않았다.** 32비트 파이썬
+  환경(`venv32`)이 아직 없고, OPT10013 의 출력 필드명도 `--discover` 로
+  확정해야 한다. 그때까지는 수동 CSV 경로를 쓰고, 넣지 않은 종목은
+  평균단가 P0 를 매물대 POC 로 추정하므로 청산 밴드 정확도가 떨어진다.
+- 섹터 분산 제한이 **비활성 상태다.** `fill_sectors` 가 FDR 상장목록에서
+  업종 컬럼을 찾는데, 현재 응답에 `Sector`/`Industry` 가 없다(`Dept` 는
+  소속부라 업종이 아니다). 추천 10선의 섹터 편중을 막지 못한다.
 - 감사의견 판정은 공시 **제목** 키워드 스캔이라 취약하다. 의견거절이 제목에
   드러나지 않는 경우가 많다. 다만 그런 종목은 대개 관리종목으로 지정되어
   ①에서 잡힌다. 확실히 하려면 `flags_manual.csv`로 직접 지정하십시오.
@@ -725,34 +730,175 @@ python run_screen.py --mode backtest --bt-no-controls --bt-no-exits  # 빠른 �
 
 **결과는 실제보다 낙관적입니다.** 리포트 하단에 이 경고가 항상 출력됩니다.
 
-## 신용잔고 자동 수집
+## 신용잔고 — 자동 수집은 불가능합니다
+
+결론부터 적습니다. **종목별 신용거래융자 잔고는 공개되지 않습니다.**
+bld 코드를 못 찾은 게 아니라 데이터가 없습니다. 2026-08-24 에 후보 소스를
+전부 직접 두드려 확인했습니다.
+
+```
+KRX 정보데이터시스템   통계 메뉴 464개 전량 덤프 후 검색
+                       '융자' -> "인프라투융자회사 시세" 1건. 무관.
+                       '신용' -> 6건 전부 채권 발행사 신용등급
+                                 (13210 13211 14023 14024)
+                       '잔고' -> 5건 전부 공매도 순보유잔고 (33001~33004)
+                       신용거래융자 잔고 화면 자체가 없음
+
+KRX getJsonData.cmd    알려진 bld(MDCSTAT01501/01701)에도
+                       HTTP 400, 본문 "LOGOUT"
+                       로더 페이지로 JSESSIONID 받아도 동일
+                       익명 조회 경로가 닫혔음
+
+네이버 금융            main.naver / frgn.naver 에서 '신용' 0건 '융자' 0건
+
+FinanceDataReader      StockListing 키는 KRX / KRX-DELISTING /
+                       KRX-ADMINISTRATIVE 뿐. 신용 컬럼 없음
+```
+
+그래서 후보 bld 목록을 **비웠습니다**. 찾을 대상이 없는데 후보를 돌리면
+영원히 실패하고, 더 나쁘게는 빈 응답을 '신용잔고 0'으로 오해합니다.
+스모크 테스트가 `CANDIDATE_BLDS == ()` 를 확인해 추측이 다시 들어오는 것을
+막습니다.
+
+### 실제로 쓸 수 있는 경로
 
 ```bash
-python run_screen.py --mode credit-probe    # bld 코드 탐침 (최초 1회)
-python run_screen.py --mode credit          # KRX 자동 + 수동 CSV 덮어쓰기
-python run_screen.py --mode credit --no-krx # 수동 CSV 만
+hermes\run.cmd --mode credit-probe   # 위 판정을 실행 시점에 재검증
+hermes\run.cmd --mode credit         # 수동 CSV 주입 (현재 유일하게 동작)
 ```
 
-KRX 정보데이터시스템의 통계 조회는 `getJsonData.cmd` 엔드포인트에 `bld`
-파라미터로 접근합니다. 다만 **'신용거래융자 종목별 잔고'의 정확한 bld 코드는
-확인되지 않았습니다.** 추측을 코드에 박으면 조용히 빈 결과가 나오고 그걸
-'신용잔고 0'으로 오해하게 됩니다. 그래서 탐침 도구를 함께 넣었습니다.
+`credit-probe` 는 엔드포인트 응답과 KRX 메뉴를 매번 다시 확인합니다.
+결론을 문서에만 적어두면 KRX 가 정책을 바꿨을 때 아무도 모릅니다.
+메뉴에 신용거래융자 화면이 생기면 `credit_hits` 에 잡히고, 그때
+`--bld` 로 확인한 뒤 `.env` 의 `KRX_CREDIT_BLD` 에 고정하면 코드 수정 없이
+살아납니다.
 
-`credit-probe` 가 후보를 시험하고 어느 코드가 어떤 컬럼을 주는지 보고합니다.
-전부 실패하면 직접 찾는 절차를 안내합니다.
+`KRX_CREDIT_BLD` 를 지정하지 않으면 **네트워크 요청조차 하지 않습니다.**
+수동 값은 항상 자동 수집을 덮어씁니다.
+
+## 키움 OpenAPI+ — 신용잔고 실측 자동화
+
+종목별 신용잔고를 실제로 주는 유일한 자동 경로다. TR 규격은
+`C:\OpenAPI` 의 키움 정의 파일에서 직접 확인했다(추측 아님).
 
 ```
-1. https://data.krx.co.kr 접속
-2. [통계] > [주식] 에서 신용융자 잔고 화면을 연다
-3. F12 > Network 탭 > 조회 버튼 클릭
-4. getJsonData.cmd 요청의 Payload 에서 bld 값 복사
-5. --mode credit-probe --bld <복사한값> 으로 재확인
-6. .env 에 KRX_CREDIT_BLD= 로 고정
+OPT10013  신용매매동향요청   화면 0141
+          입력: 종목코드 / 일자(YYYYMMDD) / 조회구분(1:융자, 2:대주)
+OPT10033  신용비율상위요청   상위 랭킹. 요청 1회로 과열 종목
+OPT10014  공매도추이요청     화면 0142. 죽은 pykrx 공매도 경로 대체 가능
+OPW20016  신용융자 가능종목요청
 ```
 
-응답 컬럼명도 하드코딩하지 않고 패턴으로 탐색합니다. KRX 는 컬럼명을 자주
-바꿉니다. 확정 전까지는 `data/credit_manual.csv` 수동 주입이 그대로 유효하고,
-수동 값이 항상 자동 수집을 덮어씁니다.
+출처: `koatrinputlegend.ini`(입력 필드), `koascreentrmap.ini`(화면↔TR).
+
+### 프로세스가 분리된 이유
+
+OpenAPI+ 는 **32비트 OCX(COM)** 다. 본체는 64비트 파이썬이고, 64비트
+프로세스는 32비트 OCX 를 인프로세스로 로드할 수 없다. 레지스트리 실측:
+`InprocServer32` 가 `WOW6432Node` 아래에만 있다(32비트 전용 등록).
+
+```
+[32비트] kiwoom_bridge.py  -->  data/credit_kiwoom.csv
+[64비트] run.cmd --mode credit   (기존 적재 경로, 테스트됨)
+```
+
+`credit_manual.csv` 와 다른 파일에 쓴다. 사람이 넣은 값을 덮어쓰지 않기
+위해서다. 적재 순서가 자동 → 수동이라 사람 값이 이긴다.
+
+### 호출 제한이 설계를 결정한다
+
+```
+초당 5건 / 분당 100건 / 시간당 1,000건
+```
+
+**시간당 1,000건이 지배적이다.** 안전마진 900/시간으로 계산한 실측값:
+
+```
+  300종목  ->    3.1분     <- 이걸 쓴다
+  900종목  ->    9.4분
+1,000종목  ->   61.0분     <- 시간 절벽
+2,874종목  ->  3.02시간    <- 전종목. 매일 불가
+```
+
+900건을 넘는 순간 첫 요청이 창을 벗어날 때까지 최대 1시간을 기다린다.
+게다가 제한에 걸리면 키움이 프로그램 재실행을 요구한다(`rc=-200`).
+
+그래서 전수조사를 하지 않는다. 대상은 이 값이 판정을 바꾸는 종목만
+고른다.
+
+```
+1순위  보유 포지션      청산 계층 6(신용 재급증)이 여기서만 작동한다
+2순위  최근 추천 종목    진입 전에 실측이 있어야 한다
+3순위  밴드 근처 종목    band_pos 낮은 순. 다음 후보군
+```
+
+나머지는 지금처럼 매물대 POC 프록시로 남는다. 그게 정직하다.
+
+### 준비 (한 번만)
+
+```bash
+hermes\run.cmd --mode kiwoom-plan          # 환경·계획 확인 (조회 없음)
+
+py -3.12-32 -m venv venv32                 # 32비트 파이썬 필요
+venv32\Scripts\pip install pywin32 PyQt5
+venv32\Scripts\python kiwoom_bridge.py --check
+venv32\Scripts\python kiwoom_bridge.py --discover
+```
+
+`--discover` 가 필요한 이유: OPT10013 의 **출력** 필드명이
+`C:\OpenAPI\data\opt10013.enc` 로 암호화돼 있어 오프라인으로 읽을 수
+없다. 후보를 실제 응답에 대보고 맞는 것만 `data/kiwoom_fields.json` 에
+고정한다. 다음 실행부터는 탐침을 건너뛴다.
+
+### 일상 사용
+
+```bash
+hermes\run.cmd --mode kiwoom-plan --write-targets data/kiwoom_targets.txt
+venv32\Scripts\python kiwoom_bridge.py --plan-file data/kiwoom_targets.txt
+hermes\run.cmd --mode credit
+```
+
+### 주의
+
+- 브릿지는 **로그인 창이 뜨는 대화형 프로그램**이다. 자동화 에이전트가
+  실행하면 안 된다. `AGENTS.md` 11장에 그렇게 적어뒀다.
+- **로그인은 실서버로 하라.** 모의투자만 3개월 접속하면 서비스가 자동
+  해지된다.
+- 브릿지는 조회 함수만 쓴다. `SendOrder` / `SendOrderCredit` 를 호출하지
+  않는다. 이 시스템은 주문을 내지 않는다.
+- 키움 규정상 OpenAPI 사용 계좌는 한국거래소에 **알고리즘 계좌로 등록될
+  수 있다.** 조회만 해도 해당된다.
+
+## 전종목 시세 소스 — KRX 엔드포인트 중단 대응
+
+2026-08 에 KRX 전종목 계열 엔드포인트가 로그인 뒤로 들어갔습니다.
+pykrx 가 이 엔드포인트를 쓰기 때문에 전종목 함수들이 빈 결과를 줍니다.
+
+```
+동작함   stock.get_market_ohlcv(start, end, ticker)      종목 1개 시계열
+동작함   fdr.StockListing('KRX')                         전종목 스냅샷
+동작함   fdr.StockListing('KRX-ADMINISTRATIVE')          관리종목
+중단     stock.get_market_ohlcv_by_ticker(date, ...)     일자별 전종목
+중단     stock.get_market_ticker_list(date, ...)         종목 목록
+중단     stock.get_market_cap_by_ticker(date, ...)       시총
+중단     stock.get_market_trading_value_by_investor(...) 투자자별
+중단     stock.get_shorting_balance_by_ticker(...)       공매도 잔고
+```
+
+전종목 경로를 FinanceDataReader 스냅샷으로 바꿨습니다. 요청 1회로 약
+2,900종목의 시가·고가·저가·종가·거래량·거래대금·시가총액·상장주식수가
+들어옵니다.
+
+**주의: 스냅샷에는 날짜 파라미터가 없습니다.** 항상 '최신'을 주므로 장중에
+부르면 종가가 아닌 현재가가 섞입니다. 그 값을 그날의 종가로 적재하면 DB 가
+조용히 오염됩니다. 그래서 기준 종목(삼성전자·SK하이닉스·현대차)의 종가를
+종목별 엔드포인트로 받아 대조하고, **일치한 경우에만** 적재합니다.
+확인이 안 되면 종목별 폴백으로 내려갑니다(2,800종목 × 0.3초 ≈ 15분).
+
+`--mode update` 가 0건일 때 휴장일로 기록하던 동작도 고쳤습니다. 소스
+장애로도 0건이 나오는데, 그 상태로 기록하면 실제 거래일이 영구히 휴장일로
+박혀 그 날짜를 두 번 다시 받지 못합니다. 지금은 기준 종목을 따로 조회해
+'거래일인지'를 독립 판정한 뒤에만 기록합니다.
 
 ## 라이선스
 
