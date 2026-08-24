@@ -1,14 +1,52 @@
+# ── 비밀정보 ──
 .env
+.env.*
+!.env.example
 *.env
+
+# ── 가상환경 ──
 venv/
 .venv/
+env/
+
+# ── 파이썬 산출물 ──
 __pycache__/
 *.py[cod]
-*.log
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── 런타임 데이터 ──
+# data/ 는 SQLite 캐시와 상태 파일이 들어가므로 통째로 제외한다.
+# 단, 저장소에 있어야 하는 템플릿/샘플은 되살린다.
+# (부정 패턴이 동작하려면 디렉터리 자체를 무시해선 안 되므로
+#  data/ 가 아니라 data/* 로 써야 한다.)
+data/*
+!data/.gitkeep
+!data/*.example
+!data/README.md
+
 logs/
-data/
+*.log
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
+
+# ── 작업 중 임시 파일 ──
+# 진단 스크립트와 그 출력은 접두사 _ 를 붙인다. 커밋되지 않는다.
+_*.txt
+_*.log
+_*.out
+_*.ps1
+_*.md
+_*.tmp
+
+# ── 에디터 / OS ──
 .DS_Store
+Thumbs.db
 .vscode/
 .idea/
+*.swp
