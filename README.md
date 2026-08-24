@@ -28,13 +28,17 @@ stocknews/
   news.py        뉴스 정리 (중복제거 · 사건 클러스터 · 종목태깅 · 중요도)
   exits.py       청산 규칙 엔진 (8계층 우선순위)
   flags.py       배제 플래그 공급원 (FDR 관리종목 · DART · 로컬 · 수동)
+  krx_credit.py  종목별 신용잔고 수집 (bld 코드 미확정 — 아래 '신용잔고' 절)
+  backtest.py    워크포워드 이벤트 스터디 (운영 코드 절단 호출)
+  trading_day.py 거래일 판정 (주말 · 공휴일 자기학습 캐시)
+  joblock.py     잡 단위 파일 락
   renderer.py    텔레그램 조판 (표 미사용)
-  ...
-smoke_test.py    스모크 테스트 91건 (네트워크·실DB 미사용)
-verify_env.py    requirements.txt 핀 대조 + 런타임 기능 점검
   notify.py      4중 게이트 + 발송
   data.py        pykrx / FinanceDataReader 로더
 run_screen.py    실행부
+smoke_test.py    스모크 테스트 135건 (네트워크·실DB 미사용)
+verify_env.py    requirements.txt 핀 대조 + 런타임 기능 점검
+hermes/run.cmd   실행 래퍼 (에이전트는 반드시 이걸 쓴다)
 ```
 
 ## 설치
@@ -81,9 +85,12 @@ ElementTree) · 미선언 전이 의존성 경고를 확인한다.
 반드시 먼저 돌리십시오.
 
 ```bash
-python smoke_test.py        # 100개 검사
-python smoke_test.py -v     # 실패 시 트레이스백까지
+hermes\run.cmd smoke        # 135건 검사 (권장 — 인코딩·인터프리터 처리됨)
+hermes\run.cmd smoke -v     # 실패 시 트레이스백까지
 ```
+
+`python smoke_test.py` 를 직접 부르면 PATH 의 `python` 이 Microsoft Store
+스텁일 수 있고, 콘솔 코드페이지 949 에서 한글이 깨진다. 래퍼를 쓰십시오.
 
 하나 실패해도 멈추지 않고 끝까지 돌린 뒤 한꺼번에 보고한다. 손으로 검산
 가능한 앵커를 박아두어 파라미터를 흔들 때 회귀를 잡을 수 있다.
@@ -134,6 +141,10 @@ copy data\flags_manual.csv.example data\flags_manual.csv
 실행하면 남은 종목만 이어서 받는다.
 
 ## 일상 운용
+
+아래는 `python run_screen.py --mode X` 로 적었지만, **Windows 에서는
+`hermes\run.cmd --mode X` 를 쓰십시오.** 인터프리터 해석과 UTF-8 출력을
+래퍼가 처리한다. 자동화 에이전트는 래퍼만 써야 한다 (`AGENTS.md` 1장).
 
 ```bash
 python run_screen.py --mode update          # 당일 시세 증분 (요청 2회, 수초)
@@ -491,15 +502,20 @@ data/export/tickers_20260824.csv        종목 마스터
 
 ## 미완성 항목
 
-- 종목별 신용잔고 **자동** 수집 경로가 없다. `--mode credit` 으로 수동
-  주입은 가능하지만(위 참조), 넣지 않은 종목은 평균단가 P0 를 매물대 POC 로
-  추정하므로 청산 밴드의 정확도가 떨어진다. KRX 정보데이터시스템 또는
-  증권사 API 연동이 근본 해법이다.
+- 종목별 신용잔고 자동 수집은 **코드는 있고 bld 코드가 미확정**이다.
+  `krx_credit.py` 가 KRX 정보데이터시스템을 호출하지만 '신용거래융자
+  종목별 잔고'의 bld 값을 확인하지 못했다. `--mode credit-probe` 로 후보를
+  탐침한 뒤 `.env` 의 `KRX_CREDIT_BLD` 에 고정해야 동작한다. 확정 전까지는
+  수동 CSV 경로를 쓰고, 넣지 않은 종목은 평균단가 P0 를 매물대 POC 로
+  추정하므로 청산 밴드의 정확도가 떨어진다.
 - 감사의견 판정은 공시 **제목** 키워드 스캔이라 취약하다. 의견거절이 제목에
   드러나지 않는 경우가 많다. 다만 그런 종목은 대개 관리종목으로 지정되어
   ①에서 잡힌다. 확실히 하려면 `flags_manual.csv`로 직접 지정하십시오.
-- `backtest.py`: 없다. 청산 파라미터(익절폭·트레일링폭·시간스톱·밴드 이탈
-  확인일수)는 전부 가설이며 아직 검증되지 않았다.
+- 청산 파라미터(익절폭·트레일링폭·시간스톱·밴드 이탈 확인일수)는 전부
+  가설이다. `--mode backtest` 로 검증할 수 있으나 백테스트 자체가 생존
+  편향과 과거 시점 플래그 부재로 낙관적이다. 아직 실데이터로 돌리지 않았다.
+- 실데이터 첫 실행이 남아 있다. 스모크 테스트는 네트워크를 쓰지 않는다.
+  `master` → `backfill` → `flags` → `daily` 순서로 한 번 돌려야 한다.
 - 본 코드는 스크리닝 도구이며 투자 판단을 대신하지 않는다. 실탄 투입 전
   과거 데이터 검증(승률·추가 하락폭·지수 대조군)이 반드시 필요하다.
 
