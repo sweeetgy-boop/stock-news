@@ -28,8 +28,10 @@ stocknews/
   news.py        뉴스 정리 (중복제거 · 사건 클러스터 · 종목태깅 · 중요도)
   exits.py       청산 규칙 엔진 (8계층 우선순위)
   flags.py       배제 플래그 공급원 (FDR 관리종목 · DART · 로컬 · 수동)
-  krx_credit.py  신용잔고 자동 수집 가능성 진단 (결론: 불가 — 아래 절)
-  kiwoom.py      키움 OpenAPI+ 호출제한·계획·환경진단 (OCX 미접촉)
+  krx_credit.py  KRX 신용잔고 수집 가능성 진단 (결론: 불가 — 아래 절)
+  kiwoom.py      키움 대상선정·호출제한·환경진단 (OCX 미접촉)
+  kiwoom_rest.py 키움 REST (au10001 토큰 + ka10013 신용잔고) ★ 자동 경로
+  env.py         .env 로더 (dotenv 위임 + stdlib 폴백)
   backtest.py    워크포워드 이벤트 스터디 (운영 코드 절단 호출)
   trading_day.py 거래일 판정 (주말 · 공휴일 자기학습 캐시)
   joblock.py     잡 단위 파일 락
@@ -37,8 +39,8 @@ stocknews/
   notify.py      4중 게이트 + 발송
   data.py        pykrx / FinanceDataReader 로더
 run_screen.py    실행부
-kiwoom_bridge.py 키움 OCX 브릿지 (★ 32비트 파이썬 전용, 조회만)
-smoke_test.py    스모크 테스트 158건 (네트워크·실DB 미사용)
+kiwoom_bridge.py 키움 OCX 브릿지 (대체 경로 · 32비트 전용 · 사람이 실행)
+smoke_test.py    스모크 테스트 218건 (네트워크·실DB 미사용)
 verify_env.py    requirements.txt 핀 대조 + 런타임 기능 점검
 hermes/run.cmd   실행 래퍼 (에이전트는 반드시 이걸 쓴다)
 ```
@@ -87,7 +89,7 @@ ElementTree) · 미선언 전이 의존성 경고를 확인한다.
 반드시 먼저 돌리십시오.
 
 ```bash
-hermes\run.cmd smoke        # 158건 검사 (권장 — 인코딩·인터프리터 처리됨)
+hermes\run.cmd smoke        # 218건 검사 (권장 — 인코딩·인터프리터 처리됨)
 hermes\run.cmd smoke -v     # 실패 시 트레이스백까지
 ```
 
@@ -150,7 +152,9 @@ copy data\flags_manual.csv.example data\flags_manual.csv
 
 ```bash
 python run_screen.py --mode update          # 당일 시세 증분 (요청 2회, 수초)
-python run_screen.py --mode credit          # 수동 신용잔고 주입 (주 1회면 충분)
+python run_screen.py --mode credit-kiwoom   # 신용잔고 REST 실측 (앱키 필요)
+python run_screen.py --mode credit          # 신용잔고 CSV 적재 (자동 -> 수동)
+python run_screen.py --mode runs            # 배치 이력 + 스케줄 공백 점검
 python run_screen.py --mode export          # 전종목 점수표 CSV (협업용)
 python run_screen.py --mode daily           # 전종목 스캔 + 추천 10선
 python run_screen.py --mode weekly          # 금요일 주간 누적 분석
@@ -192,6 +196,8 @@ python run_screen.py --mode pos-close --id 1   # 수동 종료
 30  15  * * 1-5  ... run_screen.py --mode master
 40  15  * * 1-5  ... run_screen.py --mode update
 50  15  * * 1-5  ... run_screen.py --mode flags --dart-limit 400
+35  16  * * 1-5  ... run_screen.py --mode credit-kiwoom      # 신용잔고 실측
+40  18  * * 1-5  ... run_screen.py --mode runs               # 배치 이력 점검
 55  15  * * 1    ... run_screen.py --mode credit             # 주 1회 신용잔고
 15  16  * * 5    ... run_screen.py --mode export             # 금요일 협업 CSV
 0   18  * * 1-5  ... run_screen.py --mode daily
@@ -469,7 +475,10 @@ data/export/recos_20260824.csv          추천 10선 이력
 data/export/flags_20260824.csv          배제 플래그 현황
 data/export/positions_20260824.csv      보유 포지션
 data/export/exit_log_20260824.csv       청산 신호 이력
-data/export/credit_manual_20260824.csv  주입된 신용잔고
+data/export/credit_manual_20260824.csv  주입된 신용잔고 (출처 포함)
+data/export/runs_20260824.csv           배치 이력 (모드·성공·실패·소요)
+data/export/news_20260824.csv           뉴스 (중요도·클러스터)
+data/export/news_tickers_20260824.csv   뉴스-종목 태깅
 data/export/tickers_20260824.csv        종목 마스터
 ```
 
@@ -504,15 +513,25 @@ data/export/tickers_20260824.csv        종목 마스터
 
 ## 미완성 항목
 
-- 종목별 신용잔고는 **공개 소스로 자동 수집이 불가능하다.** 데이터가
-  공개되지 않는다(위 '신용잔고' 절의 실측 근거 참조). 키움 OpenAPI+
-  경로를 넣어뒀지만 **아직 실제 조회로 검증하지 않았다.** 32비트 파이썬
-  환경(`venv32`)이 아직 없고, OPT10013 의 출력 필드명도 `--discover` 로
-  확정해야 한다. 그때까지는 수동 CSV 경로를 쓰고, 넣지 않은 종목은
-  평균단가 P0 를 매물대 POC 로 추정하므로 청산 밴드 정확도가 떨어진다.
-- 섹터 분산 제한이 **비활성 상태다.** `fill_sectors` 가 FDR 상장목록에서
-  업종 컬럼을 찾는데, 현재 응답에 `Sector`/`Industry` 가 없다(`Dept` 는
-  소속부라 업종이 아니다). 추천 10선의 섹터 편중을 막지 못한다.
+- 종목별 신용잔고는 **무료 공개 소스로는 자동 수집이 불가능하다.** 데이터가
+  공개되지 않는다(아래 '신용잔고' 절의 실측 근거 참조). 자동 경로는 키움
+  REST(`--mode credit-kiwoom`) 하나이고, **앱키/시크릿이 필요하다.**
+  규격(au10001 / ka10013)은 키움증권 공식 예제 저장소에서 확정했고
+  가짜 서버를 물린 스모크 테스트 28건이 토큰·유량·재시도·응답해석 경로를
+  검증한다. 다만 **실제 앱키로 조회한 적은 아직 없다** — 앱키가 없다.
+  키를 넣기 전까지는 수동 CSV 경로를 쓰고, 넣지 않은 종목은 평균단가 P0 를
+  매물대 POC 로 추정하므로 청산 밴드 정확도가 떨어진다.
+- 실행 시점에 확인해야 할 값이 하나 남아 있다. ka10013 의 `remn`(잔고)
+  **단위가 문서에 없다.** 주인지 천주인지 응답에서 역산해 판정하는데
+  (`remn_rt × 상장주식수 ÷ remn`), 실제 응답으로 확인된 적은 없다.
+  판정이 안 되면 주식수를 비우고 잔고율만 쓴다 — 잔고율은 단위 모호성이
+  없으므로 채점에는 영향이 없다.
+- 섹터 분산 제한은 **동작한다** (2026-08-27 실측 2,527/2,527종목, 158업종).
+  출처는 `fdr.StockListing("KRX-DESC")` 의 `Industry` 컬럼이다.
+  주의: 같은 목록의 `Sector` 컬럼은 업종이 아니라 코스닥 **소속부**다
+  (우량기업부·벤처기업부·관리종목 등 9종). 그걸 섹터로 쓰면 '우량기업부'
+  안의 반도체와 제약이 서로 경쟁한다. `StockListing("KRX")` 에는 업종
+  컬럼이 아예 없다 — 예전에 이 목록만 조회해서 커버리지가 0% 였다.
 - 감사의견 판정은 공시 **제목** 키워드 스캔이라 취약하다. 의견거절이 제목에
   드러나지 않는 경우가 많다. 다만 그런 종목은 대개 관리종목으로 지정되어
   ①에서 잡힌다. 확실히 하려면 `flags_manual.csv`로 직접 지정하십시오.
@@ -730,11 +749,12 @@ python run_screen.py --mode backtest --bt-no-controls --bt-no-exits  # 빠른 �
 
 **결과는 실제보다 낙관적입니다.** 리포트 하단에 이 경고가 항상 출력됩니다.
 
-## 신용잔고 — 자동 수집은 불가능합니다
+## 신용잔고 — 무료 공개 소스로는 불가능합니다
 
-결론부터 적습니다. **종목별 신용거래융자 잔고는 공개되지 않습니다.**
-bld 코드를 못 찾은 게 아니라 데이터가 없습니다. 2026-08-24 에 후보 소스를
-전부 직접 두드려 확인했습니다.
+결론부터 적습니다. **종목별 신용거래융자 잔고는 무료로 공개되지 않습니다.**
+자동 경로는 키움 REST 하나이고 앱키가 필요합니다(다음 절).
+bld 코드를 못 찾은 게 아니라 공개 데이터가 없습니다. 2026-08-24 에 후보
+소스를 전부 직접 두드려 확인했습니다.
 
 ```
 KRX 정보데이터시스템   통계 메뉴 464개 전량 덤프 후 검색
@@ -763,9 +783,22 @@ FinanceDataReader      StockListing 키는 KRX / KRX-DELISTING /
 ### 실제로 쓸 수 있는 경로
 
 ```bash
-hermes\run.cmd --mode credit-probe   # 위 판정을 실행 시점에 재검증
-hermes\run.cmd --mode credit         # 수동 CSV 주입 (현재 유일하게 동작)
+hermes\run.cmd --mode credit-probe    # 위 판정을 실행 시점에 재검증
+hermes\run.cmd --mode credit-kiwoom   # 키움 REST 실측 (앱키 필요)
+hermes\run.cmd --mode credit          # CSV 체인 적재 (자동 -> 수동)
 ```
+
+`--mode credit` 은 세 출처를 **순서대로** 병합합니다. 뒤가 앞을 덮으므로
+사람이 넣은 값이 항상 이깁니다.
+
+```
+KRX 자동  ->  data/credit_kiwoom.csv (source=kiwoom)
+          ->  data/credit_manual.csv (source=manual)
+```
+
+어떤 출처가 몇 종목을 채웠는지는 `--json` 의 `by_source` 로 나옵니다.
+예전에는 `credit_manual.csv` 하나만 읽어서, 키움이 만든
+`credit_kiwoom.csv` 가 아무도 읽지 않는 채로 남아 있었습니다.
 
 `credit-probe` 는 엔드포인트 응답과 KRX 메뉴를 매번 다시 확인합니다.
 결론을 문서에만 적어두면 KRX 가 정책을 바꿨을 때 아무도 모릅니다.
@@ -776,42 +809,71 @@ hermes\run.cmd --mode credit         # 수동 CSV 주입 (현재 유일하게 �
 `KRX_CREDIT_BLD` 를 지정하지 않으면 **네트워크 요청조차 하지 않습니다.**
 수동 값은 항상 자동 수집을 덮어씁니다.
 
-## 키움 OpenAPI+ — 신용잔고 실측 자동화
+## 키움 REST — 신용잔고 실측 자동화
 
-종목별 신용잔고를 실제로 주는 유일한 자동 경로다. TR 규격은
-`C:\OpenAPI` 의 키움 정의 파일에서 직접 확인했다(추측 아님).
+종목별 신용잔고를 실제로 주는 유일한 자동 경로다. **REST 를 쓴다.**
 
 ```
-OPT10013  신용매매동향요청   화면 0141
-          입력: 종목코드 / 일자(YYYYMMDD) / 조회구분(1:융자, 2:대주)
-OPT10033  신용비율상위요청   상위 랭킹. 요청 1회로 과열 종목
-OPT10014  공매도추이요청     화면 0142. 죽은 pykrx 공매도 경로 대체 가능
-OPW20016  신용융자 가능종목요청
+권장   REST   --mode credit-kiwoom     앱키만 있으면 무인 실행
+대체   OCX    kiwoom_bridge.py         32비트 + 로그인 창. 사람이 실행
 ```
 
-출처: `koatrinputlegend.ini`(입력 필드), `koascreentrmap.ini`(화면↔TR).
+### 왜 REST 로 옮겼는가
 
-### 프로세스가 분리된 이유
-
-OpenAPI+ 는 **32비트 OCX(COM)** 다. 본체는 64비트 파이썬이고, 64비트
+OCX(OpenAPI+) 는 **32비트 COM** 이다. 본체는 64비트 파이썬이고, 64비트
 프로세스는 32비트 OCX 를 인프로세스로 로드할 수 없다. 레지스트리 실측:
 `InprocServer32` 가 `WOW6432Node` 아래에만 있다(32비트 전용 등록).
+그래서 별도 venv · pywin32 · PyQt5 · **로그인 창**이 필요하다. 사람이
+앉아 있어야 돌아간다.
 
-```
-[32비트] kiwoom_bridge.py  -->  data/credit_kiwoom.csv
-[64비트] run.cmd --mode credit   (기존 적재 경로, 테스트됨)
-```
+REST 는 앱키/시크릿만 있으면 그 전부가 필요 없다. 게다가 응답 필드명이
+공개돼 있어 `--discover` 탐침도 필요 없다.
 
-`credit_manual.csv` 와 다른 파일에 쓴다. 사람이 넣은 값을 덮어쓰지 않기
-위해서다. 적재 순서가 자동 → 수동이라 사람 값이 이긴다.
-
-### 호출 제한이 설계를 결정한다
-
-```
-초당 5건 / 분당 100건 / 시간당 1,000건
+```bash
+# 1) https://openapi.kiwoom.com 에서 앱 등록 -> 앱키 / 시크릿
+# 2) .env 에 KIWOOM_APP_KEY / KIWOOM_APP_SECRET 입력
+hermes\run.cmd --mode kiwoom-plan            # 준비 상태 + 대상 계획
+hermes\run.cmd --mode credit-kiwoom --json   # 실측 수집 + DB 적재
 ```
 
-**시간당 1,000건이 지배적이다.** 안전마진 900/시간으로 계산한 실측값:
+### 규격 (공식 예제 저장소에서 확정)
+
+```
+POST /oauth2/token                      au10001
+     {grant_type:"client_credentials", appkey, secretkey}
+  -> {token, token_type, expires_dt, return_code, return_msg}
+     expires_dt = YYYYMMDDHHMMSS, KST     <- naive 로 두면 9시간 어긋난다
+
+POST /api/dostk/stkinfo                 header api-id: ka10013
+     {stk_cd, dt:YYYYMMDD, qry_tp}         qry_tp 1:융자 2:대주
+  -> {crd_trde_trend:[{dt, cur_prc, ..., remn, remn_rt, ...}], ...}
+     remn    잔고        <- 단위가 문서에 없다. 런타임에 역산해 판정한다
+     remn_rt 잔고율(%)   <- 단위 모호성이 없다. 이게 1순위다
+```
+
+토큰은 `data/kiwoom_token.json` 에 캐시한다. **앱키와 시크릿은 저장하지
+않는다** — sha256 지문 앞 16자만 남겨 '키가 바뀌었는지'만 판정한다.
+앱키가 바뀌거나 실전↔모의를 전환하면 캐시를 버린다.
+
+빈 문자열과 `0` 을 구분한다. 키움은 값이 없는 날을 `""` 로 준다. 그걸
+0 으로 읽으면 신용 과열 종목이 깨끗한 종목으로 보인다.
+
+### 호출 제한 — 수치가 공개되지 않았다
+
+REST 가이드에 유량 제한 수치가 없다. OCX 문서에는 있다. 그 차이를
+숨기지 않는다.
+
+```
+OCX (문서에 있음)    초당 5 / 분당 100 / 시간당 1,000
+REST (공개 안 됨)    보수적 기본 초당 3 / 분당 60 / 시간당 900
+```
+
+REST 는 초과를 `return_code` 1700/1701/1702 로 알려준다. 그 코드나
+HTTP 429 를 받으면 **속도를 절반으로 줄이고** 백오프한다. 실제 제한을
+알게 되면 `.env` 의 `KIWOOM_REST_PER_SECOND` / `_PER_MINUTE` /
+`_PER_HOUR` 만 고치면 된다. 코드에 박힌 '공식값'은 없다.
+
+**시간당 한도가 지배적이다.** 시간당 900 기준 실측 계산:
 
 ```
   300종목  ->    3.1분     <- 이걸 쓴다
@@ -821,7 +883,6 @@ OpenAPI+ 는 **32비트 OCX(COM)** 다. 본체는 64비트 파이썬이고, 64�
 ```
 
 900건을 넘는 순간 첫 요청이 창을 벗어날 때까지 최대 1시간을 기다린다.
-게다가 제한에 걸리면 키움이 프로그램 재실행을 요구한다(`rc=-200`).
 
 그래서 전수조사를 하지 않는다. 대상은 이 값이 판정을 바꾸는 종목만
 고른다.
@@ -834,40 +895,65 @@ OpenAPI+ 는 **32비트 OCX(COM)** 다. 본체는 64비트 파이썬이고, 64�
 
 나머지는 지금처럼 매물대 POC 프록시로 남는다. 그게 정직하다.
 
-### 준비 (한 번만)
+### 대상 목록을 직접 주기
 
 ```bash
-hermes\run.cmd --mode kiwoom-plan          # 환경·계획 확인 (조회 없음)
+hermes\run.cmd --mode kiwoom-plan --write-targets data/kiwoom_targets.txt
+hermes\run.cmd --mode credit-kiwoom --targets-file data/kiwoom_targets.txt
+```
 
+### 검증 상태
+
+가짜 서버를 물린 스모크 테스트 28건이 토큰 캐시·만료·지문 불일치, 유량
+초과 감속, HTTP 429, 토큰 거부 재발급, 자격증명 오류 즉시 포기, 없는
+종목 격리, 전송 오류 재시도, 빈 문자열과 0 구분, 잔고 단위 역산, CSV
+왕복, 주문 경로 부재를 확인한다.
+
+**실제 앱키로 조회한 적은 없다.** 앱키가 없다. 그래서 `remn` 단위도
+아직 실측으로 확정되지 않았다.
+
+### 주의
+
+- **실서버로 쓰라.** 모의투자만 3개월 접속하면 서비스가 자동 해지된다.
+  모의 도메인은 KRX 만 지원한다.
+- 조회 TR 만 쓴다. 주문 엔드포인트와 주문 TR 은 코드에 등장하지 않으며,
+  스모크 테스트가 그 문자열의 부재를 회귀 가드로 검사한다. 이 시스템은
+  주문을 내지 않는다.
+- 키움 규정상 OpenAPI 사용 계좌는 한국거래소에 **알고리즘 계좌로 등록될
+  수 있다.** 조회만 해도 해당된다.
+- 토큰은 비밀이다. 로그에 남기지 않으며 `data/kiwoom_token.json` 은
+  `.gitignore` 대상 디렉터리에 있다.
+
+### OCX 경로 (대체 · 사람이 실행)
+
+TR 규격은 `C:\OpenAPI` 의 키움 정의 파일에서 직접 확인했다(추측 아님).
+
+```
+OPT10013  신용매매동향요청   화면 0141
+          입력: 종목코드 / 일자(YYYYMMDD) / 조회구분(1:융자, 2:대주)
+OPT10033  신용비율상위요청   상위 랭킹. 요청 1회로 과열 종목
+OPT10014  공매도추이요청     화면 0142. 죽은 pykrx 공매도 경로 대체 가능
+OPW20016  신용융자 가능종목요청
+```
+
+출처: `koatrinputlegend.ini`(입력 필드), `koascreentrmap.ini`(화면↔TR).
+
+```bash
 py -3.12-32 -m venv venv32                 # 32비트 파이썬 필요
 venv32\Scripts\pip install pywin32 PyQt5
 venv32\Scripts\python kiwoom_bridge.py --check
 venv32\Scripts\python kiwoom_bridge.py --discover
+venv32\Scripts\python kiwoom_bridge.py --plan-file data/kiwoom_targets.txt
+hermes\run.cmd --mode credit               # 결과 CSV 적재
 ```
 
 `--discover` 가 필요한 이유: OPT10013 의 **출력** 필드명이
 `C:\OpenAPI\data\opt10013.enc` 로 암호화돼 있어 오프라인으로 읽을 수
 없다. 후보를 실제 응답에 대보고 맞는 것만 `data/kiwoom_fields.json` 에
-고정한다. 다음 실행부터는 탐침을 건너뛴다.
+고정한다. REST 에는 이 문제가 없다.
 
-### 일상 사용
-
-```bash
-hermes\run.cmd --mode kiwoom-plan --write-targets data/kiwoom_targets.txt
-venv32\Scripts\python kiwoom_bridge.py --plan-file data/kiwoom_targets.txt
-hermes\run.cmd --mode credit
-```
-
-### 주의
-
-- 브릿지는 **로그인 창이 뜨는 대화형 프로그램**이다. 자동화 에이전트가
-  실행하면 안 된다. `AGENTS.md` 11장에 그렇게 적어뒀다.
-- **로그인은 실서버로 하라.** 모의투자만 3개월 접속하면 서비스가 자동
-  해지된다.
-- 브릿지는 조회 함수만 쓴다. `SendOrder` / `SendOrderCredit` 를 호출하지
-  않는다. 이 시스템은 주문을 내지 않는다.
-- 키움 규정상 OpenAPI 사용 계좌는 한국거래소에 **알고리즘 계좌로 등록될
-  수 있다.** 조회만 해도 해당된다.
+브릿지는 **로그인 창이 뜨는 대화형 프로그램**이다. 자동화 에이전트가
+실행하면 안 된다(`AGENTS.md` 11장).
 
 ## 전종목 시세 소스 — KRX 엔드포인트 중단 대응
 

@@ -29,6 +29,7 @@ from .trading_day import now_kst as _now_kst
 log = logging.getLogger(__name__)
 
 __all__ = ["EXCLUDE_KEYWORDS", "is_tradable_name", "refresh_master",
+           "fill_sectors", "sector_source", "SECTOR_LISTINGS",
            "fetch_day", "backfill_one", "liquidity_filter",
            "MARKETS_WANTED"]
 
@@ -286,7 +287,9 @@ def backfill_one(store, ticker: str, days: int = 420,
     """
     from pykrx import stock
 
-    end = datetime.now()
+    # KST 기준. UTC 호스트에서 datetime.now() 를 쓰면 조회 종료일이 하루
+    # 뒤처져 최신 봉이 조용히 빠진다.
+    end = _now_kst()
     start = end - timedelta(days=int(days * 1.7))
     for attempt in range(3):
         try:
@@ -333,24 +336,87 @@ def liquidity_filter(store, tickers: dict, min_amt_20d: float = 5e8,
     return keep
 
 
+# 업종 컬럼이 있는 FDR 상장목록. 순서가 우선순위다.
+#
+# 2026-08 실측: `StockListing("KRX")` 에는 업종 컬럼이 **없다**.
+#   KRX       Code ISU_CD Name Market Dept Close ... Marcap Stocks MarketId
+#   KRX-DESC  Code Name Market Sector Industry Products ListingDate ...
+#
+# 그동안 KRX 만 조회해서 매번 "업종 컬럼 없음" 경고를 내고 0을 반환했고,
+# 그 결과 전 종목 sector 가 NULL 이라 추천 10선의 섹터 분산 제한
+# (per_sector=2) 이 조용히 비활성 상태였다. `sec and ...` 조건이라
+# 에러 없이 통과해서 아무도 몰랐다.
+SECTOR_LISTINGS: tuple[str, ...] = ("KRX-DESC", "KRX")
+SECTOR_CODE_COLS = ("Code", "Symbol", "종목코드")
+
+# **`Industry` 가 1순위다. `Sector` 는 업종이 아니다.**
+#
+# 이름이 헷갈리는데 KRX-DESC 의 `Sector` 는 코스닥 **소속부**다
+# (`KRX` 목록의 `Dept` 와 같은 값). 2026-08-27 실측 분포:
+#
+#   Sector    9종      중견기업부 513 / 우량기업부 466 / 벤처기업부 343 /
+#                      기술성장기업부 256 / 관리종목(소속부없음) 122 / ...
+#   Industry  158종    소프트웨어 개발 및 공급업 191 / 특수 목적용 기계
+#                      제조업 169 / 전자부품 제조업 136 / ...
+#
+# 소속부를 섹터로 쓰면 분산 제한이 엉뚱하게 걸린다. '우량기업부' 안에는
+# 반도체와 제약과 은행이 같이 있는데 `per_sector=2` 가 그 셋을 서로
+# 경쟁시킨다. 게다가 관리종목·투자주의환기는 섹터가 아니라 배제 플래그다.
+SECTOR_NAME_COLS = ("Industry", "업종", "Sector")
+
+
+def sector_source(listings: tuple[str, ...] = SECTOR_LISTINGS) -> dict:
+    """업종을 실제로 주는 상장목록을 찾는다. 조회 결과를 근거로 낸다.
+
+    반환: {"listing","code_col","sector_col","rows","tried":[...]}
+    못 찾으면 listing 이 None 이다.
+    """
+    rep: dict = {"listing": None, "code_col": None, "sector_col": None,
+                 "rows": 0, "tried": []}
+    try:
+        import FinanceDataReader as fdr
+    except Exception as exc:  # noqa: BLE001
+        rep["error"] = f"FinanceDataReader 임포트 실패: {exc}"
+        return rep
+
+    for name in listings:
+        try:
+            lst = fdr.StockListing(name)
+        except Exception as exc:  # noqa: BLE001
+            rep["tried"].append({"listing": name,
+                                 "error": f"{type(exc).__name__}: {exc}"[:120]})
+            continue
+        cols = list(lst.columns)
+        code_col = next((c for c in SECTOR_CODE_COLS if c in cols), None)
+        sec_col = next((c for c in SECTOR_NAME_COLS if c in cols), None)
+        rep["tried"].append({"listing": name, "cols": cols[:12],
+                             "code_col": code_col, "sector_col": sec_col})
+        if code_col and sec_col:
+            rep.update({"listing": name, "code_col": code_col,
+                        "sector_col": sec_col, "rows": int(len(lst)),
+                        "_frame": lst})
+            return rep
+    return rep
+
+
 def fill_sectors(store) -> int:
     """업종 정보 보강. 추천 10선의 섹터 편중을 막는 데 쓴다.
 
     pykrx 에는 업종 API 가 없어서 FinanceDataReader 의 상장목록을 쓴다.
-    실패하면 섹터 없이 진행하고, 그 경우 섹터 분산 제한만 비활성된다.
+    업종 컬럼이 있는 목록을 순서대로 찾는다 (`SECTOR_LISTINGS` 주석 참조).
+    전부 실패하면 섹터 없이 진행하고, 그 경우 섹터 분산 제한만 비활성된다.
+    그 사실을 로그에 명시한다 — 조용히 비활성되면 아무도 모른다.
     """
-    try:
-        import FinanceDataReader as fdr
-        lst = fdr.StockListing("KRX")
-    except Exception as exc:  # noqa: BLE001
-        log.warning("업종 정보 조회 실패, 섹터 분산 제한 비활성: %s", exc)
+    rep = sector_source()
+    lst = rep.pop("_frame", None)
+    if lst is None:
+        log.warning("업종 정보를 주는 상장목록이 없습니다. 섹터 분산 제한 "
+                    "비활성. 시도: %s", rep.get("tried") or rep.get("error"))
         return 0
 
-    code_col = next((c for c in ("Code", "Symbol", "종목코드") if c in lst.columns), None)
-    sec_col = next((c for c in ("Sector", "Industry", "업종") if c in lst.columns), None)
-    if not code_col or not sec_col:
-        log.warning("업종 컬럼 없음: %s", list(lst.columns)[:10])
-        return 0
+    code_col, sec_col = rep["code_col"], rep["sector_col"]
+    log.info("업종 출처 %s (%s / %s) · %d행",
+             rep["listing"], code_col, sec_col, rep["rows"])
 
     existing = store.active_tickers()
     rows = []
@@ -361,5 +427,9 @@ def fill_sectors(store) -> int:
                          "sector": str(r[sec_col])[:40]})
     if rows:
         store.upsert_tickers(rows)
-    log.info("업종 정보 %d종목 반영", len(rows))
+    cov = len(rows) / max(1, len(existing)) * 100.0
+    log.info("업종 정보 %d/%d종목 반영 (%.1f%%)", len(rows), len(existing), cov)
+    if cov < 50.0:
+        log.warning("업종 커버리지가 %.1f%% 입니다. 섹터 분산 제한이 "
+                    "대부분의 종목에 걸리지 않습니다.", cov)
     return len(rows)

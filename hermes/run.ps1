@@ -4,14 +4,24 @@
 #   hermes\run.ps1 --mode daily
 #   hermes\run.ps1 --mode flash --json
 #   hermes\run.ps1 smoke
+#
+# 종료 코드: 0 정상 / 1 실패 / 2 부분 실패 / 3 락 충돌 / 4 전제조건
+#            64 인자 오류 / 90 저장소 이동 실패 / 91 파이썬 없음
 [CmdletBinding()]
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
 
 $ErrorActionPreference = 'Stop'
 
 # 저장소 루트로 이동. 상대경로(data/quant.db)가 깨지지 않게 고정한다.
+# 실패하면 exit 90. run.cmd 는 이 코드를 내는데 여기만 빠져 있으면
+# 에이전트가 래퍼에 따라 다른 코드를 보게 된다 (AGENTS.md 2장).
 $repo = Split-Path -Parent $PSScriptRoot
-Set-Location $repo
+try {
+    Set-Location -LiteralPath $repo -ErrorAction Stop
+} catch {
+    Write-Error "[run.ps1] 저장소로 이동할 수 없습니다: $repo"
+    exit 90
+}
 
 # UTF-8 강제. 콘솔 기본이 cp949 라 한글 stdout 이 깨진다.
 $env:PYTHONUTF8 = '1'

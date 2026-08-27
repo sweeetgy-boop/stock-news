@@ -36,6 +36,8 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+from .trading_day import now_kst
+
 log = logging.getLogger(__name__)
 
 __all__ = ["normalize_ohlcv", "load_ohlcv", "load_investor", "load_shorting",
@@ -71,8 +73,13 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_ohlcv(ticker: str, days: int = 400) -> pd.DataFrame:
-    """pykrx 우선, 실패 시 FinanceDataReader 폴백."""
-    end = datetime.now()
+    """pykrx 우선, 실패 시 FinanceDataReader 폴백.
+
+    조회 종료일은 **KST 기준**이다. `datetime.now()` 를 쓰면 UTC 호스트에서
+    한국 날짜보다 최대 9시간 뒤처져, 16:05 배치가 그날 봉을 요청조차 하지
+    못한다. 에러가 나지 않고 그냥 하루가 비어서 알아채기 어렵다.
+    """
+    end = now_kst()
     start = end - timedelta(days=int(days * 1.6))
     try:
         from pykrx import stock
@@ -87,7 +94,7 @@ def load_ohlcv(ticker: str, days: int = 400) -> pd.DataFrame:
 
 def load_investor(ticker: str, days: int = 180) -> pd.DataFrame | None:
     """투자자별 순매수대금. 신용잔고 없을 때 평균단가 프록시(방법 B)로 쓴다."""
-    end = datetime.now()
+    end = now_kst()
     start = end - timedelta(days=int(days * 1.6))
     try:
         from pykrx import stock
@@ -104,7 +111,7 @@ def load_investor(ticker: str, days: int = 180) -> pd.DataFrame | None:
 
 def load_shorting(ticker: str, days: int = 120) -> pd.DataFrame | None:
     """공매도 잔고. 공시가 T+2 지연이므로 스코어링에서 shift 처리한다."""
-    end = datetime.now()
+    end = now_kst()
     start = end - timedelta(days=int(days * 1.6))
     try:
         from pykrx import stock

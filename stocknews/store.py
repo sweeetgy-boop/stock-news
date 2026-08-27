@@ -45,6 +45,17 @@ def _now_kst() -> datetime:
 def _now_str() -> str:
     return _now_kst().isoformat(timespec="seconds")
 
+
+def _as_kst_naive(value: datetime) -> datetime:
+    """호출자가 준 시각을 DB 표준(naive KST)으로 맞춘다.
+
+    aware 면 KST 로 변환하고 tz 를 뗀다. naive 는 이미 KST 로 본다.
+    이 정규화가 없으면 aware 와 naive 를 빼다가 TypeError 가 난다.
+    """
+    if value.tzinfo is not None:
+        return value.astimezone(KST).replace(tzinfo=None)
+    return value
+
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -950,6 +961,41 @@ class Store:
                 "SELECT MAX(asof) FROM credit_manual").fetchone()[0]
         return {"active": int(total), "with_credit": int(have), "asof": newest}
 
+    def sector_coverage(self) -> dict:
+        """업종이 채워진 활성 종목 비율.
+
+        섹터 분산 제한(`select_recommendations(per_sector=2)`)은 sector 가
+        NULL 이면 조용히 통과한다. 커버리지가 0%면 제한이 사실상 없는데
+        에러가 나지 않아 알아챌 수 없다. 그래서 숫자로 낸다.
+        """
+        with closing(self._conn()) as con:
+            total = con.execute(
+                "SELECT COUNT(*) FROM tickers WHERE active=1").fetchone()[0]
+            have = con.execute(
+                "SELECT COUNT(*) FROM tickers WHERE active=1 "
+                "AND sector IS NOT NULL AND TRIM(sector)<>''").fetchone()[0]
+            n_sec = con.execute(
+                "SELECT COUNT(DISTINCT sector) FROM tickers WHERE active=1 "
+                "AND sector IS NOT NULL AND TRIM(sector)<>''").fetchone()[0]
+        pct = (have / total * 100.0) if total else 0.0
+        return {"active": int(total), "with_sector": int(have),
+                "sectors": int(n_sec), "pct": round(pct, 1)}
+
+    def credit_sources(self) -> dict:
+        """출처별 신용잔고 종목 수. {source: {"n","asof"}}
+
+        커버리지 숫자만 보면 '몇 종목이 실측이냐'는 알 수 있지만 '누가
+        채웠냐'는 모른다. 자동 수집이 조용히 죽어서 사람이 넣은 옛 값만
+        남은 상황과, 자동이 잘 도는 상황이 같은 숫자로 보인다. 그 둘을
+        구분하기 위한 조회다.
+        """
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT COALESCE(source,'?') AS s, COUNT(*), MAX(asof) "
+                "FROM credit_manual WHERE ratio IS NOT NULL "
+                "GROUP BY s ORDER BY 2 DESC").fetchall()
+        return {str(s): {"n": int(n), "asof": asof} for s, n, asof in rows}
+
     # ────────────────────────── CSV 내보내기 ──────────────────────────
     # 김승곤 차장이 신용잔고 증감률과 대조할 수 있도록 전종목 점수표를
     # 엑셀로 떨어뜨린다. 인코딩은 utf-8-sig 여야 한다. BOM 이 없으면
@@ -958,6 +1004,21 @@ class Store:
         "scans": "SELECT * FROM scans WHERE d>=? ORDER BY d,value_score DESC",
         "recos": "SELECT * FROM recos WHERE d>=? ORDER BY d,rank",
         "exit_log": "SELECT * FROM exit_log WHERE d>=? ORDER BY d DESC,id DESC",
+        # 배치 이력도 내보낸다. 성과를 따질 때 '그날 잡이 돌았는지'가
+        # 먼저다. 스캔 결과만 보면 잡이 죽어서 빈 것과 시장이 조용해서
+        # 빈 것을 구분할 수 없다.
+        # runs 에는 명시적 id 컬럼이 없다. SQLite 의 암묵 rowid 를 쓴다.
+        # ALTER TABLE 로 PRIMARY KEY 컬럼을 추가할 수 없어서, 기존 DB 와
+        # 새 DB 가 같은 모양을 유지하는 쪽을 골랐다.
+        "runs": "SELECT rowid AS id,* FROM runs WHERE started>=? "
+                "ORDER BY rowid DESC",
+        # 뉴스도 내보낸다. 종목 태깅이 맞았는지, 어떤 사건이 추천과
+        # 겹쳤는지는 CSV 로 놓고 봐야 확인된다. 두 테이블이 빠져 있었다.
+        "news": "SELECT * FROM news WHERE d>=? ORDER BY d DESC,importance DESC",
+        "news_tickers": "SELECT nt.news_id,nt.ticker,n.d,n.title,n.category,"
+                        "n.importance FROM news_tickers nt "
+                        "JOIN news n ON n.id=nt.news_id "
+                        "WHERE n.d>=? ORDER BY n.d DESC,nt.ticker",
     }
     _EXPORTS_FULL = {
         "flags": "SELECT * FROM flags",
@@ -991,13 +1052,78 @@ class Store:
 
     # ────────────────────────── 실행 이력 ──────────────────────────
     def log_run(self, mode: str, started: datetime, ok: int, failed: int,
-                note: str = "") -> None:
-        fin = datetime.now()
+                note: str = "", elapsed: float | None = None) -> None:
+        """배치 1회를 기록한다.
+
+        `datetime.now()` 대신 KST 를 쓴다. 나머지 테이블이 전부 KST 인데
+        `runs` 만 서버 로컬시각이면 UTC 호스트에서 9시간 어긋나 이력
+        대조가 불가능해진다.
+
+        `started` 는 naive(KST 가정) 든 aware 든 받는다. 섞인 것을 그대로
+        빼면 TypeError 로 죽는다 — 기록이 목적인 함수가 배치를 죽이면
+        본말이 전도된다.
+        """
+        fin = _now_kst()
+        st = _as_kst_naive(started)
+        if elapsed is None:
+            elapsed = (fin - st).total_seconds()
         with closing(self._conn()) as con:
             con.execute(
                 "INSERT INTO runs(started,finished,mode,ok,failed,elapsed,note) "
                 "VALUES(?,?,?,?,?,?,?)",
-                (started.isoformat(timespec="seconds"),
-                 fin.isoformat(timespec="seconds"), mode, ok, failed,
-                 (fin - started).total_seconds(), note))
+                (st.isoformat(timespec="seconds"),
+                 fin.isoformat(timespec="seconds"), mode, int(ok), int(failed),
+                 float(elapsed), note))
             con.commit()
+
+    def run_history(self, days: int = 14, mode: str | None = None,
+                    limit: int = 200) -> pd.DataFrame:
+        """최근 배치 이력. 이 테이블을 읽는 코드가 없었다.
+
+        AGENTS.md 7장이 "runs 테이블에 모든 배치 이력이 남습니다"라고
+        약속하는데, 쓰는 모드가 둘뿐이고 읽는 경로가 아예 없었다.
+        약속만 있고 확인할 방법이 없으면 그 약속은 검증되지 않는다.
+        """
+        since = (_now_kst() - timedelta(days=max(0, int(days)))
+                 ).isoformat(timespec="seconds")
+        sql = ("SELECT rowid AS id,mode,started,finished,ok,failed,elapsed,note "
+               "FROM runs WHERE started>=?")
+        params: list = [since]
+        if mode:
+            sql += " AND mode=?"
+            params.append(mode)
+        sql += " ORDER BY rowid DESC LIMIT ?"
+        params.append(int(limit))
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(sql, con, params=params)
+
+    def run_summary(self, days: int = 7) -> dict:
+        """모드별 최근 실행 요약. {mode: {...}}
+
+        '몇 시간 전에 돌았나'가 핵심이다. 스케줄이 조용히 멈춘 것을
+        알아채는 유일한 근거다.
+        """
+        since = (_now_kst() - timedelta(days=max(0, int(days)))
+                 ).isoformat(timespec="seconds")
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT mode, COUNT(*), MAX(started), SUM(ok), SUM(failed), "
+                "       AVG(elapsed), MAX(elapsed) "
+                "FROM runs WHERE started>=? GROUP BY mode "
+                "ORDER BY MAX(started) DESC", (since,)).fetchall()
+        now = _now_kst()
+        out: dict = {}
+        for mode, n, last, ok, failed, avg, mx in rows:
+            age = None
+            try:
+                age = round((now - datetime.fromisoformat(str(last))
+                             ).total_seconds() / 3600.0, 1)
+            except (TypeError, ValueError):
+                pass
+            out[str(mode)] = {
+                "runs": int(n), "last": last, "age_hours": age,
+                "ok": int(ok or 0), "failed": int(failed or 0),
+                "avg_sec": round(float(avg or 0.0), 1),
+                "max_sec": round(float(mx or 0.0), 1),
+            }
+        return out

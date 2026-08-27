@@ -179,6 +179,42 @@ def main() -> int:
     feat("timezone KST", f_zoneinfo)
     feat("zipfile + ElementTree (DART corpCode)", f_stdlib_zip_xml)
 
+    # ── 설정 점검 ──
+    # 핀 버전이 맞아도 .env 가 없으면 발송 모드가 전부 exit 4 로 끝난다.
+    # 그게 '환경 검증' 에서 안 보이면 원인 추적이 오래 걸린다.
+    print("\n" + "=" * width)
+    print(" 설정 (.env)")
+    print("=" * width)
+    config_missing = []
+    try:
+        from stocknews.env import ENV_PATH, KNOWN_KEYS, load_env, mask
+        rep = load_env()
+        if rep["exists"]:
+            print(f"  OK    {ENV_PATH}  (파서: {rep['backend']})")
+        else:
+            print(f" MISS   {ENV_PATH} 없음")
+            print("        copy .env.example .env  후 값을 채우십시오")
+        if rep.get("unknown_keys"):
+            print(f"  경고  알 수 없는 키: {', '.join(rep['unknown_keys'])}")
+        import os as _os
+        for k in KNOWN_KEYS:
+            v = _os.environ.get(k)
+            src = " (.env)" if k in rep.get("applied", []) else (
+                " (OS 환경변수)" if v else "")
+            status = mask(k, v)
+            tag = "  OK  " if v else " ---- "
+            print(f" {tag}  {k:<22} {status}{src}")
+        for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+            if not _os.environ.get(k):
+                config_missing.append(k)
+        if config_missing:
+            print(f"\n  {', '.join(config_missing)} 미설정 — 발송 모드는 "
+                  "exit 4 로 끝납니다.")
+            print("  --dry-run 을 쓰면 토큰 없이도 콘솔로 확인할 수 있습니다.")
+    except Exception as exc:  # noqa: BLE001
+        print(f" FAIL   .env 점검 불가  {type(exc).__name__}: {exc}")
+        feature_fail.append((".env 점검", f"{type(exc).__name__}: {exc}"))
+
     # 선언 누락된 전이 의존성 경고
     print("\n" + "=" * width)
     print(" 미선언 전이 의존성")

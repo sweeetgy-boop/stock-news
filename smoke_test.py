@@ -634,6 +634,94 @@ def test_store(tmp: Path):
         cov = st.credit_coverage()
         assert cov["with_credit"] == 2 and cov["active"] >= 1
 
+    def t_credit_sources():
+        """출처를 기록해야 '자동이 죽었는지'를 알 수 있다.
+
+        예전에는 파서가 source 를 "manual" 로 박아서, 키움/KRX 가 넣은
+        값도 사람이 넣은 것으로 기록됐다. 자동 수집이 조용히 멈춘 상황과
+        잘 도는 상황이 같은 숫자로 보였다.
+        """
+        st.upsert_credit([{"ticker": "000002", "ratio": 3.3,
+                           "asof": "2026-08-24", "source": "kiwoom"}])
+        src = st.credit_sources()
+        assert "kiwoom" in src, src
+        assert src["kiwoom"]["n"] == 1, src
+        assert "manual" in src, src
+        assert sum(v["n"] for v in src.values()) == st.credit_coverage()[
+            "with_credit"], src
+
+    def t_credit_chain_order():
+        """적재 순서: 자동 -> 수동. 사람의 값이 항상 이겨야 한다."""
+        from stocknews.flags import refresh_credit_chain
+        from stocknews.store import Store
+
+        st2 = Store(tmp / "chain.db")
+        st2.upsert_tickers([{"ticker": "111111", "name": "체인",
+                             "market": "KOSPI", "shares": 1_000_000}])
+        auto = tmp / "chain_kiwoom.csv"
+        manual = tmp / "chain_manual.csv"
+        head = "종목코드,신용잔고율,신용잔고주식수,기준일,비고\n"
+        auto.write_text(head + "111111,1.11,,2026-08-26,kiwoom:ka10013\n",
+                        encoding="utf-8-sig")
+        manual.write_text(head + "111111,9.99,,2026-08-26,사람\n",
+                          encoding="utf-8-sig")
+
+        res = refresh_credit_chain(
+            st2, chain=((str(auto), "kiwoom"), (str(manual), "manual")))
+        assert [s["source"] for s in res["steps"]] == ["kiwoom", "manual"], \
+            res["steps"]
+        near(st2.load_credit_ratios(max_age_days=None)["111111"], 9.99,
+             label="수동이 자동을 덮음")
+        assert st2.credit_sources()["manual"]["n"] == 1, st2.credit_sources()
+
+        # 순서를 뒤집으면 자동이 이긴다 — 순서가 실제로 의미를 갖는지 확인
+        res2 = refresh_credit_chain(
+            st2, chain=((str(manual), "manual"), (str(auto), "kiwoom")))
+        assert res2["steps"][-1]["source"] == "kiwoom"
+        near(st2.load_credit_ratios(max_age_days=None)["111111"], 1.11,
+             label="순서가 결과를 바꿈")
+
+        # 없는 파일은 조용히 건너뛴다 (0건 보고)
+        res3 = refresh_credit_chain(
+            st2, chain=((str(tmp / "nope.csv"), "kiwoom"),))
+        assert res3["steps"][0]["stored"] == 0, res3
+
+    def t_credit_chain_manual_stays_last():
+        """--credit-file 로 경로를 바꿔도 수동이 마지막이어야 한다."""
+        from stocknews.flags import CREDIT_CHAIN, refresh_credit_chain
+        from stocknews.store import Store
+
+        assert CREDIT_CHAIN[-1][1] == "manual", CREDIT_CHAIN
+        st3 = Store(tmp / "chain2.db")
+        st3.upsert_tickers([{"ticker": "222222", "name": "체인2",
+                             "market": "KOSPI", "shares": 1_000_000}])
+        alt = tmp / "alt_manual.csv"
+        alt.write_text("종목코드,신용잔고율,신용잔고주식수,기준일,비고\n"
+                       "222222,7.77,,2026-08-26,대체경로\n",
+                       encoding="utf-8-sig")
+        res = refresh_credit_chain(st3, manual_path=str(alt))
+        assert res["steps"][-1]["source"] == "manual", res["steps"]
+        assert res["steps"][-1]["path"] == str(alt), res["steps"]
+        near(st3.load_credit_ratios(max_age_days=None)["222222"], 7.77,
+             label="대체 수동 경로 적재")
+
+    def t_credit_shares_derived():
+        """비율이 없고 주식수만 있으면 상장주식수로 역산한다."""
+        from stocknews.flags import refresh_credit
+        from stocknews.store import Store
+
+        st4 = Store(tmp / "derive.db")
+        st4.upsert_tickers([{"ticker": "333333", "name": "역산",
+                             "market": "KOSPI", "shares": 10_000_000}])
+        p = tmp / "derive.csv"
+        p.write_text("종목코드,신용잔고율,신용잔고주식수,기준일,비고\n"
+                     "333333,,250000,2026-08-26,\n", encoding="utf-8-sig")
+        res = refresh_credit(st4, p, source="kiwoom")
+        assert res["derived"] == 1, res
+        near(st4.load_credit_ratios(max_age_days=None)["333333"], 2.5,
+             label="250,000 / 10,000,000 = 2.5%")
+        assert st4.credit_sources()["kiwoom"]["n"] == 1
+
     def t_credit_lifts_cap():
         """실측 신용잔고가 들어오면 매집 점수 상한이 올라가야 한다."""
         from stocknews.cost_basis import estimate_cost_basis
@@ -652,7 +740,8 @@ def test_store(tmp: Path):
         out = tmp / "export"
         written = st.export_csv(out_dir=out, days=30, tag="smoke")
         for name in ("scans", "recos", "flags", "positions", "tickers",
-                     "credit_manual", "exit_log"):
+                     "credit_manual", "exit_log", "runs",
+                     "news", "news_tickers"):
             assert name in written, f"{name} 내보내기 누락"
             p = Path(written[name]["path"])
             assert p.exists(), f"{p} 없음"
@@ -666,6 +755,53 @@ def test_store(tmp: Path):
         pm = st.price_matrix(days=10)
         assert not pm.empty and "000001" in pm.columns
         st.log_run("smoke", datetime.now(), 1, 0, note="ok")
+
+    def t_runs_history():
+        """runs 테이블 조회 경로. 쓰기만 있고 읽는 코드가 없었다.
+
+        AGENTS.md 7장이 "모든 배치 이력이 남습니다"라고 약속하지만
+        확인할 방법이 없었다. 검증 없는 약속은 조용히 깨진다.
+        """
+        from datetime import timedelta as _td
+        from datetime import timezone as _tz
+
+        st.log_run("daily", datetime.now(), 1800, 3, note="rc=0")
+        st.log_run("daily", datetime.now(), 1750, 1, note="rc=0")
+        st.log_run("exits", datetime.now(), 2, 0, note="rc=0")
+
+        hist = st.run_history(days=1)
+        assert not hist.empty, "이력이 조회되지 않는다"
+        assert set(["mode", "started", "finished", "ok", "failed",
+                    "elapsed", "note"]) <= set(hist.columns), list(hist.columns)
+        only = st.run_history(days=1, mode="daily")
+        assert len(only) == 2, len(only)
+        assert set(only["mode"]) == {"daily"}
+        assert len(st.run_history(days=1, limit=1)) == 1, "limit 무시됨"
+
+        rep = st.run_summary(days=1)
+        assert rep["daily"]["runs"] == 2, rep["daily"]
+        assert rep["daily"]["ok"] == 3550, rep["daily"]
+        assert rep["daily"]["failed"] == 4, rep["daily"]
+        assert rep["daily"]["age_hours"] is not None
+        assert rep["daily"]["age_hours"] < 1.0, rep["daily"]
+
+        # aware 든 naive 든 받아야 한다. 섞어 빼면 TypeError 로 죽는다.
+        aware = datetime.now(_tz(_td(hours=9))) - _td(seconds=5)
+        st.log_run("tz-probe", aware, 1, 0)
+        got = st.run_history(days=1, mode="tz-probe")
+        assert len(got) == 1, "aware datetime 이 거부됐다"
+        near(float(got.iloc[0]["elapsed"]), 5.0, tol=3.0, label="경과 초")
+
+        # 저장 시각은 KST 여야 한다. runs 만 서버 로컬시각이면 UTC
+        # 호스트에서 다른 테이블과 9시간 어긋나 대조가 불가능해진다.
+        kst_now = datetime.now(_tz(_td(hours=9))).replace(tzinfo=None)
+        fin = datetime.fromisoformat(str(got.iloc[0]["finished"]))
+        assert abs((fin - kst_now).total_seconds()) < 120, \
+            f"finished 가 KST 가 아니다: {fin} vs {kst_now}"
+
+    def t_runs_exported():
+        """runs 가 CSV 내보내기에서 빠져 있었다. 성과 대조의 전제다."""
+        assert "runs" in Store._EXPORTS, list(Store._EXPORTS)
 
     check("store", "시세 왕복 + 멱등성", t_prices)
     check("store", "일자별 전종목 적재 (거래정지 제외)", t_cross_section)
@@ -681,8 +817,14 @@ def test_store(tmp: Path):
     check("store", "포지션 종료", t_close)
     check("store", "뉴스 적재/조회", t_news)
     check("store", "수동 신용잔고 + 기준일 만료", t_credit_manual)
+    check("store", "신용잔고 출처 집계", t_credit_sources)
+    check("credit", "적재 순서 (수동이 이김)", t_credit_chain_order)
+    check("credit", "수동은 항상 체인 마지막", t_credit_chain_manual_stays_last)
+    check("credit", "주식수 -> 비율 역산", t_credit_shares_derived)
     check("liquidation", "실측 신용잔고가 캡을 벗김", t_credit_lifts_cap)
     check("store", "CSV 내보내기 (BOM 확인)", t_export)
+    check("runs", "이력 조회 + 모드별 요약", t_runs_history)
+    check("runs", "CSV 내보내기 포함", t_runs_exported)
     check("store", "기타 조회", t_misc)
     return st
 
@@ -1580,6 +1722,72 @@ def test_kiwoom(tmp: Path):
         assert estimate_seconds(SAFE_PER_HOUR + 1, per_hour=SAFE_PER_HOUR) \
             > 3000
 
+    def t_sector_listing_choice():
+        """업종 컬럼이 있는 상장목록을 골라야 한다 (네트워크 없이 규격만).
+
+        2026-08 실측: `StockListing("KRX")` 컬럼에 Sector/Industry 가 없고
+        `KRX-DESC` 에는 둘 다 있다. 그동안 KRX 만 조회해서 매번 0을
+        반환했고, 전 종목 sector 가 NULL 이라 추천 10선의 섹터 분산
+        제한이 조용히 꺼져 있었다.
+        """
+        from stocknews.universe import (SECTOR_LISTINGS, SECTOR_NAME_COLS,
+                                       sector_source)
+
+        assert SECTOR_LISTINGS[0] == "KRX-DESC", SECTOR_LISTINGS
+        # Industry 가 Sector 보다 앞이어야 한다. 이름이 헷갈리지만
+        # KRX-DESC 의 Sector 는 코스닥 '소속부'다 (우량기업부/벤처기업부
+        # /관리종목 ...). 2026-08-27 실측으로 9종뿐이고, Industry 는
+        # 158종이다. 소속부를 섹터로 쓰면 분산 제한이 엉뚱하게 걸린다.
+        assert SECTOR_NAME_COLS.index("Industry") < \
+            SECTOR_NAME_COLS.index("Sector"), SECTOR_NAME_COLS
+
+        krx_cols = ["Code", "ISU_CD", "Name", "Market", "Dept", "Close",
+                    "Marcap", "Stocks", "MarketId"]
+        desc_cols = ["Code", "Name", "Market", "Sector", "Industry",
+                     "Products", "ListingDate"]
+
+        class _FakeFdr:
+            def StockListing(self, name):  # noqa: N802  외부 API 이름
+                import pandas as _pd
+                cols = desc_cols if name == "KRX-DESC" else krx_cols
+                return _pd.DataFrame([{c: "x" for c in cols}])
+
+        import sys as _sys
+        saved = _sys.modules.get("FinanceDataReader")
+        _sys.modules["FinanceDataReader"] = _FakeFdr()
+        try:
+            rep = sector_source()
+            assert rep["listing"] == "KRX-DESC", rep
+            assert rep["sector_col"] == "Industry", \
+                f"소속부(Sector)를 업종으로 골랐다: {rep}"
+            # KRX 만 주면 업종을 못 찾고, 그 사실을 근거와 함께 낸다
+            rep2 = sector_source(listings=("KRX",))
+            assert rep2["listing"] is None, rep2
+            assert rep2["tried"] and rep2["tried"][0]["sector_col"] is None
+        finally:
+            if saved is None:
+                _sys.modules.pop("FinanceDataReader", None)
+            else:
+                _sys.modules["FinanceDataReader"] = saved
+
+    def t_sector_coverage_visible():
+        """섹터 분산이 꺼져 있으면 숫자로 보여야 한다."""
+        from stocknews.store import Store
+
+        st = Store(tmp / "sect.db")
+        st.upsert_tickers([{"ticker": "005930", "name": "삼성전자",
+                            "market": "KOSPI"},
+                           {"ticker": "000660", "name": "SK하이닉스",
+                            "market": "KOSPI"}])
+        cov = st.sector_coverage()
+        assert cov["active"] == 2 and cov["with_sector"] == 0, cov
+        near(cov["pct"], 0.0, label="업종 0%")
+        st.upsert_tickers([{"ticker": "005930", "name": "삼성전자",
+                            "market": "KOSPI", "sector": "반도체"}])
+        cov = st.sector_coverage()
+        assert cov["with_sector"] == 1 and cov["sectors"] == 1, cov
+        near(cov["pct"], 50.0, label="업종 50%")
+
     def t_env_shape():
         env = check_environment(openapi_dir=str(tmp / "nope"))
         for k in ("python_bits", "ocx_present", "ocx_registered",
@@ -1642,11 +1850,474 @@ def test_kiwoom(tmp: Path):
     check("kiwoom", "어떤 창도 초과 안 함", t_limiter_never_exceeds)
     check("kiwoom", "ETA = 제한기 동일 로직", t_eta_matches_limiter)
     check("kiwoom", "전종목 불가 · 샷리스트 가능", t_full_scan_infeasible)
+    check("universe", "업종 상장목록 선택 (KRX-DESC)", t_sector_listing_choice)
+    check("universe", "업종 커버리지 가시화", t_sector_coverage_visible)
     check("kiwoom", "환경 진단 형태", t_env_shape)
     check("kiwoom", "수집 계획", t_plan_and_targets)
     check("kiwoom", "CSV 왕복 (기존 파서 호환)", t_csv_roundtrip)
     check("kiwoom", "필드 매핑 왕복", t_field_map_roundtrip)
     check("kiwoom", "필드 후보 존재", t_field_candidates_are_probes)
+
+
+# ═════════════════ 12-2. 키움 REST (au10001 + ka10013) ═════════════════
+def test_kiwoom_rest(tmp: Path):
+    """키움 REST 경로. 가짜 서버를 물려 네트워크 없이 전 경로를 검증한다.
+
+    OCX 경로와 달리 응답 필드명이 확정이다(공식 예제 저장소). 그래서
+    탐침이 아니라 **규격 고정**을 검사한다. 필드명이 바뀌면 여기서 깨진다.
+
+    검증 축은 넷이다.
+      규격   경로 / api-id / 필드명 / expires_dt 타임존
+      토큰   캐시 재사용 · 만료 재발급 · 지문 불일치 · 비밀 미저장
+      실패   유량 초과 · 토큰 거부 · 자격증명 거부 · 없는 종목
+      해석   빈 문자열 != 0 · 잔고 단위 판정 · CSV 왕복
+    """
+    import itertools
+    from datetime import datetime as dt
+    from datetime import timezone as tz
+
+    from stocknews.flags import load_credit_csv
+    from stocknews.kiwoom import RateLimiter, write_credit_csv
+    from stocknews.kiwoom_rest import (API_CREDIT_TREND, API_TOKEN, BASE_MOCK,
+                                       BASE_REAL, CREDIT_FIELDS,
+                                       CREDIT_LIST_KEY, FIELD_BALANCE,
+                                       FIELD_BALANCE_RATIO, INQUIRY_LOAN,
+                                       LIMITS_ARE_PUBLISHED, STKINFO_PATH,
+                                       TOKEN_PATH, AuthError, HttpReply,
+                                       KiwoomRestClient, RateLimited,
+                                       SymbolNotFound, TokenStore,
+                                       base_url_from_env, collect_credit,
+                                       credentials_from_env, limiter_from_env,
+                                       parse_expiry, parse_number,
+                                       pick_latest_credit, resolve_share_unit,
+                                       return_code_of)
+
+    UTC = tz.utc
+
+    def _row(d, remn="", remn_rt="", cur="65100"):
+        """ka10013 레코드 1건. 필드명은 공식 예제 저장소 그대로."""
+        return {"dt": d, "cur_prc": cur, "pred_pre_sig": "0", "pred_pre": "0",
+                "trde_qty": "1000", "new": "", "rpya": "", "remn": remn,
+                "amt": "", "pre": "", "shr_rt": "", "remn_rt": remn_rt}
+
+    class Fake:
+        """가짜 키움. 스크립트로 실패를 주입할 수 있다."""
+
+        def __init__(self, credit=None, expires="20991231235959"):
+            self.credit = credit or {}
+            self.expires = expires
+            self.token_calls = 0
+            self.tr_calls = []          # (api_id, body, headers)
+            self.script = []            # 앞에서부터 소비되는 강제 응답
+            self.token_value = "TOK-1"
+
+        def __call__(self, method, url, headers, payload, timeout):
+            if url.endswith(TOKEN_PATH):
+                self.token_calls += 1
+                assert payload["grant_type"] == "client_credentials"
+                assert "appkey" in payload and "secretkey" in payload
+                return HttpReply(200, {"token": self.token_value,
+                                       "token_type": "bearer",
+                                       "expires_dt": self.expires,
+                                       "return_code": 0,
+                                       "return_msg": "정상"})
+            self.tr_calls.append((headers.get("api-id"), payload, headers))
+            if self.script:
+                return self.script.pop(0)
+            code = payload.get("stk_cd")
+            return HttpReply(200, {CREDIT_LIST_KEY: self.credit.get(code, []),
+                                   "return_code": 0, "return_msg": "정상"},
+                             headers={"cont-yn": "N", "next-key": "",
+                                      "api-id": API_CREDIT_TREND})
+
+    # 토큰 캐시 파일은 검사마다 새로 준다. id(fake) 를 쓰면 파이썬이
+    # 회수한 주소를 재사용해 다른 검사의 캐시를 물려받는다 (실제로
+    # 만료 검사가 2099년 만료 토큰을 주워 읽어 흔들렸다).
+    _seq = itertools.count()
+
+    def _client(fake, **kw):
+        kw.setdefault("transport", fake)
+        kw.setdefault("base_url", BASE_REAL)
+        kw.setdefault("limiter", RateLimiter(999, 999, 9999, clock=lambda: 0.0))
+        kw.setdefault("token_store",
+                      TokenStore(tmp / f"tok_{next(_seq)}.json"))
+        kw.setdefault("sleep", lambda s: None)
+        return KiwoomRestClient("KEY", "SECRET", **kw)
+
+    # ── 규격 ──
+    def t_spec_frozen():
+        """경로·api-id·필드명. 공식 예제 저장소와 글자 단위로 같아야 한다."""
+        assert TOKEN_PATH == "/oauth2/token"
+        assert STKINFO_PATH == "/api/dostk/stkinfo"
+        assert (API_TOKEN, API_CREDIT_TREND) == ("au10001", "ka10013")
+        assert BASE_REAL == "https://api.kiwoom.com"
+        assert BASE_MOCK == "https://mockapi.kiwoom.com"
+        assert CREDIT_LIST_KEY == "crd_trde_trend"
+        assert INQUIRY_LOAN == "1"      # 1:융자 2:대주
+        assert (FIELD_BALANCE, FIELD_BALANCE_RATIO) == ("remn", "remn_rt")
+        assert list(CREDIT_FIELDS) == [
+            "dt", "cur_prc", "pred_pre_sig", "pred_pre", "trde_qty",
+            "new", "rpya", "remn", "amt", "pre", "shr_rt", "remn_rt"]
+
+    def t_limits_are_not_published():
+        """제한 수치를 '공식값'으로 위장하면 안 된다.
+
+        OCX 는 초당5/분당100/시간당1,000 이 문서에 있다. REST 는 없다.
+        모르는 것을 아는 척하면 나중에 아무도 다시 확인하지 않는다.
+        """
+        assert LIMITS_ARE_PUBLISHED is False
+
+    def t_expiry_is_kst():
+        """expires_dt 는 KST 다. naive 로 두면 UTC 서버에서 9시간 일찍 죽는다."""
+        got = parse_expiry("20241107083713")
+        assert got.tzinfo is not None, "naive datetime 이 반환됐다"
+        assert got == dt(2024, 11, 6, 23, 37, 13, tzinfo=UTC), got
+
+    def t_parse_number():
+        # 빈 문자열은 '데이터 없음'이고 0 은 '실측 0' 이다. 섞으면 안 된다.
+        assert parse_number("") is None
+        assert parse_number(None) is None
+        assert parse_number("   ") is None
+        assert parse_number("0") == 0.0
+        near(parse_number("+65100"), 65100, label="방향 부호 +")
+        near(parse_number("-27300"), -27300, label="방향 부호 -")
+        near(parse_number("1,234,567"), 1234567, label="천단위 쉼표")
+        near(parse_number("4.85"), 4.85, label="소수")
+        assert parse_number("N/A") is None
+
+    def t_return_code_str_zero():
+        """키움은 수치를 문자열로 준다. "0" 을 오류로 읽으면 전건 실패한다."""
+        assert return_code_of({"return_code": 0}) is None
+        assert return_code_of({"return_code": "0"}) is None
+        assert return_code_of({}) is None
+        assert return_code_of({"return_code": "1700"}) == 1700
+        assert return_code_of({"return_code": 8005}) == 8005
+
+    def t_env_helpers():
+        assert credentials_from_env({}) is None
+        assert credentials_from_env({"KIWOOM_APP_KEY": "a"}) is None
+        assert credentials_from_env({"KIWOOM_APP_KEY": " a ",
+                                    "KIWOOM_APP_SECRET": "b"}) == ("a", "b")
+        assert base_url_from_env({}, mock=True) == BASE_MOCK
+        assert base_url_from_env({}, mock=False) == BASE_REAL
+        # 명시 설정이 이긴다
+        assert base_url_from_env({"KIWOOM_API_BASE": "https://x/"},
+                                 mock=True) == "https://x"
+        caps = [c for _, c in limiter_from_env({}).windows]
+        assert caps == [3, 60, 900], caps
+        caps2 = [c for _, c in limiter_from_env(
+            {"KIWOOM_REST_PER_SECOND": "1"}).windows]
+        assert caps2[0] == 1, caps2
+
+    # ── 토큰 ──
+    def t_token_cached():
+        fake = Fake()
+        c = _client(fake)
+        c.credit_trend("005930", "20260827")
+        c.credit_trend("000660", "20260827")
+        assert fake.token_calls == 1, f"토큰을 매번 발급했다: {fake.token_calls}"
+        assert len(fake.tr_calls) == 2
+
+    def t_token_reused_across_clients():
+        """파일 캐시. 배치가 하루에 여러 번 돌아도 재발급하지 않는다."""
+        store_path = tmp / "tok_shared.json"
+        f1 = Fake()
+        c1 = KiwoomRestClient("K", "S", base_url=BASE_REAL, transport=f1,
+                              token_store=TokenStore(store_path),
+                              limiter=RateLimiter(999, 999, 9999,
+                                                  clock=lambda: 0.0),
+                              sleep=lambda s: None)
+        c1.credit_trend("005930", "20260827")
+        f2 = Fake()
+        c2 = KiwoomRestClient("K", "S", base_url=BASE_REAL, transport=f2,
+                              token_store=TokenStore(store_path),
+                              limiter=RateLimiter(999, 999, 9999,
+                                                  clock=lambda: 0.0),
+                              sleep=lambda s: None)
+        c2.credit_trend("005930", "20260827")
+        assert f2.token_calls == 0, "파일 캐시를 쓰지 않았다"
+
+    def t_token_secrets_not_persisted():
+        """토큰 파일에 앱키/시크릿이 남으면 .env 밖으로 새는 경로가 생긴다."""
+        p = tmp / "tok_secret.json"
+        fake = Fake()
+        c = _client(fake, token_store=TokenStore(p))
+        c.token()
+        txt = p.read_text(encoding="utf-8")
+        assert "SECRET" not in txt, "시크릿이 토큰 파일에 저장됐다"
+        assert "KEY" not in txt, "앱키가 토큰 파일에 저장됐다"
+        assert "fingerprint" in txt
+
+    def t_token_expired_reissued():
+        now = [dt(2026, 8, 27, 0, 0, tzinfo=UTC)]
+        fake = Fake(expires="20260827093000")     # KST 09:30 = UTC 00:30
+        c = _client(fake, now=lambda: now[0], refresh_buffer=0.0)
+        c.token()
+        assert fake.token_calls == 1
+        now[0] = dt(2026, 8, 27, 0, 20, tzinfo=UTC)     # 아직 유효
+        c.token()
+        assert fake.token_calls == 1, "유효한데 재발급했다"
+        now[0] = dt(2026, 8, 27, 0, 40, tzinfo=UTC)     # 만료
+        c.token()
+        assert fake.token_calls == 2, "만료됐는데 재발급 안 했다"
+
+    def t_refresh_buffer():
+        """만료 직전 토큰으로 요청을 보내면 도중에 죽는다. 미리 갱신한다."""
+        now = [dt(2026, 8, 27, 0, 0, tzinfo=UTC)]
+        fake = Fake(expires="20260827091000")     # UTC 00:10 만료
+        c = _client(fake, now=lambda: now[0], refresh_buffer=900.0)
+        c.token()
+        c.token()
+        assert fake.token_calls == 2, "만료 15분 전인데 재사용했다"
+
+    def t_fingerprint_mismatch():
+        """앱키가 바뀌면 옛 토큰을 쓰면 안 된다."""
+        p = tmp / "tok_fp.json"
+        f1 = Fake()
+        _client(f1, token_store=TokenStore(p)).token()
+        f2 = Fake()
+        c2 = KiwoomRestClient("OTHER", "OTHER", base_url=BASE_REAL,
+                              transport=f2, token_store=TokenStore(p),
+                              limiter=RateLimiter(999, 999, 9999,
+                                                  clock=lambda: 0.0),
+                              sleep=lambda s: None)
+        c2.token()
+        assert f2.token_calls == 1, "다른 앱키인데 캐시를 재사용했다"
+
+    def t_base_url_mismatch():
+        """실전/모의를 바꾸면 토큰도 갈아야 한다."""
+        p = tmp / "tok_base.json"
+        f1 = Fake()
+        _client(f1, token_store=TokenStore(p), base_url=BASE_REAL).token()
+        f2 = Fake()
+        _client(f2, token_store=TokenStore(p), base_url=BASE_MOCK).token()
+        assert f2.token_calls == 1, "도메인이 바뀐 토큰을 재사용했다"
+
+    def t_headers():
+        fake = Fake()
+        _client(fake).credit_trend("005930", "2026-08-27")
+        api_id, body, headers = fake.tr_calls[0]
+        assert api_id == API_CREDIT_TREND
+        assert headers["authorization"].startswith("Bearer "), headers
+        assert headers["Content-Type"].startswith("application/json")
+        assert headers["cont-yn"] == "N"
+        assert body == {"stk_cd": "005930", "dt": "20260827", "qry_tp": "1"}, body
+
+    # ── 실패 처리 ──
+    def t_rate_limit_backs_off():
+        """1700 을 받으면 속도를 줄이고 재시도한다. 그냥 실패하면 안 된다."""
+        fake = Fake(credit={"005930": [_row("20260826", "1000", "0.42")]})
+        fake.script = [HttpReply(200, {"return_code": 1700,
+                                       "return_msg": "제한 초과"})]
+        c = _client(fake)
+        before = [cap for _, cap in c.limiter.windows]
+        rows = c.credit_trend("005930", "20260827")
+        after = [cap for _, cap in c.limiter.windows]
+        assert rows, "재시도가 안 됐다"
+        assert after == [b // 2 for b in before], (before, after)
+        assert c.stats["rate_limited"] == 1
+        assert c.stats["throttled_down"] == 1
+
+    def t_http_429_backs_off():
+        fake = Fake(credit={"005930": [_row("20260826", "1000", "0.42")]})
+        fake.script = [HttpReply(429, {}, text="Too Many Requests")]
+        c = _client(fake)
+        assert c.credit_trend("005930", "20260827")
+        assert c.stats["throttled_down"] == 1
+
+    def t_rate_limit_exhausted():
+        fake = Fake()
+        fake.script = [HttpReply(200, {"return_code": 1701, "return_msg": "x"})
+                       for _ in range(5)]
+        c = _client(fake, max_retries=2)
+        try:
+            c.credit_trend("005930", "20260827")
+        except RateLimited:
+            pass
+        else:
+            raise AssertionError("재시도를 소진했는데 예외가 안 났다")
+
+    def t_token_rejected_reissued_once():
+        """8005(토큰 만료)는 재발급 후 1회 재시도. 무한 루프는 안 된다."""
+        fake = Fake(credit={"005930": [_row("20260826", "1000", "0.42")]})
+        fake.script = [HttpReply(200, {"return_code": 8005,
+                                       "return_msg": "토큰 만료"})]
+        c = _client(fake)
+        assert c.credit_trend("005930", "20260827")
+        assert fake.token_calls == 2, f"재발급 횟수 {fake.token_calls}"
+
+    def t_bad_credentials_no_retry():
+        """8001 은 기다려도 안 된다. 즉시 포기해야 무한 재시도를 막는다."""
+        fake = Fake()
+        fake.script = [HttpReply(200, {"return_code": 8001,
+                                       "return_msg": "앱키 오류"})
+                       for _ in range(5)]
+        c = _client(fake)
+        try:
+            c.credit_trend("005930", "20260827")
+        except AuthError:
+            pass
+        else:
+            raise AssertionError("자격증명 오류인데 AuthError 가 안 났다")
+        assert len(fake.tr_calls) == 1, f"재시도했다: {len(fake.tr_calls)}"
+
+    def t_symbol_not_found_isolated():
+        """없는 종목 하나가 배치 전체를 죽이면 안 된다."""
+        fake = Fake(credit={"005930": [_row("20260826", "1000", "0.42")]})
+        fake.script = [HttpReply(200, {"return_code": 1901,
+                                       "return_msg": "종목 없음"})]
+        c = _client(fake)
+        try:
+            c.credit_trend("999999", "20260827")
+        except SymbolNotFound:
+            pass
+        else:
+            raise AssertionError("SymbolNotFound 가 안 났다")
+        assert c.credit_trend("005930", "20260827"), "다음 종목이 막혔다"
+
+    def t_transport_retry():
+        """네트워크 오류는 재시도 대상이다."""
+        from stocknews.kiwoom_rest import TransportError
+
+        fake = Fake(credit={"005930": [_row("20260826", "1000", "0.42")]})
+        boom = [2]
+
+        def flaky(method, url, headers, payload, timeout):
+            if url.endswith(STKINFO_PATH) and boom[0] > 0:
+                boom[0] -= 1
+                raise TransportError("연결 끊김")
+            return fake(method, url, headers, payload, timeout)
+
+        c = _client(fake, transport=flaky, max_retries=4)
+        assert c.credit_trend("005930", "20260827")
+        assert c.stats["retries"] == 2, c.stats
+
+    # ── 응답 해석 ──
+    def t_pick_latest_skips_blanks():
+        """빈 문자열은 '데이터 없음'이다. 0 으로 읽으면 과열 종목을 놓친다."""
+        recs = [_row("20260827"), _row("20260826", "5000", "1.20"),
+                _row("20260825", "4000", "1.00")]
+        got = pick_latest_credit(recs)
+        assert got is not None and got["dt"] == "20260826", got
+        assert pick_latest_credit([_row("20260827"), _row("20260826")]) is None
+        assert pick_latest_credit([]) is None
+        # 실측 0 은 유효한 값이다
+        zero = pick_latest_credit([_row("20260827", "0", "0")])
+        assert zero is not None and zero["dt"] == "20260827"
+
+    def t_share_unit_resolved():
+        """remn 단위가 문서에 없다. 잔고율 x 상장주식수로 역산해 판정한다."""
+        # 주 단위: remn 이 곧 주식수
+        obs = [(1_000_000.0, 1.0, 100_000_000.0)] * 3
+        scale, note = resolve_share_unit(obs)
+        near(scale, 1.0, label="주 단위")
+        assert "주" in note, note
+        # 천주 단위: remn x 1000 = 주식수
+        obs = [(1_000.0, 1.0, 100_000_000.0)] * 3
+        scale, note = resolve_share_unit(obs)
+        near(scale, 1000.0, label="천주 단위")
+
+    def t_share_unit_refuses_to_guess():
+        """표본이 적거나 배율이 후보와 안 맞으면 추측하지 않는다."""
+        scale, note = resolve_share_unit([(1000.0, 1.0, 100_000_000.0)])
+        assert scale is None, "표본 1건으로 단위를 확정했다"
+        assert "표본" in note
+        odd = [(1000.0, 1.0, 5_700_000.0)] * 4      # 배율 57
+        scale, note = resolve_share_unit(odd)
+        assert scale is None, f"이상한 배율을 채택했다: {note}"
+
+    def t_collect_credit_roundtrip():
+        """전 경로: 가짜 서버 -> collect_credit -> CSV -> 적재 파서."""
+        listed = {"005930": 5_969_782_550.0, "000660": 728_002_365.0,
+                  "086520": 30_000_000.0}
+        credit = {
+            "005930": [_row("20260827"), _row("20260826", "5000000", "0.084")],
+            "000660": [_row("20260826", "1000000", "0.137")],
+            "086520": [_row("20260826", "600000", "2.000")],
+            "329180": [_row("20260826")],          # 값 없음 -> 실패로 집계
+        }
+        fake = Fake(credit=credit)
+        c = _client(fake)
+        rows, stats = collect_credit(
+            c, ["5930", "000660", "086520", "329180", "bad"],
+            trade_date="2026-08-27", listed_shares=listed)
+        assert stats["requested"] == 5
+        assert stats["answered"] == 3, stats
+        assert stats["rows"] == 3, stats
+        assert stats["failed"] == 2, stats["failures"]
+        near(stats["share_unit_scale"], 1.0, label="단위 판정")
+        by = {r["ticker"]: r for r in rows}
+        assert "005930" in by, list(by)
+        near(by["005930"]["ratio"], 0.084, label="잔고율")
+        near(by["005930"]["shares"], 5_000_000, label="잔고 주식수")
+        assert by["005930"]["asof"] == "2026-08-26", by["005930"]
+        assert by["005930"]["note"] == "kiwoom:ka10013"
+
+        p = tmp / "credit_rest.csv"
+        assert write_credit_csv(rows, p) == 3
+        back = load_credit_csv(p, source="kiwoom")
+        assert len(back) == 3
+        assert {r["source"] for r in back} == {"kiwoom"}, \
+            "출처가 kiwoom 으로 기록되지 않았다"
+
+    def t_collect_uses_one_request_per_ticker():
+        """유량 예산이 곧 대상 수다. 종목당 요청이 늘면 계획이 무의미해진다."""
+        fake = Fake(credit={"005930": [_row("20260826", "100", "0.1")],
+                            "000660": [_row("20260826", "200", "0.2")]})
+        c = _client(fake)
+        collect_credit(c, ["005930", "000660"], trade_date="2026-08-27")
+        assert len(fake.tr_calls) == 2, len(fake.tr_calls)
+
+    def t_continuation_capped():
+        """cont-yn=Y 여도 max_pages 를 넘겨선 안 된다."""
+        fake = Fake()
+        fake.script = [
+            HttpReply(200, {CREDIT_LIST_KEY: [_row("20260826", "1", "0.1")],
+                            "return_code": 0},
+                      headers={"cont-yn": "Y", "next-key": "K1"})
+            for _ in range(5)]
+        c = _client(fake)
+        rows = c.credit_trend("005930", "20260827", max_pages=2)
+        assert len(fake.tr_calls) == 2, len(fake.tr_calls)
+        assert len(rows) == 2
+        assert fake.tr_calls[1][2]["next-key"] == "K1"
+
+    def t_no_order_calls():
+        """이 시스템은 주문을 내지 않는다 (AGENTS.md 8장). 회귀 가드."""
+        src = (Path(__file__).parent / "stocknews" / "kiwoom_rest.py"
+               ).read_text(encoding="utf-8")
+        for banned in ("SendOrder", "/api/dostk/ordr", "kt10000", "kt10001",
+                       "kt10002", "kt10003"):
+            assert banned not in src, f"주문 경로가 들어왔다: {banned}"
+
+    check("kiwoom-rest", "규격 고정 (공식 예제 저장소)", t_spec_frozen)
+    check("kiwoom-rest", "제한 수치는 공개값 아님", t_limits_are_not_published)
+    check("kiwoom-rest", "expires_dt = KST", t_expiry_is_kst)
+    check("kiwoom-rest", "숫자 파싱 (빈값 != 0)", t_parse_number)
+    check("kiwoom-rest", 'return_code "0" 오판 방지', t_return_code_str_zero)
+    check("kiwoom-rest", "환경 헬퍼", t_env_helpers)
+    check("kiwoom-rest", "토큰 메모리 캐시", t_token_cached)
+    check("kiwoom-rest", "토큰 파일 캐시", t_token_reused_across_clients)
+    check("kiwoom-rest", "토큰 파일에 비밀 미저장", t_token_secrets_not_persisted)
+    check("kiwoom-rest", "만료 시 재발급", t_token_expired_reissued)
+    check("kiwoom-rest", "만료 직전 선제 갱신", t_refresh_buffer)
+    check("kiwoom-rest", "앱키 변경 시 캐시 무효", t_fingerprint_mismatch)
+    check("kiwoom-rest", "실전/모의 전환 시 캐시 무효", t_base_url_mismatch)
+    check("kiwoom-rest", "요청 헤더/바디 규격", t_headers)
+    check("kiwoom-rest", "유량 초과 -> 감속 재시도", t_rate_limit_backs_off)
+    check("kiwoom-rest", "HTTP 429 -> 감속", t_http_429_backs_off)
+    check("kiwoom-rest", "재시도 소진 시 예외", t_rate_limit_exhausted)
+    check("kiwoom-rest", "토큰 거부 -> 1회 재발급", t_token_rejected_reissued_once)
+    check("kiwoom-rest", "자격증명 오류는 재시도 안 함", t_bad_credentials_no_retry)
+    check("kiwoom-rest", "없는 종목만 건너뜀", t_symbol_not_found_isolated)
+    check("kiwoom-rest", "전송 오류 재시도", t_transport_retry)
+    check("kiwoom-rest", "빈 문자열 != 잔고 0", t_pick_latest_skips_blanks)
+    check("kiwoom-rest", "잔고 단위 역산 판정", t_share_unit_resolved)
+    check("kiwoom-rest", "단위 불명이면 추측 안 함", t_share_unit_refuses_to_guess)
+    check("kiwoom-rest", "수집 전 경로 왕복", t_collect_credit_roundtrip)
+    check("kiwoom-rest", "종목당 요청 1건", t_collect_uses_one_request_per_ticker)
+    check("kiwoom-rest", "연속조회 페이지 상한", t_continuation_capped)
+    check("kiwoom-rest", "주문 경로 없음", t_no_order_calls)
 
 
 def test_docs():
@@ -1675,22 +2346,203 @@ def test_docs():
         assert "hermes\\run.cmd" in txt or "hermes\\\\run.cmd" in txt
 
     def t_env_example():
+        """`.env.example` 은 git 이 추적한다. 실제 키가 들어가면 유출된다.
+
+        `.gitignore` 는 `.env` 를 제외하지만 `!.env.example` 로 이 파일만
+        되살린다. 그래서 여기 적은 값은 커밋에 그대로 실린다. 예전에는
+        `TELEGRAM_BOT_TOKEN` 한 줄만 검사해서 DART/키움 키가 들어와도
+        통과했다 (실제로 그런 일이 있었다).
+        """
+        from stocknews.env import SECRET_KEYS, parse_env_text
+
         p = root / ".env.example"
         assert p.exists(), ".env.example 이 없다"
         txt = p.read_text(encoding="utf-8")
         for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "DART_API_KEY"):
             assert k in txt, f".env.example 에 {k} 누락"
         assert "=" in txt
-        # 실제 값이 들어가 있으면 안 된다
-        for line in txt.splitlines():
-            if line.startswith("TELEGRAM_BOT_TOKEN="):
-                assert line.strip() == "TELEGRAM_BOT_TOKEN=", \
-                    "템플릿에 실제 토큰이 들어 있다"
+
+        # 비밀 키는 전부 빈 값이어야 한다. 값 자체는 출력하지 않는다.
+        parsed = parse_env_text(txt)
+        filled = sorted(k for k in SECRET_KEYS if parsed.get(k))
+        assert not filled, (
+            f"템플릿에 실제 비밀값이 들어 있다: {filled}. "
+            ".env 로 옮기고 .env.example 은 빈 값으로 두십시오. "
+            "이 파일은 git 이 추적합니다.")
+        # 비밀이 아니어도 '값처럼 보이는' 긴 문자열은 의심한다.
+        # TZ / KIWOOM_API_BASE 처럼 기본값을 적어두는 키는 예외다.
+        allowed_defaults = {"TZ", "KIWOOM_API_BASE"}
+        for k, v in parsed.items():
+            if k in allowed_defaults or not v:
+                continue
+            assert len(v) < 20, \
+                f"{k} 에 실제 값처럼 보이는 문자열이 있다 ({len(v)}자)"
 
     check("docs", "LICENSE + 금융 고지", t_license)
     check("docs", "DISCLAIMER.md", t_disclaimer)
     check("docs", "AGENTS.md", t_agents)
     check("docs", ".env.example (토큰 미포함)", t_env_example)
+
+
+# ══════════════════════════ 8-2b. .env 로더 ══════════════════════════
+def test_env(tmp: Path):
+    """`.env` 로드. 이게 없으면 발송 모드가 전부 exit 4 로 끝난다.
+
+    python-dotenv 가 있으면 파싱만 위임하고, 없으면 자체 파서로 내려간다.
+    32비트 브릿지 venv 에는 dotenv 가 없으므로 폴백 경로도 검증한다.
+    """
+    import os
+
+    from stocknews.env import (ENV_PATH, KNOWN_KEYS, SECRET_KEYS, env_report,
+                              load_env, mask, parse_env_text)
+
+    def t_parse_formats():
+        txt = (
+            "# 주석\n"
+            "\n"
+            "PLAIN=abc\n"
+            'QUOTED="a b c"\n'
+            "SQUOTED='x y'\n"
+            "export EXPORTED=zzz\n"
+            "EMPTY=\n"
+            "INLINE=val # 꼬리주석\n"
+            "HASHED=va#lue\n"
+            'QUOTED_HASH="v # keep"\n'
+            "NOEQ\n"
+        )
+        d = parse_env_text(txt)
+        assert d["PLAIN"] == "abc", d
+        assert d["QUOTED"] == "a b c", d
+        assert d["SQUOTED"] == "x y", d
+        assert d["EXPORTED"] == "zzz", "export 접두어를 못 벗겼다"
+        assert d["EMPTY"] == ""
+        assert d["INLINE"] == "val", "공백+# 인라인 주석을 못 잘랐다"
+        assert d["HASHED"] == "va#lue", "붙은 # 을 주석으로 오해했다"
+        assert d["QUOTED_HASH"] == "v # keep", "따옴표 안 # 을 잘랐다"
+        assert "NOEQ" not in d
+
+    def t_bom_and_crlf():
+        d = parse_env_text("\ufeffA=1\r\nB=2\r\n")
+        assert d == {"A": "1", "B": "2"}, d
+
+    def t_missing_file_is_quiet():
+        rep = load_env(tmp / "nope.env")
+        assert rep["exists"] is False
+        assert rep["keys"] == []
+        assert "error" not in rep, rep
+
+    def t_empty_value_not_applied():
+        """.env.example 을 그대로 복사하면 전 키가 빈 값이다.
+
+        그걸 환경에 올리면 os.getenv 가 "" 를 돌려주고 '설정됨'으로
+        오판하는 코드가 생긴다. 빈 값은 미설정으로 둬야 한다.
+        """
+        p = tmp / "empty.env"
+        p.write_text("TELEGRAM_CHAT_ID=\n", encoding="utf-8")
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
+        rep = load_env(p)
+        assert "TELEGRAM_CHAT_ID" in rep["empty"], rep
+        assert "TELEGRAM_CHAT_ID" not in os.environ, "빈 값이 환경에 올라갔다"
+
+    def t_os_env_wins():
+        """주입된 환경변수를 낡은 .env 가 덮으면 디버깅이 불가능해진다."""
+        p = tmp / "over.env"
+        p.write_text("TELEGRAM_CHAT_ID=from_file\n", encoding="utf-8")
+        os.environ["TELEGRAM_CHAT_ID"] = "from_os"
+        try:
+            rep = load_env(p)
+            assert os.environ["TELEGRAM_CHAT_ID"] == "from_os", \
+                ".env 가 OS 환경변수를 덮었다"
+            assert "TELEGRAM_CHAT_ID" in rep["skipped_existing"], rep
+            # override=True 면 덮어써야 한다
+            load_env(p, override=True)
+            assert os.environ["TELEGRAM_CHAT_ID"] == "from_file", \
+                "override=True 가 동작하지 않는다"
+        finally:
+            os.environ.pop("TELEGRAM_CHAT_ID", None)
+
+    def t_applies_value():
+        p = tmp / "ok.env"
+        p.write_text("KRX_CREDIT_BLD=some/bld\n", encoding="utf-8")
+        os.environ.pop("KRX_CREDIT_BLD", None)
+        try:
+            rep = load_env(p)
+            assert os.environ.get("KRX_CREDIT_BLD") == "some/bld", rep
+            assert "KRX_CREDIT_BLD" in rep["applied"], rep
+            assert rep["backend"] in ("python-dotenv", "stdlib"), rep
+        finally:
+            os.environ.pop("KRX_CREDIT_BLD", None)
+
+    def t_unknown_key_reported():
+        p = tmp / "unknown.env"
+        p.write_text("WAT_IS_THIS=1\n", encoding="utf-8")
+        try:
+            rep = load_env(p)
+            assert "WAT_IS_THIS" in rep["unknown_keys"], rep
+        finally:
+            os.environ.pop("WAT_IS_THIS", None)
+
+    def t_example_matches_known_keys():
+        """`.env.example` 과 KNOWN_KEYS 가 어긋나면 안 된다.
+
+        한쪽만 고치면 사용자는 채울 키를 모르고, 코드는 읽지 않는 키를
+        문서화한다. 양방향으로 검사한다.
+        """
+        txt = (Path(__file__).parent / ".env.example").read_text(
+            encoding="utf-8")
+        in_example = set(parse_env_text(txt))
+        known = set(KNOWN_KEYS)
+        assert not (in_example - known), \
+            f".env.example 에만 있는 키: {in_example - known}"
+        assert not (known - in_example), \
+            f"KNOWN_KEYS 에만 있는 키: {known - in_example}"
+
+    def t_secrets_never_echoed():
+        assert mask("TELEGRAM_BOT_TOKEN", "123:AAA") == "설정됨", \
+            "비밀 키 값이 노출된다"
+        assert mask("KIWOOM_APP_SECRET", "s3cr3t") == "설정됨"
+        assert mask("TELEGRAM_CHAT_ID", "-100123") == "-100123", \
+            "비밀이 아닌 키까지 가렸다"
+        assert mask("DART_API_KEY", None) == "미설정"
+        for k in SECRET_KEYS:
+            assert k in KNOWN_KEYS, f"{k} 가 KNOWN_KEYS 에 없다"
+        rep = env_report()
+        assert set(rep) == set(KNOWN_KEYS)
+
+    def t_repo_root_not_cwd():
+        """cwd 가 아니라 저장소 루트를 봐야 한다. 래퍼 없이 호출될 수 있다."""
+        assert ENV_PATH.parent == Path(__file__).parent.resolve(), \
+            f"ENV_PATH 가 저장소 루트가 아니다: {ENV_PATH}"
+
+    def t_wired_into_run_screen():
+        """함수가 있는 것과 호출되는 것은 다르다. 실제 배선을 확인한다."""
+        import importlib
+        mod = importlib.import_module("run_screen")
+        p = tmp / "wired.env"
+        p.write_text("KRX_CREDIT_BLD=wired/ok\n", encoding="utf-8")
+        os.environ.pop("KRX_CREDIT_BLD", None)
+        try:
+            rc = mod.main(["--mode", "pos-list", "--db",
+                           str(tmp / "wired.db"), "--env-file", str(p)])
+            assert rc == mod.EXIT_OK, f"exit {rc}"
+            assert os.environ.get("KRX_CREDIT_BLD") == "wired/ok", \
+                "run_screen.main 이 .env 를 로드하지 않았다"
+            assert "env_file" in mod.SUMMARY, "--json 요약에 env_file 누락"
+            assert mod.SUMMARY["env_file"]["exists"] is True
+        finally:
+            os.environ.pop("KRX_CREDIT_BLD", None)
+
+    check("env", "파서 형식 (따옴표·export·인라인주석)", t_parse_formats)
+    check("env", "BOM + CRLF", t_bom_and_crlf)
+    check("env", "파일 없음 = 조용히 통과", t_missing_file_is_quiet)
+    check("env", "빈 값은 미설정", t_empty_value_not_applied)
+    check("env", "OS 환경변수 우선", t_os_env_wins)
+    check("env", "값 적용", t_applies_value)
+    check("env", "알 수 없는 키 보고", t_unknown_key_reported)
+    check("env", ".env.example <-> KNOWN_KEYS 일치", t_example_matches_known_keys)
+    check("env", "비밀 값 미노출", t_secrets_never_echoed)
+    check("env", "저장소 루트 기준", t_repo_root_not_cwd)
+    check("env", "run_screen 배선", t_wired_into_run_screen)
 
 
 # ══════════════════════════ 8-3. 잡 락 / 에이전트 연동 ══════════════════════════
@@ -1731,6 +2583,51 @@ def test_joblock(tmp: Path):
             "backfill 이 daily 보다 짧은 타임아웃을 갖는다"
         assert MODE_TIMEOUTS["backfill"] >= 3600, "backfill 타임아웃이 너무 짧다"
 
+    def t_timeouts_match_write_modes():
+        """타임아웃 표와 락 대상 모드가 정확히 일치해야 한다.
+
+        예전에는 fib/weekly/brief-weekly/export 항목이 있었는데 그 넷은
+        읽기 전용이라 락을 잡지 않는다 (도달 불가). 반대로 실제로 락을
+        잡는 pos-open/fill/pos-close 는 빠져서 기본 900초로 떨어졌다.
+        표가 현실과 어긋나면 표를 읽고 판단하는 사람이 틀린다.
+        """
+        import importlib
+        mod = importlib.import_module("run_screen")
+        extra = set(MODE_TIMEOUTS) - mod._WRITE_MODES
+        assert not extra, f"락을 잡지 않는 모드에 타임아웃이 있다: {extra}"
+        missing = mod._WRITE_MODES - set(MODE_TIMEOUTS)
+        assert not missing, f"락을 잡는데 타임아웃이 없다: {missing}"
+
+    def t_context_manager_raises_when_busy():
+        """락을 못 잡으면 with 블록에 들어가면 안 된다.
+
+        예전에는 __enter__ 가 acquire() 반환값을 버려서, 락을 못 잡아도
+        조용히 블록 안으로 들어갔다. 동시 실행을 막는 코드가 정반대로
+        동작했다. LockBusy 는 이 경우를 위해 정의돼 있었지만 아무도
+        던지지 않았다.
+        """
+        from stocknews.joblock import LockBusy
+
+        held = JobLock("t5", mode="daily", lock_dir=d)
+        assert held.acquire() is True
+        entered = False
+        try:
+            with JobLock("t5", mode="update", lock_dir=d):
+                entered = True
+        except LockBusy as exc:
+            assert exc.holder.get("mode") == "daily", exc.holder
+        finally:
+            held.release()
+        assert not entered, "락을 못 잡았는데 with 블록에 들어갔다"
+
+    def t_acquire_still_returns_bool():
+        """main() 은 예외가 아니라 exit 3 을 내야 한다. bool API 유지."""
+        held = JobLock("t6", mode="daily", lock_dir=d)
+        assert held.acquire() is True
+        other = JobLock("t6", mode="update", lock_dir=d)
+        assert other.acquire() is False, "acquire 가 예외를 던졌다"
+        held.release()
+
     def t_clear():
         JobLock("t4", mode="daily", lock_dir=d).acquire()
         removed = clear_locks(d)
@@ -1741,13 +2638,32 @@ def test_joblock(tmp: Path):
     check("joblock", "컨텍스트 매니저 해제", t_context_manager)
     check("joblock", "만료 락 회수", t_expired_steal)
     check("joblock", "모드별 타임아웃", t_timeouts)
+    check("joblock", "타임아웃 표 = 락 대상 모드", t_timeouts_match_write_modes)
+    check("joblock", "with 는 락 실패 시 LockBusy", t_context_manager_raises_when_busy)
+    check("joblock", "acquire 는 bool 유지", t_acquire_still_returns_bool)
     check("joblock", "강제 해제", t_clear)
 
 
-def test_agent_contract():
+def test_agent_contract(tmp: Path):
     """에이전트 연동 규약. 종료 코드와 쓰기 모드 목록의 정합성."""
+    import contextlib
     import importlib
+    import io
+    import json as _json
     mod = importlib.import_module("run_screen")
+
+    def _run(argv: list[str]) -> tuple[int, str, str]:
+        """main 을 돌리고 (rc, stdout, stderr) 를 준다.
+
+        stdout 을 따로 받는 게 핵심이다. --json 계약은 '한 줄' 이므로
+        사람이 읽는 보고문이 섞였는지 여기서만 확인할 수 있다.
+        """
+        so, se = io.StringIO(), io.StringIO()
+        base = ["--db", str(tmp / "agent.db"), "--no-lock",
+                "--env-file", str(tmp / "absent.env")]
+        with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+            rc = mod.main(argv + base)
+        return rc, so.getvalue(), se.getvalue()
 
     def t_exit_codes():
         assert mod.EXIT_OK == 0
@@ -1780,10 +2696,24 @@ def test_agent_contract():
         unknown = mod._WRITE_MODES - set(mod.MODES)
         assert not unknown, f"_WRITE_MODES 에 없는 모드: {unknown}"
         for ro in ("weekly", "fib", "export", "pos-list", "brief-weekly",
-                   "backtest", "credit-probe", "kiwoom-plan"):
+                   "backtest", "credit-probe", "kiwoom-plan", "runs"):
             assert ro not in mod._WRITE_MODES, f"{ro} 는 읽기 전용이어야 한다"
-        for rw in ("daily", "update", "flags", "exits", "credit"):
+        for rw in ("daily", "update", "flags", "exits", "credit",
+                   "credit-kiwoom"):
             assert rw in mod._WRITE_MODES, f"{rw} 가 락 대상이 아니다"
+
+    def t_every_write_mode_has_timeout():
+        """락 타임아웃이 없는 쓰기 모드는 기본 900초로 떨어진다.
+
+        credit-kiwoom 은 유량 제한 때문에 900초를 넘길 수 있다. 그때
+        정상 실행 중인 잡의 락을 다른 잡이 빼앗는다.
+        """
+        from stocknews.joblock import MODE_TIMEOUTS
+
+        slow = {"backfill", "flags", "credit-kiwoom"}
+        for m in slow:
+            assert m in MODE_TIMEOUTS, f"{m} 에 락 타임아웃이 없다"
+            assert MODE_TIMEOUTS[m] > 900, f"{m} 타임아웃이 기본값 이하"
 
     def t_partial_threshold():
         assert mod._partial(0, 0) is False, "표본 0에서 부분실패 판정"
@@ -1794,11 +2724,201 @@ def test_agent_contract():
         """--json 출력용 요약 딕셔너리가 있어야 한다."""
         assert isinstance(mod.SUMMARY, dict)
 
+    def t_missing_args_are_usage():
+        """인자 누락은 exit 64 다.
+
+        exit 1 로 내면 AGENTS.md 규약상 '3회까지 재시도' 대상이 된다.
+        인자가 빠진 명령은 세 번 재시도해도 절대 성공하지 않는다.
+        """
+        for argv in (["--mode", "pos-open"],
+                     ["--mode", "pos-open", "--ticker", "005930"],
+                     ["--mode", "fill"],
+                     ["--mode", "fill", "--log-id", "1"],
+                     ["--mode", "pos-close"]):
+            rc, _, _ = _run(argv)
+            assert rc == mod.EXIT_USAGE, \
+                f"{' '.join(argv)} -> exit {rc} (64 여야 함)"
+
+    def t_wrong_order_is_precond():
+        """마스터가 비어 있으면 순서 오류다 -> exit 4.
+
+        exit 1 이면 재시도 루프에 걸린다. master 를 먼저 돌려야 풀린다.
+        """
+        rc, _, _ = _run(["--mode", "backfill"])
+        assert rc == mod.EXIT_PRECOND, f"backfill 빈 마스터 -> exit {rc}"
+
+    def t_json_stdout_is_single_line():
+        """--json 이면 stdout 은 JSON 한 줄뿐이어야 한다.
+
+        AGENTS.md 1장이 그렇게 규정하고 에이전트가 그걸 파싱한다. 사람용
+        보고문이 섞이면 ConvertFrom-Json 이 깨진다. 과거에 kiwoom-plan /
+        credit-probe / credit / export / flags / pos-open 여섯 모드가
+        맨 print 를 써서 이 계약을 깨고 있었다.
+        """
+        cases = [
+            ["--mode", "pos-list"],
+            ["--mode", "kiwoom-plan"],
+            ["--mode", "export", "--export-dir", str(tmp / "exp")],
+            ["--mode", "credit", "--no-krx",
+             "--credit-file", str(tmp / "nope.csv")],
+            ["--mode", "flags", "--no-fdr", "--no-dart", "--no-local",
+             "--no-manual"],
+            ["--mode", "backfill"],          # exit 4 경로도 JSON 이어야 한다
+            ["--mode", "pos-close"],         # exit 64 경로도 마찬가지
+            ["--mode", "credit-kiwoom"],     # 자격증명 없음 -> exit 4
+            ["--mode", "runs"],              # exit 2 경로 (스케줄 공백)
+        ]
+        for argv in cases:
+            rc, out, _ = _run(argv + ["--json"])
+            label = " ".join(argv)
+            lines = [ln for ln in out.splitlines() if ln.strip()]
+            assert len(lines) == 1, \
+                f"{label}: stdout {len(lines)}줄 (JSON 한 줄이어야 함)\n" \
+                f"  첫 줄: {lines[0][:70] if lines else '(없음)'}"
+            try:
+                payload = _json.loads(lines[0])
+            except ValueError as exc:
+                raise AssertionError(f"{label}: JSON 파싱 실패 {exc}") from exc
+            for key in ("mode", "exit_code", "elapsed_sec", "started",
+                        "finished"):
+                assert key in payload, f"{label}: 봉투에 {key} 누락"
+            assert payload["exit_code"] == rc, \
+                f"{label}: JSON exit_code {payload['exit_code']} != rc {rc}"
+            assert not any(k.startswith("_") for k in payload), \
+                f"{label}: 내부 키가 노출됐다 {list(payload)}"
+
+    def t_json_payload_not_empty():
+        """봉투만 내보내면 에이전트가 결과를 알 수 없다."""
+        envelope = {"mode", "started", "finished", "exit_code",
+                    "elapsed_sec", "env_file"}
+        cases = {
+            "pos-list": ["--mode", "pos-list"],
+            "export": ["--mode", "export", "--export-dir", str(tmp / "exp2")],
+            "credit": ["--mode", "credit", "--no-krx",
+                       "--credit-file", str(tmp / "nope.csv")],
+            "flags": ["--mode", "flags", "--no-fdr", "--no-dart",
+                      "--no-local", "--no-manual"],
+            "kiwoom-plan": ["--mode", "kiwoom-plan"],
+        }
+        for name, argv in cases.items():
+            _, out, _ = _run(argv + ["--json"])
+            payload = _json.loads(out.splitlines()[0])
+            extra = set(payload) - envelope
+            assert extra, f"{name}: 모드별 필드가 하나도 없다 {list(payload)}"
+
+    def t_every_mode_logs_a_run():
+        """모드마다 runs 이력이 정확히 한 줄 남아야 한다.
+
+        예전에는 22개 모드 중 backfill/update 둘만 기록했다. 나머지는
+        돌았는지 알 수 없었고, 그래서 '어제 daily 가 안 돌았다'를
+        알아챌 방법이 없었다. 이제 main() 이 전 모드에 대해 한 번만
+        남긴다 — 실패로 끝난 실행도 남아야 한다.
+        """
+        from stocknews.store import Store
+
+        db = tmp / "runs_contract.db"
+        cases = [
+            ["--mode", "pos-list"],                       # exit 0
+            ["--mode", "backfill"],                       # exit 4
+            ["--mode", "pos-close"],                      # exit 64
+            ["--mode", "credit", "--no-krx",
+             "--credit-file", str(tmp / "none.csv")],     # exit 0
+            ["--mode", "credit-kiwoom"],                  # exit 4
+        ]
+        so, se = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+            for argv in cases:
+                mod.main(argv + ["--db", str(db), "--no-lock",
+                                 "--env-file", str(tmp / "absent.env")])
+        st = Store(db)
+        rep = st.run_summary(days=1)
+        for argv in cases:
+            m = argv[1]
+            assert m in rep, f"{m} 이력이 없다 (기록된 모드: {sorted(rep)})"
+            assert rep[m]["runs"] == 1, \
+                f"{m} 이력이 {rep[m]['runs']}줄 (한 줄이어야 함)"
+        # 실패로 끝난 실행도 note 에 rc 가 남아야 한다
+        h = st.run_history(days=1, mode="pos-close")
+        assert "rc=64" in str(h.iloc[0]["note"]), h.iloc[0]["note"]
+
+    def t_runs_mode_does_not_log_itself():
+        """조회 모드가 스스로를 기록하면 이력이 조회할수록 늘어난다."""
+        from stocknews.store import Store
+
+        db = tmp / "runs_self.db"
+        so, se = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+            for _ in range(3):
+                mod.main(["--mode", "runs", "--db", str(db), "--no-lock",
+                          "--env-file", str(tmp / "absent.env")])
+        assert Store(db).run_history(days=1, mode="runs").empty, \
+            "runs 모드가 자기 실행을 기록했다"
+
+    def t_run_counts_resolver():
+        """모드마다 카운트 키가 다르다. 한 곳에서만 접어야 한다."""
+        mod.SUMMARY.clear()
+        assert mod._run_counts(mod.EXIT_OK) == (1, 0), "무보고 성공"
+        assert mod._run_counts(mod.EXIT_FAIL) == (0, 1), "무보고 실패"
+        mod.SUMMARY.update({"scanned": 1800, "failed": 3})
+        assert mod._run_counts(mod.EXIT_OK) == (1800, 3)
+        mod.SUMMARY.clear()
+        mod.SUMMARY.update({"ok": 500, "empty": 7})
+        assert mod._run_counts(mod.EXIT_OK) == (500, 7)
+        mod.SUMMARY.clear()
+        # bool 은 카운트가 아니다. skipped=True 를 1건으로 세면 안 된다.
+        mod.SUMMARY.update({"skipped": True})
+        assert mod._run_counts(mod.EXIT_OK) == (1, 0), mod.SUMMARY
+        mod.SUMMARY.clear()
+
+    def t_runs_mode_reports_gaps():
+        """스케줄 공백을 exit 2 로 알려야 한다. 조용히 0 을 내면 무의미하다."""
+        rc, out, _ = _run(["--mode", "runs", "--json"])
+        payload = _json.loads(out.splitlines()[0])
+        assert "stale" in payload and "by_mode" in payload, list(payload)
+        # 새 DB 에는 이력이 없으므로 매일 도는 모드 전부가 공백이다
+        assert len(payload["stale"]) >= len(mod._SCHEDULE_DAILY), payload["stale"]
+        assert rc == mod.EXIT_PARTIAL, f"공백이 있는데 exit {rc}"
+
+    def t_say_helper_exists():
+        """맨 print 가 다시 들어오는 것을 막는 회귀 방지.
+
+        스트림을 고르지 않는 print 는 --json 계약을 깬다. 허용되는 곳은
+        세 군데뿐이다: _say 본문(스트림을 직접 정한다), file= 을 명시한
+        호출, main 의 JSON 한 줄.
+        """
+        src = (Path(__file__).parent / "run_screen.py").read_text(
+            encoding="utf-8")
+        assert "def _say(" in src, "_say 헬퍼가 없다"
+        bad, fn = [], ""
+        for i, line in enumerate(src.splitlines(), 1):
+            if line.startswith("def ") or line.startswith("    def "):
+                fn = line.strip().split("(")[0][4:]
+            s = line.strip()
+            if not s.startswith("print("):
+                continue
+            if fn == "_say":               # 헬퍼 본문. 여기가 스트림을 정한다
+                continue
+            if "file=" in s or "json.dumps" in s:
+                continue
+            bad.append(f"{i}({fn})")
+        assert not bad, \
+            f"스트림을 고르지 않는 print 가 남아 있다: {bad}. _say 를 쓰십시오."
+
     check("agent", "종료 코드 규약", t_exit_codes)
     check("agent", "인자 오류 exit 64", t_usage_exit_code)
     check("agent", "요약 딕셔너리", t_summary_dict)
     check("agent", "락 대상 모드 정합성", t_write_modes)
+    check("agent", "느린 쓰기 모드 락 타임아웃", t_every_write_mode_has_timeout)
+    check("runs", "전 모드가 이력 1줄 남김", t_every_mode_logs_a_run)
+    check("runs", "조회 모드는 자기 실행 미기록", t_runs_mode_does_not_log_itself)
+    check("runs", "카운트 해석기", t_run_counts_resolver)
+    check("runs", "스케줄 공백 -> exit 2", t_runs_mode_reports_gaps)
     check("agent", "부분 실패 임계", t_partial_threshold)
+    check("agent", "인자 누락 = exit 64", t_missing_args_are_usage)
+    check("agent", "순서 오류 = exit 4", t_wrong_order_is_precond)
+    check("agent", "--json stdout 한 줄", t_json_stdout_is_single_line)
+    check("agent", "--json 페이로드 비어있지 않음", t_json_payload_not_empty)
+    check("agent", "맨 print 금지", t_say_helper_exists)
 
 
 # ══════════════════════════ 9. 렌더러 ══════════════════════════
@@ -1993,8 +3113,8 @@ def test_imports():
         expect = {"master", "backfill", "update", "daily", "weekly", "fib",
                   "flash", "news", "brief-morning", "brief-evening",
                   "brief-weekly", "flags", "exits", "pos-open", "pos-list",
-                  "fill", "pos-close", "credit", "credit-probe",
-                  "kiwoom-plan", "export",
+                  "fill", "pos-close", "credit", "credit-kiwoom",
+                  "credit-probe", "kiwoom-plan", "export", "runs",
                   "backtest"}
         missing = expect - set(mod.MODES)
         assert not missing, f"MODES 누락: {missing}"
@@ -2115,9 +3235,11 @@ def main() -> int:
         test_krx_credit()
         test_market_source(tmp)
         test_kiwoom(tmp)
+        test_kiwoom_rest(tmp)
         test_docs()
+        test_env(tmp)
         test_joblock(tmp)
-        test_agent_contract()
+        test_agent_contract(tmp)
         if st is not None:
             test_renderer(st)
             test_daily_weekly(st)

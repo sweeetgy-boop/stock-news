@@ -19,10 +19,13 @@ from .contracts import (DONE_TAKE1, DONE_TAKE2, CrossEvent, ExitDecision,
                         FibSignal, LiquidationSignal, Position, ScreenResult,
                         TrendSignal)
 from .daily import run_daily, scan_all, select_recommendations
+from .env import load_env
 from .exits import evaluate_position, evaluate_rotation, run_exits
 from .fibonacci import evaluate_fib, fib_levels, is_below_level
-from .flags import flag_summary, refresh_flags
+from .flags import (flag_summary, refresh_credit, refresh_credit_chain,
+                    refresh_flags)
 from .indicators import evaluate_trend, last_cross, moving_averages
+from .kiwoom_rest import KiwoomRestClient, collect_credit
 from .liquidation import evaluate_liquidation, liquidation_band, margin_call_due_dates
 from .news import classify, normalize_title, process_and_store, theme_shift
 from .news_sources import collect_all
@@ -44,6 +47,9 @@ __all__ = [
     "ExitConfig", "Position", "ExitDecision", "DONE_TAKE1", "DONE_TAKE2",
     "evaluate_position", "evaluate_rotation", "run_exits",
     "refresh_flags", "flag_summary",
+    "refresh_credit", "refresh_credit_chain",
+    "KiwoomRestClient", "collect_credit",
+    "load_env",
 ]
 
 __version__ = "0.5.0"

@@ -628,21 +628,22 @@ def flag_summary(store) -> pd.DataFrame:
 CREDIT_HEADER = ("종목코드", "신용잔고율", "신용잔고주식수", "기준일", "비고")
 
 
-def load_manual_credit(path: str | Path = "data/credit_manual.csv") -> list[dict]:
-    """수동 주입 신용잔고 CSV 파싱.
+def load_credit_csv(path: str | Path,
+                    source: str = "manual") -> list[dict]:
+    """신용잔고 CSV 파싱. 수동 파일과 키움 브릿지 파일이 같은 규격이다.
 
-    이 시스템의 핵심 가설이 '신용 강제청산'인데 종목별 신용잔고 실측을
-    자동으로 확보하지 못하고 있다. 그 사이 구멍을 메우는 경로다.
-    한 사람이 KRX/증권사 화면에서 관심종목분만 받아 CSV 로 넣으면
-    그 종목들은 프록시가 아니라 실측으로 채점된다.
+    `source` 를 인자로 받는 이유: 예전에는 `"manual"` 로 박혀 있어서
+    키움/KRX 가 채운 값도 DB 에 '사람이 넣었다'고 기록됐다. 그러면 커버리지
+    감사가 불가능하다. 어떤 종목이 실측인지, 누가 넣었는지 구분해야
+    프록시 캡(1.25점)이 언제 벗겨졌는지 설명할 수 있다.
 
     형식(헤더 필수):
       종목코드,신용잔고율,신용잔고주식수,기준일,비고
       329180,4.85,1234567,2026-08-22,김차장 제공
       086520,6.20,,2026-08-22,
 
-    신용잔고율만 있어도 동작한다. 상장주식수를 아는 종목은 주식수만
-    넣어도 되지만, 그 경우 마스터의 shares 로 비율을 계산한다.
+    신용잔고율만 있어도 동작한다. 비율이 없고 주식수만 있으면
+    `refresh_credit` 이 마스터의 상장주식수로 역산한다.
     """
     p = Path(path)
     if not p.exists():
@@ -664,23 +665,56 @@ def load_manual_credit(path: str | Path = "data/credit_manual.csv") -> list[dict
                     "ratio": float(ratio) if ratio else None,
                     "shares": float(shares) if shares else None,
                     "asof": asof or None,
-                    "source": "manual",
+                    "source": source,
                     "note": (r.get("비고") or "").strip() or None,
                 })
     except (OSError, ValueError) as exc:
         log.warning("신용잔고 CSV 읽기 실패 %s: %s", p, exc)
         return []
-    log.info("수동 신용잔고 %d종목 파싱", len(rows))
+    log.info("신용잔고 %d종목 파싱 (%s, source=%s)", len(rows), p, source)
     return rows
 
 
-def refresh_credit(store, path: str | Path = "data/credit_manual.csv") -> dict:
-    """수동 신용잔고를 적재하고, 비율이 빈 종목은 상장주식수로 역산한다."""
-    rows = load_manual_credit(path)
+def load_manual_credit(path: str | Path = "data/credit_manual.csv") -> list[dict]:
+    """수동 주입 신용잔고. `load_credit_csv(..., "manual")` 의 별칭.
+
+    사람이 KRX/증권사 화면에서 관심종목분만 받아 CSV 로 넣으면 그
+    종목들은 매물대 POC 프록시가 아니라 실측으로 채점된다.
+    """
+    return load_credit_csv(path, source="manual")
+
+
+# 적재 순서. 뒤가 앞을 덮으므로 **사람의 값이 항상 이긴다.**
+#   krx    은 KRX 자동 수집 (현재는 화면이 없어 사실상 비활성)
+#   kiwoom 은 REST ka10013 실측
+#   manual 은 사람이 넣은 CSV
+CREDIT_CHAIN: tuple[tuple[str, str], ...] = (
+    ("data/credit_kiwoom.csv", "kiwoom"),
+    ("data/credit_manual.csv", "manual"),
+)
+
+
+def refresh_credit(store, path: str | Path = "data/credit_manual.csv",
+                   source: str = "manual") -> dict:
+    """신용잔고 CSV 를 적재하고, 비율이 빈 종목은 상장주식수로 역산한다."""
+    rows = load_credit_csv(path, source=source)
     if not rows:
-        return {"parsed": 0, "stored": 0, "derived": 0,
+        return {"parsed": 0, "stored": 0, "derived": 0, "source": source,
                 "note": f"{path} 없음 또는 유효 행 없음"}
 
+    derived = _derive_ratios(store, rows)
+    usable = [r for r in rows if r["ratio"] is not None]
+    stored = store.upsert_credit(usable)
+    cov = store.credit_coverage()
+    log.info("신용잔고 적재 %d종목 (%s · 주식수 역산 %d) · 커버리지 %d/%d "
+             "· 기준일 %s", stored, source, derived, cov["with_credit"],
+             cov["active"], cov["asof"])
+    return {"parsed": len(rows), "stored": stored, "derived": derived,
+            "source": source, "coverage": cov}
+
+
+def _derive_ratios(store, rows: list[dict]) -> int:
+    """비율이 없고 주식수만 있는 행을 상장주식수로 역산한다."""
     meta = store.ticker_meta()
     derived = 0
     for r in rows:
@@ -689,11 +723,34 @@ def refresh_credit(store, path: str | Path = "data/credit_manual.csv") -> dict:
             if pd.notna(listed) and float(listed) > 0:
                 r["ratio"] = round(float(r["shares"]) / float(listed) * 100.0, 3)
                 derived += 1
+    return derived
 
-    usable = [r for r in rows if r["ratio"] is not None]
-    stored = store.upsert_credit(usable)
-    cov = store.credit_coverage()
-    log.info("신용잔고 적재 %d종목 (주식수 역산 %d) · 커버리지 %d/%d · 기준일 %s",
-             stored, derived, cov["with_credit"], cov["active"], cov["asof"])
-    return {"parsed": len(rows), "stored": stored, "derived": derived,
-            "coverage": cov}
+
+def refresh_credit_chain(store, chain=CREDIT_CHAIN,
+                         manual_path: str | Path | None = None) -> dict:
+    """여러 출처를 **순서대로** 적재한다. 뒤가 앞을 덮는다.
+
+    왜 한 명령 안에서 병합하는가: 예전에는 `--mode credit` 이
+    `credit_manual.csv` 하나만 읽었다. 키움 브릿지가 만든
+    `credit_kiwoom.csv` 는 아무도 읽지 않아서 실측이 DB 에 들어가지
+    않았다. 사람이 두 번 실행해야 했고, 순서를 틀리면 자동값이 수동값을
+    덮었다. 순서를 코드로 고정한다.
+
+    `manual_path` 로 수동 파일 위치를 바꿔도 그 항목은 체인 **마지막**에
+    남는다. CLI 의 `--credit-file` 이 우선순위를 흔들면 안 된다.
+    """
+    steps: list[dict] = []
+    total_parsed = total_stored = total_derived = 0
+    for path, source in chain:
+        p = manual_path if (source == "manual" and manual_path) else path
+        res = refresh_credit(store, p, source=source)
+        steps.append({"path": str(p), "source": source,
+                      "parsed": res["parsed"], "stored": res["stored"],
+                      "derived": res["derived"]})
+        total_parsed += res["parsed"]
+        total_stored += res["stored"]
+        total_derived += res["derived"]
+    return {"parsed": total_parsed, "stored": total_stored,
+            "derived": total_derived, "steps": steps,
+            "by_source": store.credit_sources(),
+            "coverage": store.credit_coverage()}

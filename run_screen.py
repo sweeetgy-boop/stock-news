@@ -31,7 +31,14 @@
   python run_screen.py --mode flash         # 아침 즉시 속보
 
 모든 모드에 --dry-run 을 붙이면 텔레그램 대신 콘솔로 출력한다.
-환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+설정
+----
+저장소 루트의 `.env` 를 자동으로 읽는다 (`--env-file` 로 경로 변경).
+이미 설정된 OS 환경변수가 `.env` 보다 우선한다. 키 목록은 `.env.example`
+과 `stocknews/env.py` 의 KNOWN_KEYS 를 참조.
+  필수  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  선택  DART_API_KEY, KIWOOM_APP_KEY, KIWOOM_APP_SECRET, KRX_CREDIT_BLD
 """
 from __future__ import annotations
 
@@ -40,6 +47,7 @@ import json
 import logging
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -47,13 +55,19 @@ import pandas as pd
 
 from stocknews.config import DEFAULT
 from stocknews.daily import run_daily, scan_all, select_recommendations
+from stocknews.env import load_env
 from stocknews.exits import run_exits
 from stocknews.backtest import (BacktestConfig, control_random, control_rsi,
                                 run_backtest, simulate_exit_rules,
                                 summarize, summarize_exits, sweep_thresholds)
-from stocknews.flags import flag_summary, refresh_credit, refresh_flags
+from stocknews.flags import (flag_summary, refresh_credit,
+                             refresh_credit_chain, refresh_flags)
+from stocknews import kiwoom_rest
+from stocknews.kiwoom import CREDIT_CSV as KIWOOM_CREDIT_CSV
 from stocknews.kiwoom import build_plan as kiwoom_plan
 from stocknews.kiwoom import check_environment as kiwoom_env
+from stocknews.kiwoom import estimate_seconds as kiwoom_estimate
+from stocknews.kiwoom import write_credit_csv
 from stocknews.krx_credit import diagnose as krx_diagnose
 from stocknews.krx_credit import refresh_credit_auto
 from stocknews.joblock import JobLock, clear_locks
@@ -108,26 +122,47 @@ PARTIAL_FAIL_RATIO = 0.10
 
 # DB 를 쓰는 모드. 락으로 직렬화한다. 읽기 전용 조회는 제외.
 _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
-                "daily", "exits", "news", "brief-morning", "brief-evening",
-                "flash", "pos-open", "fill", "pos-close"}
+                "credit-kiwoom", "daily", "exits", "news", "brief-morning",
+                "brief-evening", "flash", "pos-open", "fill", "pos-close"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
 SUMMARY: dict = {}     # --json 출력용. 각 모드가 여기에 결과를 적는다.
 
 
+def _out():
+    """사람이 읽는 보고문을 낼 스트림.
+
+    `--json` 일 때 stdout 은 JSON 한 줄 전용이다. AGENTS.md 가 그렇게
+    규정하고 에이전트가 그걸 파싱한다. 사람용 출력이 섞이면
+    `ConvertFrom-Json` 이 깨진다. 그래서 --json 이면 stderr 로 보낸다.
+    """
+    return sys.stderr if SUMMARY.get("_json") else sys.stdout
+
+
+def _say(*args, **kwargs) -> None:
+    """print 대체. 모드 핸들러는 맨 print 를 쓰지 말고 이것을 쓴다."""
+    kwargs.setdefault("file", _out())
+    print(*args, **kwargs)
+
+
 def _emit(text: str, dry: bool) -> None:
     if dry:
         # --json 과 함께 쓸 때 stdout 을 오염시키지 않도록 stderr 로 보낸다.
-        out = sys.stderr if SUMMARY.get("_json") else sys.stdout
+        out = _out()
         print("=" * 62, file=out)
         print(text, file=out)
         print("=" * 62, file=out)
         SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
         return
-    send_telegram(text)
+    # 발송 실패를 성공으로 집계하면 무음 장애를 알아챌 수 없다.
+    ok = send_telegram(text)
     SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
-    log.info("텔레그램 발송 완료 (%d자)", len(text))
+    if ok:
+        log.info("텔레그램 발송 완료 (%d자)", len(text))
+    else:
+        SUMMARY["send_failed"] = SUMMARY.get("send_failed", 0) + 1
+        log.error("텔레그램 발송 실패 (%d자) — 재시도 소진", len(text))
 
 
 def _partial(ok: int, failed: int) -> bool:
@@ -138,13 +173,76 @@ def _partial(ok: int, failed: int) -> bool:
     return (failed / total) > PARTIAL_FAIL_RATIO
 
 
+# ── 실행 이력용 카운트 해석 ──
+# 모드마다 '몇 건 처리했나'를 다른 키로 보고한다. runs 테이블은 두 칸
+# (ok/failed)뿐이므로 여기서 한 번만 접는다. 순서가 우선순위다.
+_OK_KEYS = ("ok", "scanned", "stored", "written", "picks", "decisions",
+            "parsed", "messages", "total", "categories")
+_FAIL_KEYS = ("failed", "empty")
+
+
+def _run_counts(rc: int) -> tuple[int, int]:
+    """SUMMARY 에서 runs 테이블용 (ok, failed) 를 뽑는다.
+
+    카운트를 보고하지 않는 모드(pos-close 등)는 성공 1건 / 실패 1건으로
+    센다. 0/0 으로 남기면 '돌았지만 아무것도 안 했다'와 '안 돌았다'가
+    구분되지 않는다.
+    """
+    ok = failed = None
+    for k in _OK_KEYS:
+        v = SUMMARY.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            ok = int(v)
+            break
+    for k in _FAIL_KEYS:
+        v = SUMMARY.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            failed = int(v)
+            break
+    if ok is None and failed is None:
+        return (1, 0) if rc == EXIT_OK else (0, 1)
+    return int(ok or 0), int(failed or 0)
+
+
+def _pad(text, width: int, align: str = "<") -> str:
+    """한글을 섞은 표를 맞춘다.
+
+    파이썬의 `{:<16}` 은 **글자 수**로 채운다. 한글은 콘솔에서 두 칸을
+    차지하므로 헤더가 한글이면 표가 어긋난다. 동아시아 전각 폭을 세서
+    실제 표시 폭으로 맞춘다.
+    """
+    s = str(text)
+    w = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+    fill = " " * max(0, width - w)
+    return (s + fill) if align == "<" else (fill + s)
+
+
+def _run_note(rc: int) -> str:
+    """runs.note 에 남길 한 줄. 사람이 이력만 보고 원인을 짚을 수 있게."""
+    bits = [f"rc={rc}"]
+    for k in ("trade_date", "reason", "error", "locked_by", "window",
+              "send_failed", "skipped"):
+        v = SUMMARY.get(k)
+        if v not in (None, "", False):
+            bits.append(f"{k}={str(v)[:80]}")
+    return " ".join(bits)
+
+
 # ────────────────────────── 모드 구현 ──────────────────────────
 def mode_master(store: Store, args) -> int:
     refresh_master(store, include_preferred=args.include_preferred)
-    fill_sectors(store)
+    sectors = fill_sectors(store)
     n = len(store.active_tickers())
-    log.info("활성 종목 %d개", n)
-    SUMMARY["active_tickers"] = n
+    cov = store.sector_coverage()
+    log.info("활성 종목 %d개 · 업종 %d/%d (%.1f%%, %d업종)",
+             n, cov["with_sector"], cov["active"], cov["pct"], cov["sectors"])
+    SUMMARY.update({"active_tickers": n, "sectors_filled": sectors,
+                    "sector_coverage": cov})
+    # 섹터가 비면 추천 10선의 분산 제한이 조용히 꺼진다. 에러가 아니므로
+    # 보고에 남겨야 사람이 알아챈다.
+    if cov["pct"] < 50.0:
+        log.warning("업종 커버리지 %.1f%% — 추천 섹터 분산 제한이 대부분 "
+                    "적용되지 않습니다.", cov["pct"])
     # 마스터가 비면 이후 전부가 무의미하다. 조회 실패를 성공으로 보고하면
     # 에이전트가 다음 단계로 넘어가 더 큰 혼란이 생긴다.
     return EXIT_OK if n > 0 else EXIT_FAIL
@@ -155,8 +253,11 @@ def mode_backfill(store: Store, args) -> int:
     started = datetime.now()
     tickers = store.active_tickers()
     if not tickers:
-        log.error("종목 마스터가 비어 있다. --mode master 를 먼저 실행하라.")
-        return 1
+        # 순서가 틀린 것이다. exit 1 로 내면 에이전트가 3회 재시도하는데
+        # master 를 돌리지 않는 한 영원히 실패한다. 전제조건으로 분류한다.
+        log.error("종목 마스터가 비어 있습니다. --mode master 를 먼저 "
+                  "실행하십시오.")
+        return EXIT_PRECOND
 
     done = store.backfill_done()
     todo = [t for t in tickers if t not in done]
@@ -179,7 +280,8 @@ def mode_backfill(store: Store, args) -> int:
             log.info("  %d/%d 적재 (성공 %d, 빈값 %d) · 잔여 약 %.0f분",
                      i, len(todo), ok, fail, eta)
 
-    store.log_run("backfill", started, ok, fail)
+    # runs 기록은 main() 이 전 모드에 대해 한 번만 남긴다. 여기서 또
+    # 부르면 backfill 만 이력이 두 줄씩 생겨 집계가 틀어진다.
     bars = store.bar_count(120)
     log.info("백필 완료: 성공 %d / 빈값 %d · 120봉 이상 확보 %d종목",
              ok, fail, bars)
@@ -221,7 +323,6 @@ def mode_update(store: Store, args) -> int:
     if skipped:
         log.info("알려진 휴장일 %d일 건너뜀", skipped)
     SUMMARY["holidays_skipped"] = skipped
-    store.log_run("update", started, total, 0)
     last = store.last_price_date()
     log.info("증분 적재 %d건 · 최신 거래일 %s", total, last)
     SUMMARY.update({"rows": total, "last_price_date": last})
@@ -390,7 +491,9 @@ def mode_news(store: Store, args) -> int:
     res = process_and_store(store, raw)
     log.info("뉴스 정리 완료: 수집 %d → 저장 %d · 종목링크 %d",
              res["collected"], res["stored"], res["links"])
-    return 0
+    SUMMARY.update({"collected": res["collected"], "stored": res["stored"],
+                    "links": res["links"]})
+    return EXIT_OK
 
 
 def mode_brief_morning(store: Store, args) -> int:
@@ -429,9 +532,11 @@ def mode_brief_evening(store: Store, args) -> int:
         # 오늘 추천 목록을 렌더러가 쓰는 최소 형태로 재구성한다.
         picks = [(r["slot"], _RecoRow(r)) for _, r in rec.iterrows()]
 
-    _emit(render_evening_brief(store, datetime.now(), picks=picks,
+    _emit(render_evening_brief(store, now_kst(), picks=picks,
                                hours=args.news_hours), args.dry_run)
-    return 0
+    SUMMARY.update({"news_hours": args.news_hours,
+                    "picks": 0 if picks is None else len(picks)})
+    return EXIT_OK
 
 
 class _RecoRow:
@@ -456,8 +561,13 @@ class _RecoRow:
 def mode_brief_weekly(store: Store, args) -> int:
     """주간 뉴스 테마 부침."""
     shift = theme_shift(store, week_days=args.week_days)
-    _emit(render_news_weekly(shift, datetime.now()), args.dry_run)
-    return 0
+    _emit(render_news_weekly(shift, now_kst()), args.dry_run)
+    # theme_shift 는 DataFrame 을 준다 (index=category, delta 내림차순).
+    SUMMARY.update({"week_days": args.week_days,
+                    "categories": int(len(shift)),
+                    "top_rising": (str(shift.index[0]) if len(shift) else None),
+                    "top_falling": (str(shift.index[-1]) if len(shift) else None)})
+    return EXIT_OK
 
 
 def mode_credit_probe(store: Store, args) -> int:
@@ -474,39 +584,42 @@ def mode_credit_probe(store: Store, args) -> int:
     rep = krx_diagnose(ymd, extra_blds=extra)
     SUMMARY["diagnose"] = rep
 
-    print(f"\n신용잔고 자동 수집 진단 (기준일 {ymd})\n")
+    _say(f"\n신용잔고 자동 수집 진단 (기준일 {ymd})\n")
 
     ep = rep.get("endpoint", {})
     if ep.get("reachable"):
-        print(f"  엔드포인트   응답함 (HTTP {ep.get('status')})")
+        _say(f"  엔드포인트   응답함 (HTTP {ep.get('status')})")
     elif ep.get("login_required"):
-        print(f"  엔드포인트   로그인 필요 — HTTP {ep.get('status')} "
-              f"{ep.get('body')}")
-        print("               익명 조회 경로가 닫혔습니다.")
+        _say(f"  엔드포인트   로그인 필요 — HTTP {ep.get('status')} "
+             f"{ep.get('body')}")
+        _say("               익명 조회 경로가 닫혔습니다.")
     else:
-        print(f"  엔드포인트   실패 — {ep.get('status') or ep.get('note')}")
+        _say(f"  엔드포인트   실패 — {ep.get('status') or ep.get('note')}")
 
     mn = rep.get("menu", {})
     hits = mn.get("credit_hits") or []
     if mn.get("ok"):
-        print(f"  통계 메뉴     {mn.get('menus')}개 중 신용거래융자 화면 "
-              f"{len(hits)}건")
+        _say(f"  통계 메뉴     {mn.get('menus')}개 중 신용거래융자 화면 "
+             f"{len(hits)}건")
         for h in hits:
-            print(f"                - {h}")
+            _say(f"                - {h}")
     else:
-        print(f"  통계 메뉴     확인 실패 — {mn.get('status') or mn.get('note')}")
+        _say(f"  통계 메뉴     확인 실패 — {mn.get('status') or mn.get('note')}")
 
     for t in rep.get("bld_tested") or []:
         mark = "OK " if t["usable"] else "   "
-        print(f"  {mark}bld       {t['bld']}  rows={t['rows']}")
+        _say(f"  {mark}bld       {t['bld']}  rows={t['rows']}")
 
     cov = store.credit_coverage()
-    print(f"\n  수동 주입     {cov['with_credit']}/{cov['active']}종목")
-    print(f"\n  판정: {rep.get('verdict')}\n")
+    _say(f"\n  수동 주입     {cov['with_credit']}/{cov['active']}종목")
+    _say(f"\n  판정: {rep.get('verdict')}\n")
     for i, s in enumerate(rep.get("next_steps") or [], 1):
-        print(f"    {i}. {s}")
-    print()
+        _say(f"    {i}. {s}")
+    _say()
 
+    SUMMARY.update({"verdict": rep.get("verdict"),
+                    "coverage": cov,
+                    "menu_hits": len(hits)})
     return EXIT_OK if rep.get("verdict") == "가능" else EXIT_PRECOND
 
 
@@ -524,61 +637,210 @@ def mode_kiwoom_plan(store: Store, args) -> int:
     SUMMARY["kiwoom_env"] = {k: v for k, v in env.items() if k != "missing"}
     SUMMARY["kiwoom_plan"] = {k: v for k, v in plan.items() if k != "tickers"}
 
+    rest_ready = kiwoom_rest.credentials_from_env() is not None
+    rest_base = kiwoom_rest.base_url_from_env()
+    rest_limiter = kiwoom_rest.limiter_from_env()
+    rest_caps = [cap for _, cap in rest_limiter.windows]
+    rest_eta = kiwoom_estimate(plan["targets"], per_second=rest_caps[0],
+                               per_minute=rest_caps[1], per_hour=rest_caps[2])
+    SUMMARY["kiwoom_rest"] = {
+        "ready": rest_ready, "base_url": rest_base,
+        "per_second": rest_caps[0], "per_minute": rest_caps[1],
+        "per_hour": rest_caps[2],
+        "limits_published": kiwoom_rest.LIMITS_ARE_PUBLISHED,
+        "eta_sec": round(rest_eta, 1),
+    }
+
+    _say("\n키움 REST 경로 (권장 · 에이전트가 직접 실행 가능)")
+    _say(f"  도메인         {rest_base}")
+    _say(f"  앱키/시크릿    {'설정됨' if rest_ready else '미설정 (.env)'}")
+    _say(f"  유량 기본값    초당 {rest_caps[0]} / 분당 {rest_caps[1]} "
+         f"/ 시간당 {rest_caps[2]}")
+    _say("  ! 키움이 REST 유량 제한 수치를 공개하지 않습니다. 보수적 "
+         "기본값으로 시작해")
+    _say("    return_code 1700/1701/1702 나 HTTP 429 를 받으면 스스로 "
+         "절반으로 줄입니다.")
+    _say(f"  예상 소요      {rest_eta / 60:.1f}분  ({plan['targets']}종목)")
+    if not rest_ready:
+        _say("  준비: https://openapi.kiwoom.com 에서 앱 등록 후 "
+             ".env 의 KIWOOM_APP_KEY / KIWOOM_APP_SECRET 를 채우십시오.")
+
     bit_note = ""
     if env.get("ocx_wow64_only"):
         bit_note = "  (InprocServer32 가 WOW6432Node 에만 = 32비트 전용)"
-    print(f"\n키움 OpenAPI+ 환경  (파이썬 {env['python_bits']}비트)")
-    print(f"  OCX 파일       {env['ocx_inproc_path'] or '없음'}")
-    print(f"  COM 등록       {env['ocx_registered']}{bit_note}")
-    print(f"  TR 정의 파일   {env['tr_defs']}")
-    print(f"  pywin32 {env['win32com']}   PyQt5 {env['PyQt5']}   "
-          f"KOA Studio {env['koa_studio']}")
-    print(f"  준비 완료      {env['ready']}")
+    _say(f"\n키움 OpenAPI+ (구 OCX 경로)  (파이썬 {env['python_bits']}비트)")
+    _say(f"  OCX 파일       {env['ocx_inproc_path'] or '없음'}")
+    _say(f"  COM 등록       {env['ocx_registered']}{bit_note}")
+    _say(f"  TR 정의 파일   {env['tr_defs']}")
+    _say(f"  pywin32 {env['win32com']}   PyQt5 {env['PyQt5']}   "
+         f"KOA Studio {env['koa_studio']}")
+    _say(f"  준비 완료      {env['ready']}")
     if env["missing"]:
-        print("\n  남은 준비:")
+        _say("\n  남은 준비:")
         for i, m in enumerate(env["missing"], 1):
-            print(f"    {i}. {m}")
+            _say(f"    {i}. {m}")
 
     lim = plan["limits"]
-    print(f"\n호출 제한  초당 {lim['per_second']} / 분당 {lim['per_minute']} "
-          f"/ 시간당 {lim['per_hour']}  (안전마진 적용 "
-          f"{plan['safe_limits']['per_hour']}/시간)")
-    print("  분당·시간당 제한에 걸리면 프로그램을 재실행해야 하므로 "
-          "여유를 둡니다.")
+    _say(f"\n호출 제한  초당 {lim['per_second']} / 분당 {lim['per_minute']} "
+         f"/ 시간당 {lim['per_hour']}  (안전마진 적용 "
+         f"{plan['safe_limits']['per_hour']}/시간)")
+    _say("  분당·시간당 제한에 걸리면 프로그램을 재실행해야 하므로 "
+         "여유를 둡니다.")
 
-    print(f"\n수집 대상  {plan['targets']}종목 / 활성 {plan['active_tickers']}종목")
+    _say(f"\n수집 대상  {plan['targets']}종목 / 활성 {plan['active_tickers']}종목")
     for reason, n in plan["by_reason"].items():
-        print(f"    {reason:12s} {n}종목")
-    print(f"\n  예상 소요    {plan['eta_sec'] / 60:.1f}분  "
-          f"({plan['requests']}건)")
-    print(f"  전수조사면   {plan['full_scan_eta_sec'] / 3600:.2f}시간  "
-          f"({plan['full_scan_requests']}건)  <- 매일 불가")
+        _say(f"    {reason:12s} {n}종목")
+    _say(f"\n  예상 소요    {plan['eta_sec'] / 60:.1f}분  "
+         f"({plan['requests']}건)")
+    _say(f"  전수조사면   {plan['full_scan_eta_sec'] / 3600:.2f}시간  "
+         f"({plan['full_scan_requests']}건)  <- 매일 불가")
     if not plan["feasible_daily"]:
-        print("  ! 대상이 많아 1시간을 넘습니다. --kw-limit 을 줄이십시오.")
+        _say("  ! 대상이 많아 1시간을 넘습니다. --kw-limit 을 줄이십시오.")
 
     cov = plan.get("coverage_now")
     if cov:
-        print(f"\n현재 신용잔고 커버리지  {cov['with_credit']}/{cov['active']}종목"
-              f" · 기준일 {cov['asof'] or '-'}")
+        _say(f"\n현재 신용잔고 커버리지  {cov['with_credit']}/{cov['active']}종목"
+             f" · 기준일 {cov['asof'] or '-'}")
 
     if args.write_targets:
         p = Path(args.write_targets)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("\n".join(plan["tickers"]) + "\n", encoding="utf-8")
-        print(f"\n대상 목록 기록 -> {p}  ({len(plan['tickers'])}종목)")
-        print("  32비트 브릿지에서:")
-        print(f"    venv32\\Scripts\\python kiwoom_bridge.py "
-              f"--plan-file {p}")
+        _say(f"\n대상 목록 기록 -> {p}  ({len(plan['tickers'])}종목)")
+        _say("  REST 경로(권장):")
+        _say(f"    hermes\\run.cmd --mode credit-kiwoom --targets-file {p}")
     else:
-        print("\n  목록을 파일로 뽑으려면: --write-targets "
-              "data/kiwoom_targets.txt")
-    print()
+        _say("\n  목록을 파일로 뽑으려면: --write-targets "
+             "data/kiwoom_targets.txt")
+    _say()
 
     if not plan["targets"]:
         log.warning("대상이 0종목입니다. 먼저 --mode daily 로 스캔 이력을 "
                     "만들거나 포지션을 등록하십시오.")
         return EXIT_PRECOND
-    return EXIT_OK if env["ready"] else EXIT_PRECOND
+    # 준비 판정은 REST 를 기준으로 한다. OCX 는 이제 대체 경로이고, 그쪽이
+    # 안 돼 있다고 exit 4 를 내면 REST 가 준비된 환경에서도 계속 실패한다.
+    if rest_ready or env["ready"]:
+        return EXIT_OK
+    return EXIT_PRECOND
+
+
+def mode_credit_kiwoom(store: Store, args) -> int:
+    """키움 REST(ka10013)로 종목별 신용잔고를 실측 수집한다.
+
+    OCX 브릿지를 대체하는 경로다. 32비트 프로세스도, 로그인 창도, 필드명
+    탐침도 필요 없다. 앱키/시크릿만 `.env` 에 있으면 무인으로 돈다.
+
+    조회 전용이다. 주문 TR 은 호출하지 않는다 (AGENTS.md 8장).
+
+    대상은 전종목이 아니다. 유량 제한 때문에 판정을 바꾸는 종목만 고른다
+    (`--mode kiwoom-plan` 이 그 계획을 보여준다).
+    """
+    creds = kiwoom_rest.credentials_from_env()
+    if not creds:
+        log.error("KIWOOM_APP_KEY / KIWOOM_APP_SECRET 가 없습니다. "
+                  ".env 에 넣으십시오 (발급: https://openapi.kiwoom.com).")
+        SUMMARY.update({"skipped": True, "reason": "no_credentials"})
+        return EXIT_PRECOND
+
+    trade_date = args.date or store.last_price_date()
+    if not trade_date:
+        log.error("시세가 없어 기준일을 정할 수 없습니다. "
+                  "--mode master -> update 를 먼저 실행하십시오.")
+        SUMMARY.update({"skipped": True, "reason": "no_prices"})
+        return EXIT_PRECOND
+
+    if args.targets_file:
+        p = Path(args.targets_file)
+        if not p.exists():
+            log.error("대상 파일이 없습니다: %s "
+                      "(--mode kiwoom-plan --write-targets 로 만드십시오)", p)
+            SUMMARY.update({"skipped": True, "reason": "no_targets_file"})
+            return EXIT_PRECOND
+        tickers = [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
+                   if ln.strip()]
+        origin = str(p)
+    else:
+        plan = kiwoom_plan(store, limit=args.kw_limit, scan_days=args.kw_days)
+        tickers = plan["tickers"]
+        origin = f"build_plan(limit={args.kw_limit})"
+
+    if not tickers:
+        log.error("대상이 0종목입니다. --mode daily 로 스캔 이력을 만들거나 "
+                  "포지션을 등록하십시오.")
+        SUMMARY.update({"skipped": True, "reason": "no_targets"})
+        return EXIT_PRECOND
+
+    base = kiwoom_rest.base_url_from_env(mock=args.kiwoom_mock)
+    limiter = kiwoom_rest.limiter_from_env()
+    eta = kiwoom_estimate(len(tickers),
+                          per_second=limiter.windows[0][1],
+                          per_minute=limiter.windows[1][1],
+                          per_hour=limiter.windows[2][1])
+    log.info("키움 REST %s · 대상 %d종목 · 기준일 %s · 예상 %.1f분",
+             base, len(tickers), trade_date, eta / 60)
+
+    # 상장주식수는 잔고(remn) 단위를 검증하는 데 쓴다. 문서에 단위가 없다.
+    try:
+        meta = store.ticker_meta()
+        listed = {t: float(v) for t, v in meta["shares"].dropna().items()
+                  if float(v) > 0}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("상장주식수 조회 실패: %s", exc)
+        listed = {}
+
+    client = kiwoom_rest.KiwoomRestClient(
+        *creds, base_url=base, limiter=limiter,
+        max_retries=args.kw_retries)
+
+    def _progress(i: int, total: int, code: str) -> None:
+        if i == 1 or i % 25 == 0 or i == total:
+            log.info("  %d/%d  %s", i, total, code)
+
+    try:
+        rows, stats = kiwoom_rest.collect_credit(
+            client, tickers, trade_date=str(trade_date),
+            listed_shares=listed, max_pages=args.kw_pages,
+            progress=_progress)
+    except kiwoom_rest.CredentialsMissing as exc:
+        log.error("%s", exc)
+        SUMMARY.update({"skipped": True, "reason": "no_credentials"})
+        return EXIT_PRECOND
+    except kiwoom_rest.AuthError as exc:
+        log.error("인증 실패: %s", exc)
+        SUMMARY.update({"error": str(exc), "reason": "auth"})
+        return EXIT_PRECOND
+
+    out = Path(args.kiwoom_out)
+    written = write_credit_csv(rows, out)
+    res = refresh_credit(store, out, source="kiwoom")
+    cov = res.get("coverage") or store.credit_coverage()
+
+    SUMMARY.update({"base_url": base, "targets": len(tickers),
+                    "origin": origin, "trade_date": str(trade_date),
+                    "csv": str(out), "written": written,
+                    "stored": res.get("stored"),
+                    "derived": res.get("derived"),
+                    "coverage": cov, "by_source": store.credit_sources()})
+    SUMMARY.update({k: v for k, v in stats.items() if k != "failures"})
+    SUMMARY["failures"] = stats.get("failures")
+
+    _say(f"\n키움 REST 신용잔고  {base}")
+    _say(f"  대상 {len(tickers)}종목 · 응답 {stats['answered']} · "
+         f"기록 {written} · 실패 {stats['failed']}")
+    _say(f"  잔고 단위    {stats['share_unit_note']}")
+    _say(f"  CSV          {out}")
+    _say(f"  DB 적재      {res.get('stored')}종목 (source=kiwoom)")
+    _say(f"  커버리지     {cov['with_credit']}/{cov['active']}종목 "
+         f"· 최신 기준일 {cov['asof'] or '-'}")
+    for src, info in (store.credit_sources() or {}).items():
+        _say(f"    {src:12s} {info['n']:5d}종목  기준일 {info['asof'] or '-'}")
+    _say()
+
+    if not written:
+        log.warning("기록된 종목이 0건입니다. 실패 사유를 확인하십시오.")
+        return EXIT_PRECOND
+    return EXIT_PARTIAL if _partial(written, stats["failed"]) else EXIT_OK
 
 
 def mode_credit(store: Store, args) -> int:
@@ -587,8 +849,10 @@ def mode_credit(store: Store, args) -> int:
     값이 들어온 종목만 LPS credit_heat 가 프록시 캡(1.25점)을 벗고
     만점(4.0점)까지 열리며, 청산 계층 6의 재급증 규칙이 살아난다.
 
-    순서: KRX 자동 수집 → 수동 CSV 로 덮어쓰기.
-    수동이 나중이므로 항상 사람의 값이 우선한다.
+    적재 순서: KRX 자동 → 키움 REST 결과 CSV → 수동 CSV.
+    수동이 마지막이므로 항상 사람의 값이 이긴다. 예전에는 수동 파일
+    하나만 읽어서, 키움이 만든 `credit_kiwoom.csv` 가 아무도 읽지 않는
+    채로 남아 있었다.
     """
     if not args.no_krx:
         auto = refresh_credit_auto(store, trade_date=args.date, bld=args.bld)
@@ -597,22 +861,115 @@ def mode_credit(store: Store, args) -> int:
             log.info("KRX 자동 수집: %d종목 적재 (bld=%s)",
                      auto.get("stored", 0), auto.get("bld"))
         else:
-            log.warning("KRX 자동 수집 실패: %s — 수동 CSV 로 진행",
+            log.warning("KRX 자동 수집 실패: %s — CSV 로 진행",
                         auto.get("note"))
 
-    res = refresh_credit(store, args.credit_file)
+    res = refresh_credit_chain(store, manual_path=args.credit_file)
     cov = res.get("coverage") or store.credit_coverage()
     log.info("파싱 %s · 적재 %s · 주식수 역산 %s",
              res.get("parsed"), res.get("stored"), res.get("derived"))
-    print(f"\n신용잔고 커버리지: {cov['with_credit']}/{cov['active']}종목 "
-          f"· 최신 기준일 {cov['asof'] or '-'}")
+    _say(f"\n신용잔고 커버리지: {cov['with_credit']}/{cov['active']}종목 "
+         f"· 최신 기준일 {cov['asof'] or '-'}")
+    for step in res.get("steps") or []:
+        _say(f"    {step['source']:12s} {step['stored']:5d}종목  {step['path']}")
     if not cov["with_credit"]:
-        print(f"  {args.credit_file} 이 비어 있습니다.")
-        print("  템플릿: data/credit_manual.csv.example")
-        print("  값이 없으면 매집 점수 상한이 8.49점으로 눌립니다.\n")
+        _say(f"  {args.credit_file} 이 비어 있습니다.")
+        _say("  템플릿: data/credit_manual.csv.example")
+        _say("  자동 경로: hermes\\run.cmd --mode credit-kiwoom")
+        _say("  값이 없으면 매집 점수 상한이 8.49점으로 눌립니다.\n")
     else:
-        print("  해당 종목은 실측으로 채점됩니다 (credit_heat 최대 4.0점).\n")
-    return 0
+        _say("  해당 종목은 실측으로 채점됩니다 (credit_heat 최대 4.0점).\n")
+    SUMMARY.update({"parsed": res.get("parsed"), "stored": res.get("stored"),
+                    "derived": res.get("derived"), "coverage": cov,
+                    "steps": res.get("steps"),
+                    "by_source": res.get("by_source")})
+    return EXIT_OK
+
+
+# ── 스케줄 기대치 (AGENTS.md 4장) ──
+# '어제 daily 가 안 돌았다'를 알아채려면 무엇이 매일 돌아야 하는지를
+# 코드가 알고 있어야 한다. 휴장일에도 각 모드는 skipped 로 exit 0 을
+# 내고 이력을 남기므로, 이력의 공백은 곧 cron/전원 문제다.
+_SCHEDULE_DAILY = ("news", "brief-morning", "master", "update", "flags",
+                   "daily", "exits", "brief-evening")
+_SCHEDULE_WEEKLY = ("weekly", "brief-weekly", "export", "credit")
+STALE_DAILY_HOURS = 36.0      # 하루 + 여유
+STALE_WEEKLY_HOURS = 24.0 * 9   # 주간 + 연휴 여유
+
+
+def mode_runs(store: Store, args) -> int:
+    """배치 이력 조회 + 스케줄 공백 점검. 읽기 전용.
+
+    `runs` 테이블은 쓰기만 하고 읽는 코드가 없었다. AGENTS.md 7장이
+    "모든 배치 이력이 남습니다"라고 약속하는데 확인할 명령이 없으면
+    그 약속은 검증되지 않는다. 그리고 실제로는 22개 모드 중 둘만
+    기록하고 있었다.
+
+    이게 전략 검증의 전제다. 스캔 결과가 비었을 때 '시장이 조용했다'와
+    '잡이 죽어 있었다'를 구분해야 성과 해석이 성립한다.
+    """
+    hist = store.run_history(days=args.runs_days, mode=args.runs_mode,
+                            limit=args.runs_limit)
+    summary = store.run_summary(days=args.runs_days)
+
+    stale: list[dict] = []
+    for group, modes, limit_h in (("daily", _SCHEDULE_DAILY, STALE_DAILY_HOURS),
+                                  ("weekly", _SCHEDULE_WEEKLY,
+                                   STALE_WEEKLY_HOURS)):
+        for m in modes:
+            info = summary.get(m)
+            if info is None:
+                stale.append({"mode": m, "group": group, "age_hours": None,
+                              "note": f"최근 {args.runs_days}일 이력 없음"})
+            elif info["age_hours"] is not None and info["age_hours"] > limit_h:
+                stale.append({"mode": m, "group": group,
+                              "age_hours": info["age_hours"],
+                              "note": f"{limit_h:.0f}시간 기준 초과"})
+
+    failing = {m: i for m, i in summary.items() if i["failed"] > 0}
+
+    SUMMARY.update({"days": args.runs_days, "total": int(len(hist)),
+                    "modes": len(summary), "by_mode": summary,
+                    "stale": stale, "failing": sorted(failing)})
+
+    _say(f"\n배치 이력  최근 {args.runs_days}일 · {len(hist)}회 · "
+         f"{len(summary)}개 모드")
+    if hist.empty:
+        _say("  이력이 없습니다. 아직 배치를 돌리지 않았거나 DB 가 새 것입니다.")
+    else:
+        _say("\n  " + _pad("모드", 16) + _pad("최근 실행", 21)
+             + _pad("경과", 8, ">") + _pad("회", 5, ">")
+             + _pad("성공", 9, ">") + _pad("실패", 8, ">")
+             + _pad("평균초", 9, ">"))
+        for m, i in summary.items():
+            age = "-" if i["age_hours"] is None else f"{i['age_hours']:.1f}h"
+            _say(f"  {m:<16}{str(i['last'] or '-'):<21}{age:>8}"
+                 f"{i['runs']:>5}{i['ok']:>9}{i['failed']:>8}"
+                 f"{i['avg_sec']:>9.1f}")
+
+    if stale:
+        _say(f"\n  ! 스케줄 공백 {len(stale)}건 — cron 또는 전원 절전을 "
+             "확인하십시오")
+        for s in stale:
+            age = "이력 없음" if s["age_hours"] is None \
+                else f"{s['age_hours']:.1f}시간 전"
+            _say(f"      {s['mode']:<16}{s['group']:<8}{age}")
+    else:
+        _say("\n  스케줄 공백 없음")
+
+    if failing:
+        _say(f"\n  실패가 집계된 모드: {', '.join(sorted(failing))}")
+
+    if args.runs_mode and not hist.empty:
+        _say(f"\n  {args.runs_mode} 최근 {min(len(hist), 15)}회")
+        for _, r in hist.head(15).iterrows():
+            _say(f"      {r['started']}  {r['elapsed']:>7.1f}s  "
+                 f"ok={r['ok']} fail={r['failed']}  "
+                 f"{str(r['note'] or '')[:50]}")
+    _say()
+
+    # 공백이 있으면 exit 2 로 알린다. 조회 자체는 성공했으므로 실패가 아니다.
+    return EXIT_PARTIAL if stale else EXIT_OK
 
 
 def mode_backtest(store: Store, args) -> int:
@@ -665,11 +1022,8 @@ def mode_backtest(store: Store, args) -> int:
 
 
 def _print_backtest_report(s: dict, sweep, ex: dict, bt, args) -> None:
-    out = sys.stderr if args.json else sys.stdout
     w = 66
-
-    def p(*a):
-        print(*a, file=out)
+    p = _say
 
     p("\n" + "=" * w)
     p(" 백테스트 결과")
@@ -764,12 +1118,14 @@ def mode_export(store: Store, args) -> int:
     엑셀에서 한글이 깨지지 않도록 utf-8-sig(BOM) 로 쓴다.
     """
     written = store.export_csv(out_dir=args.export_dir, days=args.export_days)
-    print(f"\nCSV 내보내기 ({args.export_dir}):")
+    _say(f"\nCSV 내보내기 ({args.export_dir}):")
     for name, info in written.items():
-        print(f"  {name:<14} {info['rows']:>7,}행   {info['path']}")
-    print("\n  인코딩 utf-8-sig — 한글 엑셀에서 바로 열립니다.")
-    print("  scans 파일이 전종목 점수표입니다. 신용잔고 대조용으로 넘기십시오.\n")
-    return 0
+        _say(f"  {name:<14} {info['rows']:>7,}행   {info['path']}")
+    _say("\n  인코딩 utf-8-sig — 한글 엑셀에서 바로 열립니다.")
+    _say("  scans 파일이 전종목 점수표입니다. 신용잔고 대조용으로 넘기십시오.\n")
+    SUMMARY.update({"out_dir": args.export_dir,
+                    "files": {k: v["rows"] for k, v in written.items()}})
+    return EXIT_OK
 
 
 def mode_flags(store: Store, args) -> int:
@@ -794,22 +1150,26 @@ def mode_flags(store: Store, args) -> int:
 
     disc = stats.get("_discontinuity_list") or []
     if disc:
-        print("\n시세 불연속 의심 (재적재 권고):")
+        _say("\n시세 불연속 의심 (재적재 권고):")
         for code, memo in disc:
-            print(f"  {code}  {memo}")
-        print("  조치: DELETE FROM prices WHERE ticker='코드' 후 backfill 재실행\n")
+            _say(f"  {code}  {memo}")
+        _say("  조치: DELETE FROM prices WHERE ticker='코드' 후 backfill 재실행\n")
 
     summary = flag_summary(store)
-    if summary is not None and len(summary):
-        print(f"\n배제 대상 {len(summary)}종목 (상위 25):")
+    n_excluded = 0 if summary is None else int(len(summary))
+    if n_excluded:
+        _say(f"\n배제 대상 {n_excluded}종목 (상위 25):")
         for _, r in summary.head(25).iterrows():
             imp = r.get("capital_impair")
             it = f" (잠식 {float(imp):.1f}%)" if imp == imp and imp else ""
-            print(f"  {r['ticker']} {r['name'][:14]:<14} {r['reasons']}{it}")
-        print()
+            _say(f"  {r['ticker']} {r['name'][:14]:<14} {r['reasons']}{it}")
+        _say()
     else:
         log.warning("배제 대상 0건 — 공급원이 모두 실패했을 수 있다")
-    return 0
+
+    SUMMARY.update({k: v for k, v in stats.items() if not k.startswith("_")})
+    SUMMARY.update({"excluded": n_excluded, "discontinuity": len(disc)})
+    return EXIT_OK
 
 
 # ────────────────────────── 포지션 / 청산 ──────────────────────────
@@ -862,14 +1222,15 @@ def mode_exits(store: Store, args) -> int:
 def mode_pos_open(store: Store, args) -> int:
     """포지션 개시. 진입 시점 밴드/피보 레벨을 스냅샷으로 고정한다."""
     if not args.ticker or not args.qty:
+        # 인자 오류다. exit 1 은 재시도 대상이라 무한히 실패한다.
         log.error("--ticker 와 --qty 가 필요합니다")
-        return 1
+        return EXIT_USAGE
 
     code = str(args.ticker).zfill(6)
     ohlcv = store.load_ohlcv(code, days=420)
     if ohlcv is None or len(ohlcv) < DEFAULT.ma.long + 30:
-        log.error("%s 시세가 부족합니다 (backfill/update 확인)", code)
-        return 1
+        log.error("%s 시세가 부족합니다 (backfill/update 를 먼저 실행)", code)
+        return EXIT_PRECOND
 
     names = store.active_tickers()
     name = args.name or names.get(code, code)
@@ -906,15 +1267,20 @@ def mode_pos_open(store: Store, args) -> int:
         v = snap.get(key)
         return f"{float(v):,.0f}원" if v else "없음"
 
-    print(f"\n포지션 #{pos_id} 개시: {name} ({code}) [{track}]")
-    print(f"  진입 {entry_date} @ {entry_price:,.0f}원 x {int(args.qty):,}주")
-    print(f"  손절선(밴드 하단 -44%) : {_won('band_lo')}")
-    print(f"  대량청산 중심(-30%)    : {_won('band_mid')}")
-    print(f"  목표선(밴드 상단 -16%) : {_won('band_hi')}")
-    print(f"  피보 0.382 (2차 익절)  : {_won('fib_0382')}")
-    print(f"  골든크로스 봉 저가     : {_won('cross_low')}")
-    print("  ※ 위 값은 고정됩니다. 이후 재계산하지 않습니다.\n")
-    return 0
+    _say(f"\n포지션 #{pos_id} 개시: {name} ({code}) [{track}]")
+    _say(f"  진입 {entry_date} @ {entry_price:,.0f}원 x {int(args.qty):,}주")
+    _say(f"  손절선(밴드 하단 -44%) : {_won('band_lo')}")
+    _say(f"  대량청산 중심(-30%)    : {_won('band_mid')}")
+    _say(f"  목표선(밴드 상단 -16%) : {_won('band_hi')}")
+    _say(f"  피보 0.382 (2차 익절)  : {_won('fib_0382')}")
+    _say(f"  골든크로스 봉 저가     : {_won('cross_low')}")
+    _say("  ※ 위 값은 고정됩니다. 이후 재계산하지 않습니다.\n")
+
+    SUMMARY.update({"pos_id": int(pos_id), "ticker": code, "name": name,
+                    "track": track, "entry_date": entry_date,
+                    "entry_price": entry_price, "qty": int(args.qty),
+                    "snapshot": snap})
+    return EXIT_OK
 
 
 def mode_pos_list(store: Store, args) -> int:
@@ -924,8 +1290,7 @@ def mode_pos_list(store: Store, args) -> int:
                  for p in positions}
     # 상태 조회는 stdout(--json 이면 stderr)으로만 낸다. 토큰이 없어도
     # 실패하지 않아야 한다.
-    print(render_positions(positions, price_map),
-          file=sys.stderr if args.json else sys.stdout)
+    _say(render_positions(positions, price_map))
 
     SUMMARY["positions"] = len(positions)
     SUMMARY["open"] = [{"id": p.id, "ticker": p.ticker, "name": p.name,
@@ -934,14 +1299,13 @@ def mode_pos_list(store: Store, args) -> int:
                        for p in positions if p.status == "OPEN"]
 
     pending = store.pending_exits(days=args.catchup)
-    out = sys.stderr if args.json else sys.stdout
     if pending is not None and not pending.empty:
-        print("\n미체결 청산 신호:", file=out)
+        _say("\n미체결 청산 신호:")
         for _, r in pending.iterrows():
-            print(f"  log#{int(r['id'])} {r['name']}({r['ticker']}) "
-                  f"L{int(r['layer'])} {r['action']} {int(r['qty'])}주 "
-                  f"@ {float(r['signal_price']):,.0f} · {r['d']}", file=out)
-        print("  체결 반영: --mode fill --log-id N --fill-price 가격\n", file=out)
+            _say(f"  log#{int(r['id'])} {r['name']}({r['ticker']}) "
+                 f"L{int(r['layer'])} {r['action']} {int(r['qty'])}주 "
+                 f"@ {float(r['signal_price']):,.0f} · {r['d']}")
+        _say("  체결 반영: --mode fill --log-id N --fill-price 가격\n")
         SUMMARY["pending_exits"] = int(len(pending))
     else:
         SUMMARY["pending_exits"] = 0
@@ -952,21 +1316,25 @@ def mode_fill(store: Store, args) -> int:
     """체결 확인. 여기서만 잔량이 줄어든다."""
     if not args.log_id or args.fill_price is None:
         log.error("--log-id 와 --fill-price 가 필요합니다")
-        return 1
+        return EXIT_USAGE
     out = store.confirm_exit(int(args.log_id), float(args.fill_price),
                              int(args.fill_qty) if args.fill_qty else None)
     log.info("체결 반영: %s %d주 · 잔량 %d · %s",
              out["ticker"], out["filled_qty"], out["remaining"], out["status"])
-    return 0
+    SUMMARY.update({"ticker": out["ticker"], "filled_qty": out["filled_qty"],
+                    "remaining": out["remaining"], "status": out["status"],
+                    "log_id": int(args.log_id)})
+    return EXIT_OK
 
 
 def mode_pos_close(store: Store, args) -> int:
     if not args.id:
         log.error("--id 가 필요합니다")
-        return 1
+        return EXIT_USAGE
     store.close_position(int(args.id), args.note or "manual close")
     log.info("포지션 #%s 수동 종료", args.id)
-    return 0
+    SUMMARY.update({"closed_id": int(args.id), "status": "CLOSED"})
+    return EXIT_OK
 
 
 MODES = {
@@ -983,9 +1351,11 @@ MODES = {
     "brief-weekly": mode_brief_weekly,
     "flags": mode_flags,
     "credit": mode_credit,
+    "credit-kiwoom": mode_credit_kiwoom,
     "credit-probe": mode_credit_probe,
     "kiwoom-plan": mode_kiwoom_plan,
     "backtest": mode_backtest,
+    "runs": mode_runs,
     "export": mode_export,
     "exits": mode_exits,
     "pos-open": mode_pos_open,
@@ -1072,6 +1442,8 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true",
                     help="결과 요약을 stdout 에 JSON 한 줄로 출력 "
                          "(로그는 stderr 로 분리)")
+    ap.add_argument("--env-file",
+                    help="읽을 .env 경로 (기본: 저장소 루트의 .env)")
     ap.add_argument("--no-lock", action="store_true",
                     help="잡 락 사용하지 않음 (동시 실행 위험, 디버그용)")
     ap.add_argument("--lock-wait", type=int, default=0,
@@ -1087,13 +1459,33 @@ def main(argv=None) -> int:
     ap.add_argument("--bld", help="credit/credit-probe: KRX bld 코드 직접 지정")
     ap.add_argument("--no-krx", action="store_true",
                     help="credit: KRX 자동 수집 없이 수동 CSV 만 사용")
-    # ── 키움 OpenAPI+ ──
+    # ── 키움 (계획 + REST 수집) ──
     ap.add_argument("--kw-limit", type=int, default=300,
-                    help="kiwoom-plan: 수집 대상 상한 (기본 300)")
+                    help="kiwoom-plan/credit-kiwoom: 수집 대상 상한 (기본 300)")
     ap.add_argument("--kw-days", type=int, default=5,
                     help="kiwoom-plan: 스캔/추천 이력 조회 일수 (기본 5)")
     ap.add_argument("--write-targets",
                     help="kiwoom-plan: 대상 종목코드를 이 파일에 기록")
+    ap.add_argument("--targets-file",
+                    help="credit-kiwoom: 대상 종목코드 목록 파일 "
+                         "(없으면 계획기가 직접 고름)")
+    ap.add_argument("--kiwoom-out", default=KIWOOM_CREDIT_CSV,
+                    help=f"credit-kiwoom: 결과 CSV 경로 "
+                         f"(기본 {KIWOOM_CREDIT_CSV})")
+    ap.add_argument("--kiwoom-mock", action="store_true",
+                    help="credit-kiwoom: 모의투자 도메인 사용 "
+                         "(KIWOOM_API_BASE 가 있으면 그쪽이 우선)")
+    ap.add_argument("--kw-pages", type=int, default=1,
+                    help="credit-kiwoom: ka10013 연속조회 페이지 상한 "
+                         "(기본 1. 늘리면 종목당 요청이 늘어남)")
+    ap.add_argument("--kw-retries", type=int, default=3,
+                    help="credit-kiwoom: TR 재시도 횟수 (기본 3)")
+    # ── 배치 이력 ──
+    ap.add_argument("--runs-days", type=int, default=14,
+                    help="runs: 조회 일수 (기본 14)")
+    ap.add_argument("--runs-mode", help="runs: 특정 모드만 조회")
+    ap.add_argument("--runs-limit", type=int, default=200,
+                    help="runs: 최대 행 수 (기본 200)")
     # ── 백테스트 ──
     ap.add_argument("--bt-step", type=int, default=5,
                     help="backtest: 평가 간격(거래일). 1이면 전수")
@@ -1112,6 +1504,17 @@ def main(argv=None) -> int:
     SUMMARY["mode"] = args.mode
     SUMMARY["started"] = now_kst().isoformat(timespec="seconds")
 
+    # .env 를 환경변수로 올린다. 여기가 아니면 TELEGRAM_* / DART_API_KEY 를
+    # 읽는 시점에 이미 늦다. OS 환경변수가 이기므로 주입된 값은 보존된다.
+    env_rep = load_env(args.env_file)
+    SUMMARY["env_file"] = {"path": env_rep["path"], "exists": env_rep["exists"],
+                           "keys": env_rep["keys"]}
+    if not env_rep["exists"]:
+        log.debug(".env 없음 (%s) — OS 환경변수만 사용", env_rep["path"])
+    elif env_rep["unknown_keys"]:
+        log.warning(".env 에 알 수 없는 키: %s",
+                    ", ".join(sorted(env_rep["unknown_keys"])))
+
     if args.force_unlock:
         removed = clear_locks()
         log.warning("락 강제 해제: %s", removed or "없음")
@@ -1119,6 +1522,7 @@ def main(argv=None) -> int:
 
     store = Store(args.db)
     t0 = time.time()
+    started_at = now_kst().replace(tzinfo=None)
     lock = None
     try:
         # DB 쓰기 모드는 직렬화한다. 겹치면 database is locked 로 죽는다.
@@ -1150,10 +1554,28 @@ def main(argv=None) -> int:
             lock.release()
 
     elapsed = time.time() - t0
+    # 발송이 실패했는데 exit 0 이면 무음 장애를 아무도 모른다. 판정 자체는
+    # 성공했으므로 치명적 실패가 아니라 부분 실패로 알린다.
+    if SUMMARY.get("send_failed") and rc == EXIT_OK:
+        log.error("텔레그램 발송 %d건 실패 — 부분 실패로 보고합니다",
+                  SUMMARY["send_failed"])
+        rc = EXIT_PARTIAL
     SUMMARY["exit_code"] = int(rc)
     SUMMARY["elapsed_sec"] = round(elapsed, 1)
     SUMMARY["finished"] = now_kst().isoformat(timespec="seconds")
     log.info("[%s] 종료 rc=%d · 소요 %.1f초", args.mode, rc, elapsed)
+
+    # 배치 이력은 여기서 한 번만 남긴다. 모드 안에서 각자 부르면 빠뜨리는
+    # 모드가 생긴다 (실제로 22개 중 2개만 기록하고 있었다). 예외로 죽은
+    # 실행도 여기까지는 오므로 실패 이력이 남는다 — 그게 더 중요하다.
+    if args.mode != "runs":
+        ok_n, fail_n = _run_counts(rc)
+        try:
+            store.log_run(args.mode, started_at, ok_n, fail_n,
+                          note=_run_note(rc), elapsed=elapsed)
+        except Exception as exc:  # noqa: BLE001
+            # 이력 기록 실패가 배치 결과를 바꾸면 안 된다.
+            log.warning("runs 기록 실패: %s", exc)
 
     if args.json:
         payload = {k: v for k, v in SUMMARY.items() if not k.startswith("_")}
