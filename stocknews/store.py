@@ -19,12 +19,15 @@ pandas 연산만 한다. 2,800종목 채점이 수 분 안에 끝난다.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 __all__ = ["Store"]
 
@@ -270,19 +273,47 @@ class Store:
             con.commit()
 
     # ────────────────────────── 시세 ──────────────────────────
+    @staticmethod
+    def _price_ok(o, h, l, c) -> bool:
+        """OHLC 가 전부 양수인가. 하나라도 0/음수/NaN 이면 버린다.
+
+        2026-08-27 실측으로 잡은 규칙이다. 백필 435,263행 중 1행이
+        `o=h=l=0, c=18,000, v=199,329` 였다(아이에스동서 2026-08-13).
+        거래량이 0이 아니라서 기존 필터(`거래량 > 0`)를 통과했다.
+
+        한 행이지만 영향이 크다. 저가 0 이 파동 저점으로 잡히면 그
+        종목의 피보나치 레벨이 전부 망가지고, 매물대 POC 와 ATR 도
+        0 범위로 계산된다. 조용히 한 종목의 채점이 무의미해진다.
+
+        거래된 주식의 가격은 0 일 수 없다. 이건 데이터 오류다.
+        """
+        try:
+            vals = (float(o), float(h), float(l), float(c))
+        except (TypeError, ValueError):
+            return False
+        return all(v > 0 and v == v for v in vals)   # v == v : NaN 배제
+
     def upsert_prices(self, ticker: str, df: pd.DataFrame) -> int:
         """한 종목의 OHLCV 적재. 컬럼은 한글 규격을 기대한다."""
         if df is None or df.empty:
             return 0
         rows = []
+        dropped = 0
         has_amt = "거래대금" in df.columns
         for idx, r in df.iterrows():
+            if not self._price_ok(r["시가"], r["고가"], r["저가"], r["종가"]):
+                dropped += 1
+                continue
             rows.append((
                 ticker, _d(idx),
                 float(r["시가"]), float(r["고가"]), float(r["저가"]),
                 float(r["종가"]), float(r["거래량"]),
                 float(r["거래대금"]) if has_amt and pd.notna(r["거래대금"]) else None,
             ))
+        if dropped:
+            log.warning("%s: OHLC 가 0/결측인 %d행 제외", ticker, dropped)
+        if not rows:
+            return 0
         with closing(self._conn()) as con:
             con.executemany(
                 "INSERT INTO prices(ticker,d,o,h,l,c,v,amt) VALUES(?,?,?,?,?,?,?,?) "
@@ -309,6 +340,9 @@ class Store:
             try:
                 if float(r["거래량"]) <= 0:
                     continue  # 거래정지/휴장 종목은 지표를 왜곡한다
+                if not self._price_ok(r["시가"], r["고가"], r["저가"],
+                                      r["종가"]):
+                    continue  # 거래량이 있어도 OHLC 가 0 이면 데이터 오류다
                 rows.append((
                     str(code).zfill(6), ds,
                     float(r["시가"]), float(r["고가"]), float(r["저가"]),

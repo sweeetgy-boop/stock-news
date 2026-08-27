@@ -462,6 +462,46 @@ def test_store(tmp: Path):
         n = st.upsert_cross_section("2026-08-25", cs)
         assert n == 1, f"거래량 0 종목이 걸러지지 않음 (n={n})"
 
+    def t_zero_ohlc_rejected():
+        """OHLC 가 0 인 행은 거래량이 있어도 버려야 한다.
+
+        2026-08-27 실측: 백필 435,263행 중 1행이 `o=h=l=0, c=18,000,
+        v=199,329` 였다(아이에스동서 2026-08-13). 거래량이 0이 아니라서
+        기존 필터를 통과했다.
+
+        한 행이지만 영향이 크다. 저가 0 이 파동 저점으로 잡히면 그
+        종목의 피보나치 레벨이 전부 망가지고, 매물대 POC 와 ATR 도
+        0 범위가 된다. 조용히 한 종목의 채점이 무의미해진다.
+        """
+        bad = pd.DataFrame({
+            "시가": [0.0], "고가": [0.0], "저가": [0.0],
+            "종가": [18000.0], "거래량": [199329.0],
+        }, index=pd.to_datetime(["2026-08-13"]))
+        assert st.upsert_prices("000099", bad) == 0, \
+            "OHLC 가 0 인 행이 적재됐다"
+        assert st.load_ohlcv("000099", days=10) is None or \
+            st.load_ohlcv("000099", days=10).empty
+
+        # 전종목 경로도 같은 규칙이어야 한다 (쓰는 곳이 둘이다)
+        cs = pd.DataFrame({
+            "시가": [0.0, 1000.0], "고가": [0.0, 1010.0],
+            "저가": [0.0, 990.0], "종가": [18000.0, 1005.0],
+            "거래량": [199329.0, 100.0], "거래대금": [None, 100_500.0],
+        }, index=["000098", "000097"])
+        assert st.upsert_cross_section("2026-08-24", cs) == 1, \
+            "전종목 경로에서 OHLC 0 행이 통과했다"
+
+        # 정상 행은 그대로 들어가야 한다 (과잉 차단 방지)
+        good = pd.DataFrame({
+            "시가": [1000.0], "고가": [1010.0], "저가": [990.0],
+            "종가": [1005.0], "거래량": [100.0],
+        }, index=pd.to_datetime(["2026-08-13"]))
+        assert st.upsert_prices("000096", good) == 1
+        # NaN 도 막아야 한다
+        nan_row = good.copy()
+        nan_row.loc[nan_row.index[0], "저가"] = float("nan")
+        assert st.upsert_prices("000095", nan_row) == 0, "NaN 행이 적재됐다"
+
     def t_tickers():
         st.upsert_tickers([
             {"ticker": "000001", "name": "급락종목", "market": "KOSPI",
@@ -805,6 +845,7 @@ def test_store(tmp: Path):
 
     check("store", "시세 왕복 + 멱등성", t_prices)
     check("store", "일자별 전종목 적재 (거래정지 제외)", t_cross_section)
+    check("store", "OHLC 0 행 거부 (실데이터 버그)", t_zero_ohlc_rejected)
     check("store", "종목 마스터 COALESCE 보존", t_tickers)
     check("store", "비활성/재등록", t_inactive)
     check("store", "스캔 스냅샷 + 추천 이력", t_scan_reco)
