@@ -109,13 +109,27 @@ def main() -> int:
     print("=" * width)
     feature_fail = []
 
-    def feat(label, fn):
+    feature_warn = []
+
+    def feat(label, fn, *, fatal: bool = True):
+        """기능 1건 점검.
+
+        `fatal=False` 는 '기능이 죽었지만 폴백으로 동작한다'는 뜻이다.
+        하드 실패로 내면 고칠 수 없는 환경(예: OS 보안 정책)에서 rc=1 이
+        영구히 붙어 정작 진짜 실패를 가린다. 반대로 조용히 통과시키면
+        열화 사실을 아무도 모른다. 그래서 등급을 나눈다.
+        """
         try:
             fn()
             print(f"  OK    {label}")
         except Exception as exc:  # noqa: BLE001
-            feature_fail.append((label, f"{type(exc).__name__}: {exc}"))
-            print(f" FAIL   {label}  {type(exc).__name__}: {exc}")
+            detail = f"{type(exc).__name__}: {exc}"
+            if fatal:
+                feature_fail.append((label, detail))
+                print(f" FAIL   {label}  {detail}")
+            else:
+                feature_warn.append((label, detail))
+                print(f" 경고   {label}\n        {exc}")
 
     def f_bs4_xml():
         from bs4 import BeautifulSoup
@@ -157,6 +171,38 @@ def main() -> int:
         kst = timezone(timedelta(hours=9))
         assert datetime.now(kst).utcoffset() == timedelta(hours=9)
 
+    def f_charset_detector():
+        """requests 의 문자 인식 의존성이 실제로 로드되는가.
+
+        핀 대조는 `importlib.metadata` 로 버전만 읽는다. 그래서 설치는
+        돼 있는데 **로드가 막힌** 경우를 놓친다. 2026-08-28 실측:
+
+            ImportError: DLL load failed while importing cd:
+            애플리케이션 제어 정책에서 이 파일을 차단했습니다.
+
+        Windows 애플리케이션 제어 정책(WDAC/Smart App Control)이
+        `charset_normalizer` 의 컴파일 확장(`cd.cp312-win_amd64.pyd`)을
+        차단한 것이다. 패키지 파일은 전부 있고 순수 파이썬 폴백(`cd.py`)도
+        있지만 `__init__` 이 `.pyd` 를 먼저 잡아 ImportError 로 죽는다.
+
+        영향은 좁다. charset 헤더를 주는 응답(DART·키움 JSON)은 무관하고,
+        헤더가 없으면 requests 가 utf-8 로 폴백한다. 우리가 읽는 소스는
+        전부 UTF-8 이라 실害가 없다. 다만 '환경이 정확히 일치합니다'가
+        거짓이 되는 것을 막아야 한다.
+        """
+        import requests.compat as _rc
+        if getattr(_rc, "chardet", None) is not None:
+            return
+        try:
+            import charset_normalizer  # noqa: F401
+            return
+        except ImportError as exc:
+            raise AssertionError(
+                f"charset 인식 의존성 로드 실패 ({exc}). "
+                "응답 인코딩 자동 판별이 꺼집니다 (utf-8 폴백). "
+                "복구하려면: pip install --force-reinstall "
+                "--no-binary :all: charset-normalizer") from exc
+
     def f_stdlib_zip_xml():
         import io
         import zipfile
@@ -178,6 +224,9 @@ def main() -> int:
     feat("numpy add.at (매물대 POC)", f_numpy_addat)
     feat("timezone KST", f_zoneinfo)
     feat("zipfile + ElementTree (DART corpCode)", f_stdlib_zip_xml)
+    # 폴백(utf-8)이 있어 배치가 죽지는 않는다. 그래서 경고로만 낸다.
+    feat("requests charset 인식 (전이 의존성 로드)", f_charset_detector,
+         fatal=False)
 
     # ── 설정 점검 ──
     # 핀 버전이 맞아도 .env 가 없으면 발송 모드가 전부 exit 4 로 끝난다.
@@ -245,10 +294,17 @@ def main() -> int:
     bad = len(mismatch) + len(missing) + len(import_fail) + len(feature_fail)
     print(f" 핀 일치 {len(ok)}/{len(pins)}   불일치 {len(mismatch)}   "
           f"미설치 {len(missing)}")
-    print(f" import 실패 {len(import_fail)}   기능 실패 {len(feature_fail)}")
+    print(f" import 실패 {len(import_fail)}   기능 실패 {len(feature_fail)}"
+          f"   기능 경고 {len(feature_warn)}")
     print("-" * width)
-    if bad == 0:
+    if bad == 0 and not feature_warn:
         print("\n환경이 requirements.txt 와 정확히 일치합니다.")
+    elif bad == 0:
+        # '일치합니다' 를 그대로 찍으면 열화 사실이 묻힌다.
+        print("\n핀 버전은 일치하지만 열화된 기능이 있습니다:")
+        for label, detail in feature_warn:
+            print(f"  · {label}")
+            print(f"    {detail}")
     return 1 if bad else 0
 
 
