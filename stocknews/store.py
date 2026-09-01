@@ -49,6 +49,39 @@ def _now_str() -> str:
     return _now_kst().isoformat(timespec="seconds")
 
 
+# 정규장 마감. 이 시각 전에는 '오늘' 봉이 아직 완성되지 않았다.
+KRX_CLOSE_HOUR, KRX_CLOSE_MIN = 15, 30
+# 마감 직후 몇 분은 시세가 확정되지 않는다. 여유를 둔다.
+CLOSE_SETTLE_MIN = 20
+
+
+def in_progress_date(now: datetime | None = None) -> str | None:
+    """지금 적재하면 '진행 중인 봉'이 되는 날짜. 없으면 None.
+
+    장중(09:00~15:50)에는 오늘 봉이 미완성이다. pykrx 종목별 조회는
+    장중에도 당일 행을 주는데, 그 종가는 현재가다. 그걸 종가로 적재하면
+    그날 채점 전체가 틀어진다.
+
+    2026-08-28 실측으로 잡은 규칙이다. 백필이 08:54 에 시작해 09:04 에
+    끝났고 장은 09:00 에 열렸다. 09:00 이후 처리된 252종목이 개장 직후
+    몇 분치만 담긴 봉을 받았고, 그중 246종목(98%)의 거래량이 8월 평균의
+    30% 미만이었다. `daily` 는 `last_price_date()` 로 기준일을 잡으므로
+    그 오염된 날짜를 그날의 거래일로 골랐다.
+
+    주말·공휴일은 여기서 판정하지 않는다 (`trading_day` 의 몫이다).
+    이 함수는 '오늘 장이 아직 안 끝났는가'만 본다.
+    """
+    now = now or _now_kst()
+    if now.weekday() >= 5:          # 주말엔 오늘 봉이 애초에 없다
+        return None
+    settle = now.replace(hour=KRX_CLOSE_HOUR,
+                         minute=KRX_CLOSE_MIN + CLOSE_SETTLE_MIN,
+                         second=0, microsecond=0)
+    if now >= settle:
+        return None
+    return now.strftime("%Y-%m-%d")
+
+
 def _as_kst_naive(value: datetime) -> datetime:
     """호출자가 준 시각을 DB 표준(naive KST)으로 맞춘다.
 
@@ -293,25 +326,39 @@ class Store:
             return False
         return all(v > 0 and v == v for v in vals)   # v == v : NaN 배제
 
-    def upsert_prices(self, ticker: str, df: pd.DataFrame) -> int:
-        """한 종목의 OHLCV 적재. 컬럼은 한글 규격을 기대한다."""
+    def upsert_prices(self, ticker: str, df: pd.DataFrame,
+                      allow_today: bool = False) -> int:
+        """한 종목의 OHLCV 적재. 컬럼은 한글 규격을 기대한다.
+
+        장중이면 오늘 행을 버린다. 미완성 봉을 종가로 적재하면 그날
+        채점이 전부 틀어진다 (`in_progress_date` 주석 참조).
+        `allow_today=True` 는 마감 후 재적재나 테스트용이다.
+        """
         if df is None or df.empty:
             return 0
+        skip_d = None if allow_today else in_progress_date()
         rows = []
         dropped = 0
+        partial = 0
         has_amt = "거래대금" in df.columns
         for idx, r in df.iterrows():
+            ds = _d(idx)
+            if skip_d and ds == skip_d:
+                partial += 1
+                continue
             if not self._price_ok(r["시가"], r["고가"], r["저가"], r["종가"]):
                 dropped += 1
                 continue
             rows.append((
-                ticker, _d(idx),
+                ticker, ds,
                 float(r["시가"]), float(r["고가"]), float(r["저가"]),
                 float(r["종가"]), float(r["거래량"]),
                 float(r["거래대금"]) if has_amt and pd.notna(r["거래대금"]) else None,
             ))
         if dropped:
             log.warning("%s: OHLC 가 0/결측인 %d행 제외", ticker, dropped)
+        if partial:
+            log.debug("%s: 장중 미완성 봉 %s 제외", ticker, skip_d)
         if not rows:
             return 0
         with closing(self._conn()) as con:
@@ -325,15 +372,22 @@ class Store:
             con.commit()
         return len(rows)
 
-    def upsert_cross_section(self, trade_date, df: pd.DataFrame) -> int:
+    def upsert_cross_section(self, trade_date, df: pd.DataFrame,
+                             allow_today: bool = False) -> int:
         """'특정 일자 전종목' 한 판을 통째로 적재.
 
         df : index=종목코드, columns=['시가','고가','저가','종가','거래량','거래대금']
         일일 증분 업데이트의 핵심 경로다. 요청 1회로 2,800종목이 들어온다.
+
+        `upsert_prices` 와 같은 이유로 장중 오늘 날짜는 거부한다. 적재
+        경로가 둘이므로 한쪽만 막으면 다른 쪽으로 새 들어온다.
         """
         if df is None or df.empty:
             return 0
         ds = _d(trade_date)
+        if not allow_today and ds == in_progress_date():
+            log.warning("%s 는 장중이라 적재하지 않습니다 (미완성 봉)", ds)
+            return 0
         has_amt = "거래대금" in df.columns
         rows = []
         for code, r in df.iterrows():
@@ -380,10 +434,43 @@ class Store:
             out = out.drop(columns=["거래대금"])
         return out[out["거래량"] > 0]
 
-    def last_price_date(self) -> str | None:
+    # 마지막 날짜가 이 비율 미만으로만 채워져 있으면 '부분 적재'로 본다.
+    PARTIAL_DAY_RATIO = 0.5
+
+    def last_price_date(self, allow_partial: bool = False) -> str | None:
+        """스캔 기준일. **부분적으로만 채워진 날짜는 건너뛴다.**
+
+        `MAX(d)` 를 그대로 쓰면 안 된다. 적재가 중간에 끊기거나 장중에
+        일부 종목만 들어오면 그 날짜가 최신이 되고, `daily` 가 그걸
+        거래일로 잡아 전종목을 그 날짜로 채점한다. 데이터가 있는 종목이
+        일부뿐이라 결과가 무의미해진다.
+
+        2026-08-28 실측: 08-25~27 은 각 2,400여 종목인데 08-28 은
+        252종목뿐이었다(장중 백필). 그 상태로 `daily` 가 1,196종목을
+        08-28 기준으로 채점하기 시작했다.
+
+        직전 거래일 대비 절반도 안 채워진 날짜는 아직 완성되지 않은
+        것으로 보고 그 앞 날짜를 준다.
+        """
         with closing(self._conn()) as con:
-            row = con.execute("SELECT MAX(d) FROM prices").fetchone()
-        return row[0] if row and row[0] else None
+            rows = con.execute(
+                "SELECT d, COUNT(*) n FROM prices GROUP BY d "
+                "ORDER BY d DESC LIMIT 6").fetchall()
+        if not rows:
+            return None
+        if allow_partial or len(rows) == 1:
+            return rows[0][0]
+
+        # 비교 기준은 그 아래 날짜들의 중위 종목수다. 하루만 보면 그
+        # 하루도 부분 적재일 수 있다.
+        counts = sorted(n for _, n in rows[1:])
+        median = counts[len(counts) // 2]
+        for d, n in rows:
+            if median <= 0 or n >= median * self.PARTIAL_DAY_RATIO:
+                return d
+            log.warning("%s 는 %d종목만 적재돼 기준일에서 제외합니다 "
+                        "(직전 중위 %d종목)", d, n, median)
+        return rows[-1][0]
 
     def existing_dates(self, since: str | None = None) -> set[str]:
         """이미 적재된 거래일 집합. 증분 업데이트에서 중복 요청을 막는다."""

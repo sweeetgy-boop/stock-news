@@ -462,6 +462,113 @@ def test_store(tmp: Path):
         n = st.upsert_cross_section("2026-08-25", cs)
         assert n == 1, f"거래량 0 종목이 걸러지지 않음 (n={n})"
 
+    def t_in_progress_date():
+        """장중 판정. 마감 후·주말이면 '진행 중인 날짜'가 없다."""
+        from datetime import datetime as _dt
+
+        from stocknews.store import in_progress_date
+
+        # 금요일 2026-08-28
+        assert in_progress_date(_dt(2026, 8, 28, 8, 59)) == "2026-08-28", \
+            "개장 전에도 오늘 봉은 미완성이다"
+        assert in_progress_date(_dt(2026, 8, 28, 9, 1)) == "2026-08-28"
+        assert in_progress_date(_dt(2026, 8, 28, 15, 29)) == "2026-08-28"
+        # 15:30 마감 + 20분 여유
+        assert in_progress_date(_dt(2026, 8, 28, 15, 49)) == "2026-08-28"
+        assert in_progress_date(_dt(2026, 8, 28, 15, 50)) is None, \
+            "마감 정산 후에는 오늘 봉을 받아야 한다"
+        assert in_progress_date(_dt(2026, 8, 28, 23, 0)) is None
+        # 주말은 오늘 봉이 애초에 없다
+        assert in_progress_date(_dt(2026, 8, 29, 10, 0)) is None
+        assert in_progress_date(_dt(2026, 8, 30, 10, 0)) is None
+
+    def t_intraday_bar_rejected():
+        """장중 오늘 봉을 종가로 적재하면 안 된다.
+
+        2026-08-28 실측: 백필이 08:54~09:04 에 돌았고 장은 09:00 에
+        열렸다. 09:00 이후 처리된 252종목이 개장 몇 분치만 담긴 봉을
+        받았고, 그중 246종목(98%)의 거래량이 8월 평균의 30% 미만이었다.
+        `daily` 가 `last_price_date()` 로 그 날짜를 거래일로 잡아
+        1,196종목을 08-28 기준으로 채점하기 시작했다.
+        """
+        import stocknews.store as store_mod
+        from stocknews.store import Store
+
+        # 별도 DB 를 쓴다. 공유 DB 에 날짜를 추가하면 daily 의
+        # check_listing (= DB 전체 거래일 수 >= 252) 이 켜지면서 다른
+        # 검사의 250봉 픽스처가 '상장 1년 미만'으로 배제된다. 실제로
+        # 그렇게 깨졌다.
+        sti = Store(tmp / "intraday.db")
+        today = "2026-08-28"
+        df = pd.DataFrame({
+            "시가": [1000.0, 1010.0], "고가": [1020.0, 1015.0],
+            "저가": [990.0, 1005.0], "종가": [1015.0, 1012.0],
+            "거래량": [100000.0, 3000.0],       # 두 번째가 장중 봉
+        }, index=pd.to_datetime(["2026-08-27", today]))
+
+        orig = store_mod.in_progress_date
+        store_mod.in_progress_date = lambda now=None: today
+        try:
+            n = sti.upsert_prices("000094", df)
+            assert n == 1, f"장중 봉이 적재됐다 (n={n})"
+            back = sti.load_ohlcv("000094", days=10)
+            # load_ohlcv 는 d 를 인덱스로 옮긴다 (컬럼으로 남지 않는다)
+            got = {str(x)[:10] for x in back.index}
+            assert back is not None and today not in got, \
+                f"장중 날짜가 DB 에 남았다: {got}"
+
+            # 전종목 경로도 같은 규칙 (쓰는 곳이 둘이다)
+            cs = pd.DataFrame({
+                "시가": [1000.0], "고가": [1020.0], "저가": [990.0],
+                "종가": [1015.0], "거래량": [3000.0], "거래대금": [None],
+            }, index=["000093"])
+            assert sti.upsert_cross_section(today, cs) == 0, \
+                "전종목 경로로 장중 봉이 들어왔다"
+
+            # 마감 후 재적재는 허용해야 한다
+            assert sti.upsert_prices("000092", df, allow_today=True) == 2
+        finally:
+            store_mod.in_progress_date = orig
+
+    def t_partial_day_not_trade_date():
+        """부분 적재된 날짜를 기준일로 잡으면 안 된다.
+
+        MAX(d) 를 그대로 쓰면 적재가 끊긴 날짜나 장중 일부만 들어온
+        날짜가 최신이 되고, daily 가 전종목을 그 날짜로 채점한다.
+        """
+        from stocknews.store import Store
+
+        st2 = Store(tmp / "partial.db")
+        rows = []
+        for d, n in (("2026-08-25", 200), ("2026-08-26", 200),
+                     ("2026-08-27", 204)):
+            for i in range(n):
+                rows.append((f"{i:06d}", d))
+        # 08-28 은 12종목만 (부분 적재)
+        for i in range(12):
+            rows.append((f"{i:06d}", "2026-08-28"))
+        import sqlite3 as _sq
+        with _sq.connect(st2.path) as con:
+            con.executemany(
+                "INSERT INTO prices(ticker,d,o,h,l,c,v) "
+                "VALUES(?,?,100,110,90,105,1000)", rows)
+            con.commit()
+
+        assert st2.last_price_date() == "2026-08-27", \
+            f"부분 적재일을 골랐다: {st2.last_price_date()}"
+        assert st2.last_price_date(allow_partial=True) == "2026-08-28", \
+            "allow_partial 이 무시됐다"
+
+        # 정상적으로 다 채워지면 그 날짜를 골라야 한다 (과잉 차단 방지)
+        with _sq.connect(st2.path) as con:
+            con.executemany(
+                "INSERT INTO prices(ticker,d,o,h,l,c,v) "
+                "VALUES(?,?,100,110,90,105,1000)",
+                [(f"{i:06d}", "2026-08-28") for i in range(12, 200)])
+            con.commit()
+        assert st2.last_price_date() == "2026-08-28", \
+            "완성된 날짜를 거부했다"
+
     def t_zero_ohlc_rejected():
         """OHLC 가 0 인 행은 거래량이 있어도 버려야 한다.
 
@@ -479,6 +586,8 @@ def test_store(tmp: Path):
         }, index=pd.to_datetime(["2026-08-13"]))
         assert st.upsert_prices("000099", bad) == 0, \
             "OHLC 가 0 인 행이 적재됐다"
+        # 이 검사는 새 날짜를 만들지 않는다. 공유 DB 의 거래일 수가 늘면
+        # daily 의 check_listing 이 켜져 다른 검사가 깨진다 (실제 발생).
         assert st.load_ohlcv("000099", days=10) is None or \
             st.load_ohlcv("000099", days=10).empty
 
@@ -846,6 +955,9 @@ def test_store(tmp: Path):
     check("store", "시세 왕복 + 멱등성", t_prices)
     check("store", "일자별 전종목 적재 (거래정지 제외)", t_cross_section)
     check("store", "OHLC 0 행 거부 (실데이터 버그)", t_zero_ohlc_rejected)
+    check("store", "장중 판정 (마감+20분)", t_in_progress_date)
+    check("store", "장중 미완성 봉 거부 (실데이터 버그)", t_intraday_bar_rejected)
+    check("store", "부분 적재일은 기준일 제외", t_partial_day_not_trade_date)
     check("store", "종목 마스터 COALESCE 보존", t_tickers)
     check("store", "비활성/재등록", t_inactive)
     check("store", "스캔 스냅샷 + 추천 이력", t_scan_reco)
