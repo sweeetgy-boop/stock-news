@@ -2943,6 +2943,400 @@ def test_kiwoom_rest(tmp: Path):
     check("kiwoom-rest", "주문 경로 없음", t_no_order_calls)
 
 
+def test_dividends(tmp: Path):
+    """배당 수집. 픽스처는 2026-09-01 OpenDART 실측 응답이다.
+
+    앵커 5종목(삼성전자·POSCO홀딩스·KT&G·삼성화재·우리금융지주)의 주당
+    현금배당금과 배당성향을 공시 원문 값으로 고정한다. 파서가 단위나
+    우선주 처리를 잘못 바꾸면 여기서 걸린다.
+    """
+    from stocknews.dividend_data import (build_rows, collect_dividends,
+                                         fetch_one, free_cash_flow,
+                                         latest_fiscal_year,
+                                         parse_alot_matter, parse_cashflow,
+                                         payout_ratio, resolve_status,
+                                         year_batches, _label_unit)
+    from stocknews.kiwoom import RateLimiter
+    from stocknews.store import Store
+
+    def _al(se, knd, th, fr, lw, stlm="2025-12-31"):
+        return {"se": se, "stock_knd": knd, "thstrm": th, "frmtrm": fr,
+                "lwfr": lw, "stlm_dt": stlm}
+
+    def _cf(aid, nm, th, fr, bf):
+        return {"sj_div": "CF", "account_id": aid, "account_nm": nm,
+                "thstrm_amount": th, "frmtrm_amount": fr,
+                "bfefrmtrm_amount": bf}
+
+    # ── 실측 픽스처 (bsns_year=2025, reprt_code=11011) ──
+    SEC = [
+        _al("주당액면가액(원)", "-", "100", "100", "100"),
+        _al("(연결)당기순이익(백만원)", "-",
+            "44,260,956", "33,621,363", "14,473,401"),
+        _al("(별도)당기순이익(백만원)", "-",
+            "33,686,601", "23,582,565", "25,397,099"),
+        _al("현금배당금총액(백만원)", "-",
+            "11,107,906", "9,810,767", "9,809,438"),
+        _al("주식배당금총액(백만원)", "-", "-", "-", "-"),
+        _al("(연결)현금배당성향(%)", "-", "25.10", "29.20", "67.80"),
+        _al("현금배당수익률(%)", "보통주", "1.50", "2.70", "1.90"),
+        _al("주당 현금배당금(원)", "보통주", "1,668", "1,446", "1,444"),
+        _al("주당 현금배당금(원)", "우선주", "1,669", "1,447", "1,445"),
+        _al("주당 주식배당(주)", "보통주", "-", "-", "-"),
+    ]
+    POSCO = [
+        _al("주당액면가액(원)", "-", "5,000", "5,000", "5,000"),
+        _al("(연결)당기순이익(백만원)", "-",
+            "657,654", "1,094,917", "1,698,092"),
+        _al("현금배당금총액(백만원)", "-", "756,208", "757,485", "758,762"),
+        _al("(연결)현금배당성향(%)", "-", "115.00", "69.20", "44.70"),
+        _al("주당 현금배당금(원)", "보통주", "10,000", "10,000", "10,000"),
+        _al("주당 현금배당금(원)", "우선주", "-", "-", "-"),
+    ]
+    KTNG = [
+        _al("주당액면가액(원)", "-", "5,000", "5,000", "5,000"),
+        _al("(연결)당기순이익(백만원)", "-",
+            "1,090,072", "1,165,727", "902,662"),
+        _al("현금배당금총액(백만원)", "-", "627,428", "588,448", "590,777"),
+        _al("(연결)현금배당성향(%)", "-", "57.60", "50.50", "65.40"),
+        _al("주당 현금배당금(원)", "보통주", "6,000", "5,400", "5,200"),
+    ]
+    SFIRE = [
+        _al("주당액면가액(원)", "-", "500", "500", "500"),
+        _al("(연결)당기순이익(백만원)", "-",
+            "2,018,286", "2,073,572", "1,818,433"),
+        _al("현금배당금총액(백만원)", "-", "828,949", "807,694", "680,166"),
+        _al("(연결)현금배당성향(%)", "-", "41.10", "39.00", "37.40"),
+        # 우선주가 보통주보다 큰 값이라 잘못 고르면 앵커가 어긋난다.
+        _al("주당 현금배당금(원)", "우선주", "19,505", "19,005", "16,005"),
+        _al("주당 현금배당금(원)", "보통주", "19,500", "19,000", "16,000"),
+    ]
+    WOORI = [
+        _al("주당액면가액(원)", "-", "5,000", "5,000", "5,000"),
+        _al("(연결)당기순이익(백만원)", "-",
+            "3,124,346", "3,085,995", "2,506,296"),
+        _al("현금배당금총액(백만원)", "-", "998,468", "891,045", "747,302"),
+        _al("(연결)현금배당성향(%)", "-", "31.96", "28.87", "29.82"),
+        _al("주당 현금배당금(원)", "보통주", "1,360", "1,200", "1,000"),
+    ]
+    # 삼성전자 연결 현금흐름표 실측. 유출인데 부호가 양수인 것이 핵심이다.
+    SEC_CF = [
+        _cf("ifrs-full_CashFlowsFromUsedInOperatingActivities",
+            "영업활동현금흐름",
+            "85315148000000", "72982621000000", "44788749000000"),
+        _cf("ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassified"
+            "AsInvestingActivities", "유형자산의 취득",
+            "47522179000000", "51406355000000", "52963102000000"),
+        _cf("ifrs-full_PurchaseOfIntangibleAssetsClassified"
+            "AsInvestingActivities", "무형자산의 취득",
+            "4630970000000", "2335284000000", "2394284000000"),
+        # CF 가 아닌 행은 무시해야 한다.
+        {"sj_div": "BS", "account_id": "ifrs-full_Assets",
+         "account_nm": "자산총계", "thstrm_amount": "1", "frmtrm_amount": "1",
+         "bfefrmtrm_amount": "1"},
+        # 자기주식 취득도 유출인데 양수다. CAPEX 로 세면 안 된다.
+        _cf("dart_AcquisitionOfTreasuryShares", "자기주식의 취득",
+            "8189263000000", "1811775000000", "0"),
+    ]
+
+    ANCHOR_DPS = {"삼성전자": (SEC, 1668.0, 25.10),
+                  "POSCO홀딩스": (POSCO, 10000.0, 115.00),
+                  "KT&G": (KTNG, 6000.0, 57.60),
+                  "삼성화재": (SFIRE, 19500.0, 41.10),
+                  "우리금융지주": (WOORI, 1360.0, 31.96)}
+
+    def t_unit_scale():
+        assert _label_unit("현금배당금총액(백만원)") == ("현금배당금총액", 1e6)
+        assert _label_unit("주당 현금배당금(원)") == ("주당 현금배당금", 1.0)
+        # 앞의 괄호를 단위로 오인하면 안 된다.
+        head, sc = _label_unit("(연결)당기순이익(백만원)")
+        assert head == "(연결)당기순이익" and sc == 1e6, (head, sc)
+        head, sc = _label_unit("(연결)현금배당성향(%)")
+        assert head == "(연결)현금배당성향" and sc == 1.0, (head, sc)
+        # 단위가 아닌 괄호는 라벨을 건드리지 않는다.
+        assert _label_unit("어떤항목(주석)") == ("어떤항목(주석)", 1.0)
+
+    def t_year_mapping():
+        """응답 하나가 당기/전기/전전기 3개 연도를 준다."""
+        got = parse_alot_matter(SEC, 2025)
+        assert sorted(got) == [2023, 2024, 2025], sorted(got)
+        near(got[2025]["dps"], 1668.0, label="2025 DPS")
+        near(got[2024]["dps"], 1446.0, label="2024 DPS")
+        near(got[2023]["dps"], 1444.0, label="2023 DPS")
+        near(got[2023]["net_income"], 14_473_401e6, tol=1.0,
+             label="2023 순이익")
+        assert got[2025]["settle_dt"] == "2025-12-31", got[2025]["settle_dt"]
+
+    def t_dps_anchor_5():
+        """5종목 주당 현금배당금 = 공시 원문 (2025 사업연도)."""
+        for name, (rows, dps, _) in ANCHOR_DPS.items():
+            got = parse_alot_matter(rows, 2025)[2025]
+            near(got["dps"], dps, label=f"{name} DPS")
+
+    def t_payout_matches_disclosure():
+        """총액/순이익으로 계산한 성향이 공시 성향과 맞아야 한다.
+
+        DART 는 성향을 소수 둘째까지 반올림해 준다. 0.05%p 이내면 같은
+        값을 다르게 반올림한 것이다. 그보다 벌어지면 단위 환산이나
+        연결/별도 선택이 틀렸다는 뜻이다.
+        """
+        for name, (rows, _, disclosed) in ANCHOR_DPS.items():
+            rec = parse_alot_matter(rows, 2025)[2025]
+            calc = payout_ratio(rec["total_dividend"], rec["net_income"])
+            assert calc is not None, f"{name} 성향이 None"
+            assert abs(calc - disclosed) <= 0.05, \
+                f"{name} 성향 계산 {calc} vs 공시 {disclosed}"
+
+    def t_preferred_row_excluded():
+        """우선주 행을 고르면 안 된다 (삼성화재 19,505 / 삼성전자 1,669)."""
+        got = parse_alot_matter(SFIRE, 2025)
+        near(got[2025]["dps"], 19500.0, label="삼성화재 보통주")
+        got2 = parse_alot_matter(SEC, 2025)
+        near(got2[2025]["dps"], 1668.0, label="삼성전자 보통주")
+
+    def t_none_vs_missing():
+        """무배당(0)과 누락(no_report)을 섞지 않는다."""
+        nodiv = [
+            _al("주당액면가액(원)", "-", "500", "500", "-"),
+            _al("(연결)당기순이익(백만원)", "-", "1,000", "900", "-"),
+            _al("현금배당금총액(백만원)", "-", "-", "-", "-"),
+            _al("주당 현금배당금(원)", "보통주", "-", "-", "-"),
+        ]
+        got = parse_alot_matter(nodiv, 2025)
+        # 그 연도를 보고했고 배당금이 '-' -> 무배당 확정
+        assert got[2025]["dps"] == 0.0, got[2025]["dps"]
+        assert resolve_status(got[2025]) == "none", got[2025]
+        assert resolve_status(got[2024]) == "none", got[2024]
+        # 칸이 전부 비어 있는 연도는 무배당이 아니라 '없음'이다
+        assert resolve_status(got[2023]) == "no_report", got[2023]
+        # 응답 자체가 빈 경우
+        empty = parse_alot_matter([], 2025)
+        assert resolve_status(empty[2025]) == "no_report", empty[2025]
+        assert empty[2025]["dps"] is None, "빈 응답을 0 으로 채웠다"
+
+    def t_payout_negative_guard():
+        """적자 연도 성향은 None 이다. 음수로 내면 해석이 뒤집힌다."""
+        assert payout_ratio(100.0, -50.0) is None
+        assert payout_ratio(100.0, 0.0) is None
+        assert payout_ratio(None, 100.0) is None
+        assert payout_ratio(100.0, None) is None
+        near(payout_ratio(25.0, 100.0), 25.0, label="성향")
+
+    def t_cashflow_accounts():
+        """account_id 로 영업현금흐름·CAPEX 를 집는다."""
+        got = parse_cashflow(SEC_CF, 2025)
+        assert sorted(got) == [2023, 2024, 2025], sorted(got)
+        near(got[2025]["ocf"], 85_315_148e6, tol=1.0, label="2025 OCF")
+        near(got[2024]["ocf"], 72_982_621e6, tol=1.0, label="2024 OCF")
+
+    def t_capex_sign_ignored():
+        """유출인데 부호가 양수로 오는 필러가 있다 (실측). 절대값 합이다.
+
+        자기주식 취득은 CAPEX 가 아니므로 섞이면 안 된다.
+        """
+        got = parse_cashflow(SEC_CF, 2025)
+        near(got[2025]["capex"], (47_522_179 + 4_630_970) * 1e6, tol=1.0,
+             label="2025 CAPEX")
+        # 음수로 보고하는 필러도 같은 값이 나와야 한다
+        neg = [dict(r) for r in SEC_CF]
+        for r in neg:
+            if r["account_nm"] in ("유형자산의 취득", "무형자산의 취득"):
+                r["thstrm_amount"] = "-" + r["thstrm_amount"]
+        near(parse_cashflow(neg, 2025)[2025]["capex"],
+             got[2025]["capex"], tol=1.0, label="부호 반대 CAPEX")
+
+    def t_fcf_anchor():
+        """FCF = OCF - CAPEX (삼성전자 2025 = 33,161,999백만원)."""
+        got = parse_cashflow(SEC_CF, 2025)
+        near(got[2025]["fcf"], 33_161_999e6, tol=1.0, label="2025 FCF")
+        near(got[2024]["fcf"], 19_240_982e6, tol=1.0, label="2024 FCF")
+
+    def t_fcf_none_without_capex():
+        """CAPEX 가 없으면 FCF 는 None 이다. 0 으로 두면 커버가 무조건 통과."""
+        assert free_cash_flow(100.0, None) is None
+        assert free_cash_flow(None, 10.0) is None
+        only_ocf = [SEC_CF[0]]
+        got = parse_cashflow(only_ocf, 2025)
+        assert got[2025]["ocf"] is not None
+        assert got[2025]["capex"] is None and got[2025]["fcf"] is None, got[2025]
+
+    def t_latest_fiscal_year():
+        """사업보고서 제출 기한(3월 말) 경계."""
+        assert latest_fiscal_year(datetime(2026, 4, 1)) == 2025
+        assert latest_fiscal_year(datetime(2026, 3, 31)) == 2024
+        assert latest_fiscal_year(datetime(2026, 9, 1)) == 2025
+        assert latest_fiscal_year(datetime(2026, 1, 15)) == 2024
+
+    def t_year_batches():
+        """응답이 3년을 주므로 5년은 2회다."""
+        assert year_batches(2025, 5) == [2025, 2022], year_batches(2025, 5)
+        assert year_batches(2025, 3) == [2025]
+        assert year_batches(2025, 1) == [2025]
+        assert year_batches(2025, 7) == [2025, 2022, 2019]
+        assert year_batches(2025, 0) == []
+
+    def t_store_roundtrip():
+        s = Store(tmp / "div.db")
+        rows = build_rows("005930", parse_alot_matter(SEC, 2025),
+                          parse_cashflow(SEC_CF, 2025),
+                          years=3, base_year=2025)
+        assert len(rows) == 3, rows
+        assert s.upsert_dividends(rows) == 3
+        # 멱등: 다시 넣어도 행이 늘지 않는다
+        s.upsert_dividends(rows)
+        df = s.dividends_of("005930")
+        assert len(df) == 3, len(df)
+        r25 = df[df["fiscal_year"] == 2025].iloc[0]
+        near(r25["dps"], 1668.0, label="저장된 DPS")
+        near(r25["payout_ratio"], 25.10, tol=0.05, label="저장된 성향")
+        near(r25["fcf"], 33_161_999e6, tol=1.0, label="저장된 FCF")
+        assert r25["status"] == "paid", r25["status"]
+        assert r25["settle_dt"] == "2025-12-31", r25["settle_dt"]
+        # 정정공시는 새 값이 이겨야 한다 (COALESCE 로 묶지 않았는지)
+        fixed = [dict(r) for r in rows if r["fiscal_year"] == 2025]
+        assert len(fixed) == 1, fixed
+        fixed[0]["dps"] = 1700.0
+        s.upsert_dividends(fixed)
+        again = s.dividends_of("005930")
+        near(again[again["fiscal_year"] == 2025].iloc[0]["dps"], 1700.0,
+             label="정정 반영")
+        cov = s.dividend_coverage(2025)
+        assert cov["collected"] == 1 and cov["paid"] == 1, cov
+        assert s.has_dividends("005930", 2025)
+        assert not s.has_dividends("000660", 2025)
+        assert set(s.dividend_asof(2025)) == {"005930"}
+
+    def _fake_get(book: dict, calls: list):
+        def get(path, params):
+            calls.append((path, params.get("bsns_year"), params.get("fs_div")))
+            key = (params.get("corp_code"), path)
+            if key in book:
+                return book[key]
+            if path == "alotMatter.json":
+                return {"status": "013", "list": []}
+            return {"status": "013", "list": []}
+        return get
+
+    def _limiter():
+        return RateLimiter(999, 999, 9999, clock=lambda: 0.0)
+
+    def t_no_cashflow_for_nonpayers():
+        """무배당 회사는 현금흐름을 조회하지 않는다. 호출 낭비다."""
+        nodiv = [
+            _al("주당액면가액(원)", "-", "500", "500", "500"),
+            _al("(연결)당기순이익(백만원)", "-", "1,000", "900", "800"),
+            _al("주당 현금배당금(원)", "보통주", "-", "-", "-"),
+        ]
+        calls: list = []
+        book = {("CORP1", "alotMatter.json"): {"status": "000", "list": nodiv}}
+        got = fetch_one("CORP1", years=3, base_year=2025,
+                        get=_fake_get(book, calls), limiter=_limiter(),
+                        sleep=lambda s: None)
+        assert got["error"] is None, got
+        assert all(p != "fnlttSinglAcntAll.json" for p, _, _ in calls), calls
+        # 배당하는 회사는 조회한다
+        calls2: list = []
+        book2 = {("CORP2", "alotMatter.json"): {"status": "000", "list": SEC},
+                 ("CORP2", "fnlttSinglAcntAll.json"): {"status": "000",
+                                                       "list": SEC_CF}}
+        got2 = fetch_one("CORP2", years=3, base_year=2025,
+                         get=_fake_get(book2, calls2), limiter=_limiter(),
+                         sleep=lambda s: None)
+        assert any(p == "fnlttSinglAcntAll.json" for p, _, _ in calls2), calls2
+        near(got2["cash"][2025]["fcf"], 33_161_999e6, tol=1.0, label="FCF")
+
+    def t_collect_isolates_failure():
+        """한 종목이 실패해도 나머지는 적재된다."""
+        s = Store(tmp / "divcol.db")
+        book = {("C1", "alotMatter.json"): {"status": "000", "list": SEC},
+                ("C1", "fnlttSinglAcntAll.json"): {"status": "000",
+                                                   "list": SEC_CF}}
+
+        def get(path, params):
+            if params.get("corp_code") == "C2":
+                return None                 # DART 장애 / 한도 초과
+            return book.get((params.get("corp_code"), path),
+                            {"status": "013", "list": []})
+
+        res = collect_dividends(
+            s, years=3, base_year=2025, ttl_days=0,
+            tickers={"005930": "삼성전자", "000660": "SK하이닉스"},
+            corp_codes={"005930": "C1", "000660": "C2"},
+            get=get, limiter=_limiter(), sleep=lambda s_: None)
+        assert res["targets"] == 2, res
+        assert res["stored"] == 1, res
+        assert res["failed"] == 1, res
+        assert res["failures"][0]["code"] == "000660", res["failures"]
+        assert res["by_status"].get("paid") == 3, res["by_status"]
+        assert len(s.dividends_of("005930")) == 3
+        assert len(s.dividends_of("000660")) == 0, "실패를 0 으로 적었다"
+
+    def t_collect_ttl_skip():
+        """월 1회 갱신. TTL 안이면 건너뛰고, --force 면 다시 받는다."""
+        s = Store(tmp / "divttl.db")
+        book = {("C1", "alotMatter.json"): {"status": "000", "list": SEC},
+                ("C1", "fnlttSinglAcntAll.json"): {"status": "000",
+                                                   "list": SEC_CF}}
+        args = dict(years=3, base_year=2025,
+                    tickers={"005930": "삼성전자"},
+                    corp_codes={"005930": "C1"},
+                    get=lambda p, q: book.get((q.get("corp_code"), p),
+                                              {"status": "013", "list": []}),
+                    limiter=_limiter(), sleep=lambda s_: None)
+        first = collect_dividends(s, ttl_days=30, **args)
+        assert first["stored"] == 1, first
+        second = collect_dividends(s, ttl_days=30, **args)
+        assert second["targets"] == 0 and second["skipped_ttl"] == 1, second
+        assert second["calls"] == 0, "TTL 스킵인데 DART 를 불렀다"
+        forced = collect_dividends(s, ttl_days=30, force=True, **args)
+        assert forced["targets"] == 1 and forced["stored"] == 1, forced
+
+    def t_preferred_ticker_excluded():
+        """우선주 종목코드는 수집 대상이 아니다 (보통주 행에 함께 실린다)."""
+        s = Store(tmp / "divpref.db")
+        res = collect_dividends(
+            s, years=3, base_year=2025, ttl_days=0,
+            tickers={"005935": "삼성전자우"},
+            corp_codes={"005935": "C1"},
+            get=lambda p, q: {"status": "013", "list": []},
+            limiter=_limiter(), sleep=lambda s_: None)
+        assert res["targets"] == 0, res
+
+    def t_record_only_boundary():
+        """수집 모듈이 채점·알림 경로를 참조하지 않아야 한다.
+
+        1단계는 데이터 기반만이다. 필터 엔진이 붙기 전에 점수 쪽으로
+        선이 넘어가면 '기록 전용'이 문서에만 남는다.
+        """
+        src = (Path(__file__).parent / "stocknews" / "dividend_data.py"
+               ).read_text(encoding="utf-8")
+        for bad in ("from .screener", "from .liquidation", "from .exits",
+                    "from .renderer", "from .notify", "from .weekly",
+                    "from .daily"):
+            assert bad not in src, f"dividend_data 가 {bad} 를 참조한다"
+
+    check("dividend", "단위 환산 (백만원 -> 원)", t_unit_scale)
+    check("dividend", "사업연도 매핑 (당기/전기/전전기)", t_year_mapping)
+    check("dividend", "DPS 앵커 5종목 (공시 실측)", t_dps_anchor_5)
+    check("dividend", "성향 = 총액/순이익 (공시 대조)",
+          t_payout_matches_disclosure)
+    check("dividend", "우선주 행 배제", t_preferred_row_excluded)
+    check("dividend", "무배당(0) != 누락(no_report)", t_none_vs_missing)
+    check("dividend", "적자 연도 성향 None", t_payout_negative_guard)
+    check("dividend", "현금흐름 계정 식별 (account_id)", t_cashflow_accounts)
+    check("dividend", "CAPEX 부호 무시 + 자사주 제외", t_capex_sign_ignored)
+    check("dividend", "FCF 앵커 (삼성전자 2025)", t_fcf_anchor)
+    check("dividend", "CAPEX 없으면 FCF None", t_fcf_none_without_capex)
+    check("dividend", "최신 사업연도 경계 (3월/4월)", t_latest_fiscal_year)
+    check("dividend", "5년 = 호출 2회", t_year_batches)
+    check("dividend", "저장/조회/정정 덮어쓰기", t_store_roundtrip)
+    check("dividend", "무배당은 현금흐름 미조회", t_no_cashflow_for_nonpayers)
+    check("dividend", "수집 실패 격리", t_collect_isolates_failure)
+    check("dividend", "TTL 스킵 + --force", t_collect_ttl_skip)
+    check("dividend", "우선주 종목 제외", t_preferred_ticker_excluded)
+    check("dividend", "채점 경로 미참조", t_record_only_boundary)
+
+
 def test_docs():
     """라이선스와 면책 조항이 있어야 한다. 금융 코드의 필수 요건이다."""
     root = Path(__file__).parent
@@ -3389,6 +3783,7 @@ def test_agent_contract(tmp: Path):
             ["--mode", "backfill"],          # exit 4 경로도 JSON 이어야 한다
             ["--mode", "pos-close"],         # exit 64 경로도 마찬가지
             ["--mode", "credit-kiwoom"],     # 자격증명 없음 -> exit 4
+            ["--mode", "collect-dividends"],  # 키 없음/마스터 없음 -> exit 4
             ["--mode", "runs"],              # exit 2 경로 (스케줄 공백)
         ]
         for argv in cases:
@@ -4841,6 +5236,26 @@ def test_daily_weekly(st, tmp: Path):
     check("news-freq", "기록 전용 증명 (참조 부재)", t_nf_record_only)
     check("news-freq", "테마 축 != KRX 업종 축", t_nf_axis_differs_from_sector)
 
+    def t_earnings_source_is_none():
+        """실적 추정치 소스는 미구현. None 이 조사 결론이다.
+
+        누군가 프록시(과거 성장률 등)를 넣으려 하면 여기서 걸린다.
+        추정치를 만들어 쓰는 것은 없는 데이터를 만들어내는 것이다.
+        """
+        import inspect
+        from stocknews import config as C
+        assert hasattr(C, "EARNINGS_SOURCE"), "EARNINGS_SOURCE 자리가 없다"
+        assert C.EARNINGS_SOURCE is None, \
+            f"소스가 채워졌다: {C.EARNINGS_SOURCE!r} — 실제 소스인지 확인 필요"
+        # 추정치를 만들어내는 코드가 붙지 않았는지
+        for mod_name in ("screener", "daily", "sector_metrics", "weekly"):
+            mod = __import__(f"stocknews.{mod_name}", fromlist=["x"])
+            src = inspect.getsource(mod)
+            for tk in ("EARNINGS_SOURCE", "consensus", "eps_estimate"):
+                assert tk not in src, f"{mod_name} 가 {tk} 를 참조한다"
+
+    check("news-freq", "실적 추정치 자리만 (None)", t_earnings_source_is_none)
+
     # ───────── 재진입 금지 쿨다운 + 월간 회고 ─────────
     from stocknews.config import COOLDOWN_DAYS
     from stocknews.contracts import COOLDOWN_REASON, MANUAL_REASON
@@ -5289,6 +5704,7 @@ def main() -> int:
         test_market_source(tmp)
         test_kiwoom(tmp)
         test_kiwoom_rest(tmp)
+        test_dividends(tmp)
         test_docs()
         test_env(tmp)
         test_joblock(tmp)

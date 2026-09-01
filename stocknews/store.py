@@ -335,6 +335,39 @@ CREATE TABLE IF NOT EXISTS market_context (
   kosdaq_ret_5d     REAL,
   created_at        TEXT
 );
+
+-- 배당 실적. DART 사업보고서 '배당에 관한 사항' + 현금흐름표 실측이다.
+--
+-- 축이 **사업연도(fiscal_year)** 다. 다른 테이블은 전부 거래일이나
+-- 달력일이라 scan_date 로 조인할 수 없다. 결산일은 `settle_dt` 가 준다 —
+-- 12월 결산이 아닌 회사가 있어서 사업연도만으로 날짜를 유추하면 틀린다.
+--
+-- `status` 가 무배당과 누락을 구분한다. 이 구분이 없으면 조회 실패한
+-- 종목이 '배당 0원'으로 채점된다.
+--     paid       주당 현금배당금 > 0
+--     none       그 연도를 보고했고 배당금이 '-' — 무배당 확정
+--     no_report  그 연도 칸이 비어 있다 (상장 전 · 공시 없음)
+-- 조회가 실패한 종목은 행 자체를 쓰지 않는다.
+--
+-- 금액 단위는 전부 **원**이다. DART 는 백만원으로 주므로 적재 전에
+-- 환산한다. ocf/capex 가 NULL 이면 미조회이고, fcf 는 둘 중 하나라도
+-- 없으면 NULL 이다 (CAPEX 를 0 으로 가정하면 커버 판정이 무조건 통과한다).
+CREATE TABLE IF NOT EXISTS dividends (
+  code           TEXT NOT NULL,
+  fiscal_year    INTEGER NOT NULL,
+  dps            REAL,      -- 주당 현금배당금(원). 보통주.
+  total_dividend REAL,      -- 현금배당금총액(원)
+  net_income     REAL,      -- 당기순이익(원). 연결 우선, 없으면 별도.
+  payout_ratio   REAL,      -- 배당성향(%) = 총액/순이익 x 100
+  ocf            REAL,      -- 영업활동현금흐름(원)
+  capex          REAL,      -- 유형+무형자산 취득(원). 절대값 합.
+  fcf            REAL,      -- ocf - capex
+  status         TEXT,      -- paid / none / no_report
+  settle_dt      TEXT,      -- 결산일 YYYY-MM-DD
+  collected_at   TEXT,
+  PRIMARY KEY (code, fiscal_year)
+);
+CREATE INDEX IF NOT EXISTS ix_div_year ON dividends(fiscal_year);
 """
 
 _COLS = {"o": "시가", "h": "고가", "l": "저가", "c": "종가",
@@ -1226,6 +1259,85 @@ class Store:
             return pd.read_sql_query(
                 "SELECT * FROM news_freq WHERE scan_date=? "
                 "ORDER BY mention_cnt DESC", con, params=(_d(d),))
+
+    # ────────────────────────── 배당 ──────────────────────────
+    _DIV_COLS = ("code", "fiscal_year", "dps", "total_dividend", "net_income",
+                 "payout_ratio", "ocf", "capex", "fcf", "status", "settle_dt")
+
+    def has_dividends(self, code: str, fiscal_year: int) -> bool:
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM dividends WHERE code=? AND fiscal_year=? "
+                "LIMIT 1", (code, int(fiscal_year))).fetchone()
+        return row is not None
+
+    def dividend_asof(self, fiscal_year: int) -> dict:
+        """`{종목코드: collected_at}` — 월 1회 갱신에서 TTL 스킵 판정용."""
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT code,collected_at FROM dividends WHERE fiscal_year=?",
+                (int(fiscal_year),)).fetchall()
+        return {c: at for c, at in rows}
+
+    def upsert_dividends(self, rows: list[dict]) -> int:
+        """배당 실적 다건. 같은 (종목, 사업연도) 는 덮어쓴다.
+
+        COALESCE 를 쓰지 않는다. 재수집은 '같은 공시를 다시 읽은 것'이고,
+        정정공시가 나오면 새 값이 이겨야 한다. 값을 못 읽었으면 애초에
+        행을 만들지 않는다(`status` 로 구분).
+        """
+        if not rows:
+            return 0
+        now = _now_str()
+        payload = []
+        for r in rows:
+            vals = [r.get(c) for c in self._DIV_COLS]
+            vals[1] = int(vals[1])
+            payload.append((*vals, now))
+        marks = ",".join("?" * (len(self._DIV_COLS) + 1))
+        sets = ",".join(f"{c}=excluded.{c}" for c in self._DIV_COLS[2:])
+        with closing(self._conn()) as con:
+            con.executemany(
+                f"INSERT INTO dividends({','.join(self._DIV_COLS)},"
+                f"collected_at) VALUES({marks}) "
+                f"ON CONFLICT(code,fiscal_year) DO UPDATE SET {sets},"
+                f"collected_at=excluded.collected_at", payload)
+            con.commit()
+        return len(payload)
+
+    def dividends_of(self, code: str) -> pd.DataFrame:
+        """한 종목의 사업연도별 배당 실적 (오래된 연도부터)."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM dividends WHERE code=? ORDER BY fiscal_year",
+                con, params=(code,))
+
+    def dividends_on(self, fiscal_year: int) -> pd.DataFrame:
+        """그 사업연도 전종목 배당 실적."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM dividends WHERE fiscal_year=? ORDER BY code",
+                con, params=(int(fiscal_year),))
+
+    def dividend_coverage(self, fiscal_year: int) -> dict:
+        """수집 현황. 몇 종목이 실측으로 채점 가능한지 확인용."""
+        with closing(self._conn()) as con:
+            active = con.execute(
+                "SELECT COUNT(*) FROM tickers WHERE active=1").fetchone()[0]
+            got = con.execute(
+                "SELECT COUNT(*) FROM dividends WHERE fiscal_year=?",
+                (int(fiscal_year),)).fetchone()[0]
+            paid = con.execute(
+                "SELECT COUNT(*) FROM dividends WHERE fiscal_year=? "
+                "AND status='paid'", (int(fiscal_year),)).fetchone()[0]
+            none_n = con.execute(
+                "SELECT COUNT(*) FROM dividends WHERE fiscal_year=? "
+                "AND status='none'", (int(fiscal_year),)).fetchone()[0]
+            newest = con.execute(
+                "SELECT MAX(collected_at) FROM dividends").fetchone()[0]
+        return {"active": int(active), "fiscal_year": int(fiscal_year),
+                "collected": int(got), "paid": int(paid),
+                "no_dividend": int(none_n), "asof": newest}
 
     def news_theme_counts(self, days: int = 14) -> pd.DataFrame:
         """일자 x 카테고리 건수. 주간 테마 부침 분석용."""

@@ -19,6 +19,8 @@ from .contracts import (DONE_TAKE1, DONE_TAKE2, CrossEvent, ExitDecision,
                         FibSignal, LiquidationSignal, Position, ScreenResult,
                         TrendSignal)
 from .daily import run_daily, scan_all, select_recommendations
+from .dividend_data import (collect_dividends, latest_fiscal_year,
+                            parse_alot_matter, parse_cashflow, payout_ratio)
 from .env import load_env
 from .exits import evaluate_position, evaluate_rotation, run_exits
 from .fibonacci import evaluate_fib, fib_levels, is_below_level
@@ -54,6 +56,9 @@ __all__ = [
     # 섹터·뉴스 지표 — 기록 전용. 점수·추천·알림에 쓰지 않는다.
     "SectorConfig", "compute_sector_metrics", "collect_sector_metrics",
     "NewsFreqConfig", "compute_news_freq", "collect_news_freq",
+    # 배당 — 수집·저장만. 점수·추천·알림에 넣지 않는다.
+    "collect_dividends", "latest_fiscal_year", "parse_alot_matter",
+    "parse_cashflow", "payout_ratio",
     "load_env",
 ]
 

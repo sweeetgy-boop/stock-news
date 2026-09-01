@@ -55,6 +55,8 @@ import pandas as pd
 
 from stocknews.config import DEFAULT
 from stocknews.daily import run_daily, scan_all, select_recommendations
+from stocknews.dividend_data import (collect_dividends, dart_key_present,
+                                     latest_fiscal_year)
 from stocknews.env import load_env
 from stocknews.exits import run_exits, stop_price_for
 from stocknews.backtest import (BacktestConfig, control_random, control_rsi,
@@ -125,8 +127,9 @@ PARTIAL_FAIL_RATIO = 0.10
 
 # DB 를 쓰는 모드. 락으로 직렬화한다. 읽기 전용 조회는 제외.
 _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
-                "credit-kiwoom", "daily", "exits", "news", "brief-morning",
-                "brief-evening", "flash", "pos-open", "fill", "pos-close"}
+                "credit-kiwoom", "collect-dividends", "daily", "exits",
+                "news", "brief-morning", "brief-evening", "flash",
+                "pos-open", "fill", "pos-close"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -907,6 +910,80 @@ def mode_credit_kiwoom(store: Store, args) -> int:
     return EXIT_PARTIAL if _partial(written, stats["failed"]) else EXIT_OK
 
 
+def mode_collect_dividends(store: Store, args) -> int:
+    """배당 실적 수집 (OpenDART). **월 1회 갱신용이다.**
+
+    nightly 에 넣지 않는다. 배당은 사업보고서 시즌(3월)에만 바뀌므로
+    매일 도는 것은 DART 호출을 태우는 짓이다. 스케줄은 월 1회로 잡고,
+    중간에 끊기면 같은 명령을 다시 부르면 된다 — `--div-ttl` 일 안에
+    이미 받은 종목은 건너뛴다.
+
+    호출 수를 줄인 근거는 `dividend_data` 모듈 독스트링에 있다. 응답
+    하나가 3개 사업연도를 주므로 5년치가 종목당 2회다.
+    """
+    if not dart_key_present():
+        log.error("DART_API_KEY 가 없습니다. .env 에 넣으십시오 "
+                  "(발급: https://opendart.fss.or.kr).")
+        SUMMARY.update({"skipped": True, "reason": "no_dart_key"})
+        return EXIT_PRECOND
+
+    if not store.active_tickers():
+        log.error("종목 마스터가 비어 있습니다. --mode master 를 먼저 "
+                  "실행하십시오.")
+        SUMMARY.update({"skipped": True, "reason": "no_master"})
+        return EXIT_PRECOND
+
+    base = args.div_year or latest_fiscal_year()
+    t0 = time.time()
+
+    def _progress(i: int, total: int, code: str) -> None:
+        if i == 1 or i % 100 == 0 or i == total:
+            log.info("  %d/%d  %s", i, total, code)
+
+    res = collect_dividends(
+        store, years=args.div_years, base_year=base, limit=args.limit,
+        ttl_days=args.div_ttl, force=args.force,
+        with_cashflow=not args.div_no_cashflow, progress=_progress)
+
+    if res.get("error"):
+        log.error("배당 수집 전제조건 미충족: %s", res["error"])
+        SUMMARY.update({k: v for k, v in res.items() if k != "failures"})
+        return EXIT_PRECOND
+
+    took = time.time() - t0
+    done = res["stored"] + res["failed"]
+    per = (took / done) if done else 0.0
+    cov = res.get("coverage") or {}
+    # 전종목 1회 소요를 실측값으로 환산해 남긴다. 추정이 아니라 이번
+    # 실행의 종목당 실측 시간을 쓴다.
+    full = cov.get("active", 0) * per
+
+    SUMMARY.update({k: v for k, v in res.items() if k != "failures"})
+    SUMMARY.update({"sec_per_ticker": round(per, 3),
+                    "full_scan_min": round(full / 60.0, 1)})
+    SUMMARY["failures"] = res.get("failures")
+
+    _say(f"\n배당 실적 수집  기준 사업연도 {base} · 최근 {args.div_years}년")
+    _say(f"  대상 {res['targets']}종목 · 적재 {res['stored']} · "
+         f"실패 {res['failed']} · TTL 스킵 {res['skipped_ttl']}")
+    _say(f"  DART 호출 {res['calls']}회 · 종목당 {per:.2f}초")
+    _say(f"  전종목 1회 환산 {full / 60.0:.1f}분 "
+         f"({cov.get('active', 0)}종목 기준)")
+    for st, n in sorted(res.get("by_status", {}).items()):
+        _say(f"    {st:<10} {n:6d}행")
+    _say(f"  커버리지     {cov.get('collected', 0)}/{cov.get('active', 0)}종목"
+         f" · 배당 {cov.get('paid', 0)} · 무배당 {cov.get('no_dividend', 0)}")
+    if res.get("no_corp_code"):
+        _say(f"  corp_code 없음 {res['no_corp_code']}종목 (비상장 매핑 누락)")
+    _say()
+
+    if not res["stored"] and res["targets"]:
+        log.warning("적재 0종목 — 실패 사유를 확인하십시오: %s",
+                    res.get("failures")[:3])
+        return EXIT_PRECOND
+    return EXIT_PARTIAL if _partial(res["stored"], res["failed"]) else EXIT_OK
+
+
 def mode_credit(store: Store, args) -> int:
     """신용잔고 주입. 이 시스템 핵심 가설의 데이터 구멍을 메운다.
 
@@ -1436,6 +1513,7 @@ MODES = {
     "flags": mode_flags,
     "credit": mode_credit,
     "credit-kiwoom": mode_credit_kiwoom,
+    "collect-dividends": mode_collect_dividends,
     "credit-probe": mode_credit_probe,
     "kiwoom-plan": mode_kiwoom_plan,
     "backtest": mode_backtest,
@@ -1519,6 +1597,15 @@ def main(argv=None) -> int:
     ap.add_argument("--offering-days", type=int, default=60,
                     help="flags: 증자/감사의견 공시 소급 일수")
     # ── 신용잔고 / 내보내기 ──
+    # ── 배당 (collect-dividends) ──
+    ap.add_argument("--div-years", type=int, default=5,
+                    help="수집할 최근 사업연도 수")
+    ap.add_argument("--div-year", type=int, default=0,
+                    help="기준 사업연도 (기본: 사업보고서가 나온 최신 연도)")
+    ap.add_argument("--div-ttl", type=int, default=30,
+                    help="이 일수 안에 받은 종목은 건너뛴다 (월 1회 갱신)")
+    ap.add_argument("--div-no-cashflow", action="store_true",
+                    help="현금흐름표 조회 생략 (FCF 없이 배당만)")
     ap.add_argument("--credit-file", default="data/credit_manual.csv",
                     help="credit: 수동 신용잔고 CSV 경로")
     ap.add_argument("--export-dir", default="data/export",

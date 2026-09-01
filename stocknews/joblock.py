@@ -46,6 +46,8 @@ __all__ = ["JobLock", "LockBusy", "MODE_TIMEOUTS", "clear_locks"]
 MODE_TIMEOUTS: dict[str, int] = {
     "backfill": 7200,     # 2시간 (2,800종목 x 0.35초 + 재시도)
     "credit-kiwoom": 5400,   # 90분 (유량 제한이 걸리면 스스로 느려진다)
+    # 전종목 배당 수집. 종목당 DART 2~3회 x 2,500종목.
+    "collect-dividends": 7200,
     "flags": 3600,        # DART 조회가 종목당 0.25초
     "daily": 1800,        # 30분
     "flash": 1200,
