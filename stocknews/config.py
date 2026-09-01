@@ -223,6 +223,62 @@ class ExitConfig:
     min_lot: int = 1                   # 최소 주문 단위
 
 
+# 뉴스 테마 키워드 사전. **기록 전용 지표(news_freq)에만 쓴다.**
+#
+# 키(테마명)는 `news.CATEGORY_RULES` 의 카테고리명과 **같은 어휘**를 쓴다.
+# 어휘가 갈라지면 news.category 와 news_freq.sector 를 조인할 수 없고,
+# 어느 쪽이 정본인지도 알 수 없게 된다. 값(키워드)도 CATEGORY_RULES 의
+# 같은 카테고리와 일치시켰고, 스모크 테스트가 그 일치를 강제한다.
+#
+# 분류(classify)와 이 집계는 세는 방식이 다르다.
+#   classify        첫 매치 하나만 남긴다(단일 라벨). 순서가 우선순위다.
+#   news_freq       걸리는 테마마다 센다(다중 라벨). "반도체 실적" 기사는
+#                   반도체와 실적 양쪽에 1건씩 잡힌다.
+# 충돌이 아니라 의도된 차이다. 빈도는 관심도를 보려는 것이므로 한 기사가
+# 두 테마를 건드리면 둘 다 세는 게 맞다.
+#
+# **주의: 여기서 말하는 '섹터'는 KRX 업종이 아니다.** `sector_metrics` 의
+# sector 는 업종명 158종(tickers.sector)이고, 이쪽은 뉴스 테마 10종이다.
+# 두 테이블을 scan_date 로 조인해도 sector 는 한 행도 맞지 않는다.
+NEWS_THEME_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "반도체": ("반도체", "hbm", "d램", "디램", "낸드", "파운드리", "웨이퍼",
+               "asml", "tsmc", "nvidia", "엔비디아", "gpu", "chip"),
+    "2차전지": ("2차전지", "이차전지", "배터리", "양극재", "음극재", "전해질",
+                "리튬", "니켈", "캐즘", "전기차", "ess", "battery"),
+    "방산조선": ("방산", "무기", "미사일", "전차", "잠수함", "조선", "수주",
+                 "lng운반선", "컨테이너선", "mro", "defense", "shipbuild"),
+    "바이오": ("바이오", "임상", "신약", "기술수출", "라이선스", "fda",
+               "adc", "cdmo", "제약", "biotech", "clinical"),
+    "전력AI": ("전력", "변압기", "송전", "배전", "데이터센터", "원전",
+               "smr", "ai인프라", "전선", "grid", "transformer"),
+    "수급": ("공매도", "대차", "신용융자", "반대매매", "순매수", "순매도",
+             "외국인", "기관", "프로그램매매", "블록딜", "지분"),
+    "실적": ("실적", "어닝", "영업이익", "매출", "적자", "흑자", "턴어라운드",
+             "컨센서스", "가이던스", "earnings", "guidance", "revenue"),
+    "매크로": ("금리", "환율", "원달러", "국고채", "연준", "fomc", "cpi",
+               "물가", "유가", "원자재", "구리", "달러", "인플레이션",
+               "fed", "rate", "inflation", "yield"),
+    "정책": ("관세", "수출규제", "제재", "보조금", "규제", "법안", "정부",
+             "국회", "세제", "tariff", "sanction", "subsidy"),
+    "공시": ("유상증자", "무상증자", "전환사채", "신주인수권", "교환사채",
+             "자기주식", "자사주", "감사의견", "감사보고서", "관리종목",
+             "상장폐지", "합병", "분할", "감자", "공급계약", "단일판매",
+             "주요사항보고", "공시"),
+}
+
+
+@dataclass(frozen=True)
+class NewsFreqConfig:
+    """뉴스 빈도 지표 파라미터. **기록 전용이다.**
+
+    사전은 `NEWS_THEME_KEYWORDS` 모듈 상수에 있다. frozen 데이터클래스에
+    가변 dict 를 기본값으로 넣을 수 없어서 분리했다.
+    """
+
+    ma_days: int = 7      # 이동평균 구간. **달력일이다** (뉴스는 휴장일에도 난다)
+    lookback_days: int = 30   # 집계 시 읽어올 뉴스 일자 수
+
+
 @dataclass(frozen=True)
 class SectorConfig:
     """섹터 지표 파라미터. **기록 전용 지표다.**
@@ -252,6 +308,7 @@ class Config:
     exit: ExitConfig = ExitConfig()
     audit: AuditConfig = AuditConfig()
     sector: SectorConfig = SectorConfig()
+    news_freq: NewsFreqConfig = NewsFreqConfig()
 
 
 DEFAULT = Config()

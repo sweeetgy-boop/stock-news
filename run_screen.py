@@ -75,6 +75,7 @@ from stocknews.notify import TelegramNotConfigured, now_kst
 from stocknews.trading_day import (is_definitely_closed, market_status,
                                    news_window_hours, should_scan_intraday)
 from stocknews.news import process_and_store, theme_shift
+from stocknews.news_freq import collect_news_freq
 from stocknews.news_sources import collect_all
 from stocknews.notify import (AlertGate, reco_send_allowed,  # noqa: F401
                              reco_send_dow_label, send_telegram)
@@ -552,6 +553,10 @@ def mode_news(store: Store, args) -> int:
              res["collected"], res["stored"], res["links"])
     SUMMARY.update({"collected": res["collected"], "stored": res["stored"],
                     "links": res["links"]})
+    # 테마 언급 빈도 기록. 수집 직후라야 그날 최신 건수가 잡힌다.
+    # 기록 전용이고 실패를 삼키므로 이 모드의 종료 코드에 영향이 없다.
+    freq = collect_news_freq(store, cfg=DEFAULT)
+    SUMMARY["news_freq"] = {k: v for k, v in freq.items() if k != "top"}
     return EXIT_OK
 
 

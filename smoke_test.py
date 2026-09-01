@@ -4649,6 +4649,198 @@ def test_daily_weekly(st, tmp: Path):
     check("sector", "기록 전용 증명 (참조 부재)", t_sector_record_only)
     check("sector", "recos 스키마 불변", t_sector_recos_schema_unchanged)
 
+    # ───────── 뉴스 테마 빈도 (기록 전용) ─────────
+    def t_nf_dict_matches_classify():
+        """사전이 두 벌로 갈라지지 않아야 한다.
+
+        config.NEWS_THEME_KEYWORDS 와 news.CATEGORY_RULES 는 같은 어휘를
+        써야 한다. 한쪽만 고치면 여기서 깨진다.
+        """
+        from stocknews.config import NEWS_THEME_KEYWORDS
+        from stocknews.news import CATEGORY_RULES
+        rules = dict(CATEGORY_RULES)
+        assert len(NEWS_THEME_KEYWORDS) == 10, len(NEWS_THEME_KEYWORDS)
+        for theme, keys in NEWS_THEME_KEYWORDS.items():
+            assert theme in rules, f"{theme} 가 CATEGORY_RULES 에 없다"
+            assert tuple(keys) == tuple(rules[theme]), \
+                f"{theme} 키워드가 CATEGORY_RULES 와 다르다"
+        # 키워드는 전부 소문자여야 한다 (제목을 lower 해서 비교하므로)
+        for theme, keys in NEWS_THEME_KEYWORDS.items():
+            for k in keys:
+                assert k == k.lower(), f"{theme} 의 '{k}' 가 대문자를 포함"
+
+    def _titles(rows):
+        return pd.DataFrame(rows, columns=["d", "title"])
+
+    def t_nf_count_anchor():
+        """카운트 앵커. 합성 제목으로 손계산과 대조한다.
+
+        제목 5건 (같은 날):
+          1 "반도체 HBM 수출 급증"        -> 반도체
+          2 "삼성전자 실적 어닝 서프라이즈" -> 실적
+          3 "반도체 업체 영업이익 급증"    -> 반도체 + 실적  (다중 라벨)
+          4 "배터리 양극재 수주"          -> 2차전지 + 방산조선(수주)
+          5 "코스피 마감"                 -> 아무 테마도 아님
+        기대: 반도체 2 · 실적 2 · 2차전지 1 · 방산조선 1 · 나머지 0
+        """
+        from stocknews.news_freq import count_mentions
+        t = _titles([
+            ("2026-08-27", "반도체 HBM 수출 급증"),
+            ("2026-08-27", "삼성전자 실적 어닝 서프라이즈"),
+            ("2026-08-27", "반도체 업체 영업이익 급증"),
+            ("2026-08-27", "배터리 양극재 수주"),
+            ("2026-08-27", "코스피 마감"),
+        ])
+        c = count_mentions(t)
+        assert int(c.loc["2026-08-27", "반도체"]) == 2, c.loc["2026-08-27"]
+        assert int(c.loc["2026-08-27", "실적"]) == 2
+        assert int(c.loc["2026-08-27", "2차전지"]) == 1
+        assert int(c.loc["2026-08-27", "방산조선"]) == 1, "'수주' 가 안 잡혔다"
+        assert int(c.loc["2026-08-27", "바이오"]) == 0
+        assert int(c.loc["2026-08-27", "전력AI"]) == 0
+
+    def t_nf_case_and_multilabel():
+        """영문 대문자 헤드라인도 잡아야 하고, 다중 라벨이어야 한다."""
+        from stocknews.news_freq import count_mentions
+        c = count_mentions(_titles([
+            ("2026-08-27", "NVIDIA GPU demand and FOMC rate decision"),
+        ]))
+        assert int(c.loc["2026-08-27", "반도체"]) == 1, "대문자 NVIDIA 미검출"
+        assert int(c.loc["2026-08-27", "매크로"]) == 1, "FOMC/rate 미검출"
+
+        # 같은 사건을 여러 매체가 쓰면 그만큼 센다 (증폭. 동작을 고정한다)
+        many = _titles([("2026-08-27", f"반도체 호황 {i}") for i in range(20)])
+        assert int(count_mentions(many).loc["2026-08-27", "반도체"]) == 20
+
+    def t_nf_ma_and_change():
+        """MA7 과 변화율 앵커. 당일을 포함한 7일 평균이다.
+
+        7일간 반도체 언급 = [1, 1, 1, 1, 1, 1, 8]  (마지막이 기준일)
+          MA7 = (1x6 + 8)/7 = 14/7 = 2.0
+          chg = (8/2.0 - 1) x 100 = +300.0%
+        """
+        from stocknews.news_freq import compute_news_freq
+        days = [f"2026-08-{d:02d}" for d in range(21, 28)]
+        rows = []
+        for i, d in enumerate(days):
+            n = 8 if i == len(days) - 1 else 1
+            rows += [(d, f"반도체 뉴스 {j}") for j in range(n)]
+        got = {r["sector"]: r for r in compute_news_freq(_titles(rows),
+                                                        "2026-08-27")}
+        semi = got["반도체"]
+        assert semi["mention_cnt"] == 8, semi
+        near(semi["mention_cnt_ma7"], 2.0, tol=1e-9, label="MA7")
+        near(semi["chg_vs_ma7"], 300.0, tol=1e-9, label="변화율")
+        # 언급이 0 인 테마는 0 으로 기록되고 MA 는 0 이라 변화율은 None
+        assert got["바이오"]["mention_cnt"] == 0
+        near(got["바이오"]["mention_cnt_ma7"], 0.0, tol=1e-9, label="바이오 MA7")
+        assert got["바이오"]["chg_vs_ma7"] is None, "0 나누기를 했다"
+
+    def t_nf_short_history_null():
+        """일자가 7일 미만이면 MA·변화율을 만들지 않는다."""
+        from stocknews.news_freq import compute_news_freq
+        rows = [(f"2026-08-{d:02d}", "반도체 뉴스") for d in (25, 26, 27)]
+        got = {r["sector"]: r for r in compute_news_freq(_titles(rows),
+                                                         "2026-08-27")}
+        assert got["반도체"]["mention_cnt"] == 1
+        assert got["반도체"]["mention_cnt_ma7"] is None, \
+            "3일치로 7일 평균을 만들었다"
+        assert got["반도체"]["chg_vs_ma7"] is None
+        # 뉴스가 아예 없어도 10테마 0건 행을 만든다 (행 없음과 0건은 다르다)
+        empty = compute_news_freq(pd.DataFrame(columns=["d", "title"]),
+                                  "2026-08-27")
+        assert len(empty) == 10, len(empty)
+        assert all(r["mention_cnt"] == 0 for r in empty)
+        assert all(r["mention_cnt_ma7"] is None for r in empty)
+
+    def t_nf_no_lookahead():
+        """기준일 이후 일자는 쓰지 않는다."""
+        from stocknews.news_freq import compute_news_freq
+        rows = ([("2026-08-27", "반도체 뉴스")]
+                + [("2026-08-28", f"반도체 폭증 {i}") for i in range(50)])
+        got = {r["sector"]: r for r in compute_news_freq(_titles(rows),
+                                                         "2026-08-27")}
+        assert got["반도체"]["mention_cnt"] == 1, \
+            f"미래 일자가 섞였다: {got['반도체']}"
+
+    def t_nf_store_and_collect():
+        """저장·덮어쓰기 + 수집기 격리."""
+        from stocknews.news_freq import collect_news_freq, compute_news_freq
+        from stocknews.store import Store
+        s = Store(tmp / "newsfreq.db")
+        rows = compute_news_freq(_titles([("2026-08-27", "반도체 HBM")]),
+                                 "2026-08-27")
+        assert s.has_news_freq("2026-08-27") is False
+        assert s.upsert_news_freq(rows) == 10
+        assert s.has_news_freq("2026-08-27") is True
+        got = s.news_freq_on("2026-08-27")
+        assert len(got) == 10, len(got)
+        assert int(got.iloc[0]["mention_cnt"]) == 1, "정렬이 건수 내림차순 아님"
+        assert got.iloc[0]["created_at"], "created_at 이 비었다"
+        # 덮어쓰기 — 행이 늘지 않아야 한다
+        assert s.upsert_news_freq(rows) == 10
+        assert len(s.news_freq_on("2026-08-27")) == 10
+
+        # 뉴스가 없는 새 DB 에서도 조용히 10테마 0건
+        s2 = Store(tmp / "newsfreq2.db")
+        out = collect_news_freq(s2, "2026-08-27")
+        assert out["themes"] == 10 and out["total_mentions"] == 0, out
+
+        # store 가 터져도 예외가 올라오지 않아야 한다
+        class _Boom:
+            def news_titles(self, days=30):
+                raise RuntimeError("DB 없음")
+
+        assert collect_news_freq(_Boom(), "2026-08-27")["themes"] == 0
+
+    def t_nf_record_only():
+        """기록 전용 증명. 점수·추천·스크리닝·알림에 참조가 없어야 한다."""
+        import inspect
+        from stocknews import (exits, liquidation, notify, renderer, screener,
+                              weekly)
+        from stocknews.daily import select_recommendations
+
+        tokens = ("news_freq", "mention_cnt", "chg_vs_ma7",
+                  "NEWS_THEME_KEYWORDS", "NewsFreqConfig")
+        for mod in (renderer, screener, notify, exits, weekly, liquidation):
+            src = inspect.getsource(mod)
+            for tk in tokens:
+                assert tk not in src, \
+                    f"{mod.__name__} 가 {tk} 를 참조한다 (기록 전용 위반)"
+        for fn in (screener.screen_one, select_recommendations):
+            names = set(fn.__code__.co_names)
+            for tk in ("news_freq", "mention_cnt", "collect_news_freq"):
+                assert tk not in names, f"{fn.__name__} 가 {tk} 를 본다"
+
+        # news_freq 가 점수·표시 모듈을 import 하지 않는지
+        import stocknews.news_freq as NF
+        src = inspect.getsource(NF)
+        for bad in ("from .screener", "from .renderer", "from .notify",
+                    "from .exits", "from .liquidation", "from .weekly"):
+            assert bad not in src, f"news_freq 가 {bad} 를 한다"
+
+    def t_nf_axis_differs_from_sector():
+        """news_freq.sector 는 뉴스 테마다. KRX 업종과 값 집합이 다르다.
+
+        이름이 같아서 조인할 수 있다고 착각하기 쉬운 지점이라 명시한다.
+        """
+        from stocknews.config import NEWS_THEME_KEYWORDS
+        themes = set(NEWS_THEME_KEYWORDS)
+        krx_like = {"의약품 제조업", "전자부품 제조업", "소프트웨어 개발 및 공급업"}
+        assert not (themes & krx_like), \
+            "뉴스 테마와 KRX 업종명이 겹친다 — 축 구분이 무너진다"
+        assert "반도체" in themes and "공시" in themes
+
+    check("news-freq", "사전 정본 일치 (classify 와)", t_nf_dict_matches_classify)
+    check("news-freq", "카운트 앵커 (다중 라벨)", t_nf_count_anchor)
+    check("news-freq", "영문 대문자 + 증폭 고정", t_nf_case_and_multilabel)
+    check("news-freq", "MA7 + 변화율 앵커", t_nf_ma_and_change)
+    check("news-freq", "일자 부족은 NULL", t_nf_short_history_null)
+    check("news-freq", "미래 일자 미사용", t_nf_no_lookahead)
+    check("news-freq", "저장/덮어쓰기 + 수집기 격리", t_nf_store_and_collect)
+    check("news-freq", "기록 전용 증명 (참조 부재)", t_nf_record_only)
+    check("news-freq", "테마 축 != KRX 업종 축", t_nf_axis_differs_from_sector)
+
     # ───────── 재진입 금지 쿨다운 + 월간 회고 ─────────
     from stocknews.config import COOLDOWN_DAYS
     from stocknews.contracts import COOLDOWN_REASON, MANUAL_REASON

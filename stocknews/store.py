@@ -303,6 +303,27 @@ CREATE TABLE IF NOT EXISTS sector_metrics (
 );
 CREATE INDEX IF NOT EXISTS ix_secmet_date ON sector_metrics(scan_date);
 
+-- 뉴스 테마 언급 빈도. **기록 전용이다.**
+--
+-- `scan_date` 는 **거래일이 아니라 달력일**이다 (`news.d` 와 같은 축).
+-- 뉴스는 휴장일에도 나므로 거래일로 강제하면 주말 뉴스가 사라지거나
+-- 다음 거래일에 몰린다. 그래서 sector_metrics/recos 의 scan_date(거래일)
+-- 와는 축이 다르다 — 조인할 때 주의해야 한다.
+--
+-- `sector` 는 KRX 업종이 아니라 뉴스 테마 10종이다
+-- (`config.NEWS_THEME_KEYWORDS` 의 키). sector_metrics.sector(업종 158종)
+-- 와 이름만 같고 값 집합이 다르다.
+CREATE TABLE IF NOT EXISTS news_freq (
+  scan_date       TEXT NOT NULL,
+  sector          TEXT NOT NULL,
+  mention_cnt     INTEGER,
+  mention_cnt_ma7 REAL,
+  chg_vs_ma7      REAL,
+  created_at      TEXT,
+  PRIMARY KEY (scan_date, sector)
+);
+CREATE INDEX IF NOT EXISTS ix_newsfreq_date ON news_freq(scan_date);
+
 CREATE TABLE IF NOT EXISTS market_context (
   scan_date         TEXT PRIMARY KEY,
   kospi_close       REAL,
@@ -1155,6 +1176,56 @@ class Store:
             return pd.read_sql_query(
                 f"SELECT news_id,ticker,name FROM news_tickers "
                 f"WHERE news_id IN ({marks})", con, params=news_ids)
+
+    def news_titles(self, days: int = 30) -> pd.DataFrame:
+        """[d, title] — 일자별 뉴스 제목. 테마 언급 빈도 집계용.
+
+        `d` 는 수집 기준일(달력일)이다. `published` 는 네이버가 안 주므로
+        일자 축으로 못 쓴다.
+        """
+        since = (_now_kst() - timedelta(days=int(days))).strftime("%Y-%m-%d")
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT d,title FROM news WHERE d>=? AND title IS NOT NULL "
+                "ORDER BY d", con, params=(since,))
+
+    # ────────────────── 뉴스 테마 빈도 (기록 전용) ──────────────────
+    _NF_COLS = ("scan_date", "sector", "mention_cnt", "mention_cnt_ma7",
+                "chg_vs_ma7")
+
+    def has_news_freq(self, d) -> bool:
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM news_freq WHERE scan_date=? LIMIT 1",
+                (_d(d),)).fetchone()
+        return row is not None
+
+    def upsert_news_freq(self, rows: list[dict]) -> int:
+        """뉴스 빈도 다건. 같은 (일자, 테마) 는 덮어쓴다."""
+        if not rows:
+            return 0
+        now = _now_str()
+        payload = []
+        for r in rows:
+            vals = [r.get(c) for c in self._NF_COLS]
+            vals[0] = _d(vals[0])
+            payload.append((*vals, now))
+        marks = ",".join("?" * (len(self._NF_COLS) + 1))
+        sets = ",".join(f"{c}=excluded.{c}" for c in self._NF_COLS[2:])
+        with closing(self._conn()) as con:
+            con.executemany(
+                f"INSERT INTO news_freq({','.join(self._NF_COLS)},created_at) "
+                f"VALUES({marks}) ON CONFLICT(scan_date,sector) DO UPDATE SET "
+                f"{sets},created_at=excluded.created_at", payload)
+            con.commit()
+        return len(payload)
+
+    def news_freq_on(self, d) -> pd.DataFrame:
+        """그 일자 테마 빈도 전체."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM news_freq WHERE scan_date=? "
+                "ORDER BY mention_cnt DESC", con, params=(_d(d),))
 
     def news_theme_counts(self, days: int = 14) -> pd.DataFrame:
         """일자 x 카테고리 건수. 주간 테마 부침 분석용."""
