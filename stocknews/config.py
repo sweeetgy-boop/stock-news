@@ -224,6 +224,26 @@ class ExitConfig:
 
 
 @dataclass(frozen=True)
+class SectorConfig:
+    """섹터 지표 파라미터. **기록 전용 지표다.**
+
+    여기서 나온 값은 `sector_metrics` 테이블에만 들어간다. 점수·추천·
+    스크리닝·알림 어디에도 쓰지 않는다. 채점 표본이 쌓인 뒤 '어떤 섹터
+    국면에서 통했나'를 되짚기 위한 것이고, 지금 판단에 쓰면 검증되지
+    않은 축을 하나 더 얹는 셈이 된다.
+    """
+
+    rs_short: int = 5              # 단기 상대강도 구간 (거래일)
+    rs_long: int = 20              # 장기 상대강도 구간. RS 순위의 기준
+    breadth_ma: int = 20           # 폭 판정에 쓰는 이동평균
+    new_high_lookback: int = 252   # 52주 ≈ 252거래일
+    new_high_ratio: float = 0.99   # 최고 종가의 이 비율 이상이면 신고가로 본다
+    turnover_ma: int = 20          # 거래대금 비중의 비교 기준 구간
+    persist_lookback: int = 20     # 모멘텀 지속성: 몇 거래일 전과 대조하나
+    persist_top_fraction: float = 1.0 / 3.0   # 상위 이 비율이면 '상위권'
+
+
+@dataclass(frozen=True)
 class Config:
     ma: MAConfig = MAConfig()
     fib: FibConfig = FibConfig()
@@ -231,6 +251,7 @@ class Config:
     gate: GateConfig = GateConfig()
     exit: ExitConfig = ExitConfig()
     audit: AuditConfig = AuditConfig()
+    sector: SectorConfig = SectorConfig()
 
 
 DEFAULT = Config()

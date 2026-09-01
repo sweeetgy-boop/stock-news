@@ -4179,6 +4179,476 @@ def test_daily_weekly(st, tmp: Path):
     check("market", "조회 실패에도 daily 완료", t_daily_survives_index_failure)
     check("market", "기록 전용 (표시·점수 미반영)", t_mkt_not_used_anywhere)
 
+    # ───────── 섹터 지표 (기록 전용) ─────────
+    # 픽스처: 섹터 2개 x 종목 3개 + 미분류 1개. 30봉.
+    # 손계산이 되도록 마지막 봉(과 A1 의 -21봉)만 계단으로 움직인다.
+    #
+    #   A1  100 유지 · idx[-21]=50 · 마지막 130   시총 3
+    #   A2  100 유지 · 마지막 90                  시총 1
+    #   A3  100 유지 · 마지막 110                 시총 1
+    #   B1  200 유지 · 마지막 195                 시총 1
+    #   B2  200 유지 · 마지막 180                 시총 1
+    #   B3  200 유지 · 마지막 220                 시총 1
+    #   U1  100 유지 (미분류) — 거래대금 분모에만 들어간다
+    _SEC_A = "반도체"
+    _SEC_B = "바이오"
+
+    def _sector_fixture(bars: int = 30):
+        from stocknews.sector_metrics import UNCLASSIFIED
+        idx = pd.DatetimeIndex(pd.bdate_range(end="2026-08-27", periods=bars))
+
+        def _ser(base, last, deep=None):
+            a = np.full(bars, float(base))
+            if deep is not None and bars >= 21:
+                a[-21] = float(deep)
+            a[-1] = float(last)
+            return a
+
+        close = pd.DataFrame({
+            "A00001": _ser(100, 130, deep=50),
+            "A00002": _ser(100, 90),
+            "A00003": _ser(100, 110),
+            "B00001": _ser(200, 195),
+            "B00002": _ser(200, 180),
+            "B00003": _ser(200, 220),
+            "U00001": _ser(100, 100),
+        }, index=idx)
+        amt = pd.DataFrame({
+            "A00001": np.full(bars, 10.0),
+            "A00002": np.full(bars, 20.0),
+            "A00003": np.full(bars, 30.0),   # 섹터 A 합 60
+            "B00001": np.full(bars, 10.0),
+            "B00002": np.full(bars, 10.0),
+            "B00003": np.full(bars, 20.0),   # 섹터 B 합 40
+            "U00001": np.full(bars, 50.0),   # 미분류 — 분모에만
+        }, index=idx)
+        sectors = {"A00001": _SEC_A, "A00002": _SEC_A, "A00003": _SEC_A,
+                   "B00001": _SEC_B, "B00002": _SEC_B, "B00003": _SEC_B,
+                   "U00001": UNCLASSIFIED}
+        caps = pd.Series({"A00001": 3.0, "A00002": 1.0, "A00003": 1.0,
+                          "B00001": 1.0, "B00002": 1.0, "B00003": 1.0,
+                          "U00001": 1.0})
+        return close, amt, sectors, caps
+
+    def _rows_by_sector(rows):
+        return {r["sector"]: r for r in rows}
+
+    def t_sector_ticker_math():
+        """종목 단위 계산 앵커. 손계산과 대조한다.
+
+        A1 = 100 유지 · idx[-21]=50 · 마지막 130
+          5일  수익률 = 130/100 - 1 = +30%   (idx[-6] = 100)
+          20일 수익률 = 130/50  - 1 = +160%  (idx[-21] = 50)
+          MA20 = (19x100 + 130)/20 = 101.5   (idx[-21] 은 창 밖)
+        """
+        from stocknews.sector_metrics import (above_ma, new_high_flags,
+                                              ticker_returns)
+        close, _, _, _ = _sector_fixture()
+
+        r5 = ticker_returns(close, 5)
+        near(r5["A00001"], 30.0, tol=1e-9, label="A1 5일")
+        near(r5["A00002"], -10.0, tol=1e-9, label="A2 5일")
+        near(r5["A00003"], 10.0, tol=1e-9, label="A3 5일")
+        near(r5["B00001"], -2.5, tol=1e-9, label="B1 5일")
+
+        r20 = ticker_returns(close, 20)
+        near(r20["A00001"], 160.0, tol=1e-9,
+             label="A1 20일 (5일창과 다른 봉을 봐야 한다)")
+        near(r20["A00002"], -10.0, tol=1e-9, label="A2 20일")
+
+        ma = above_ma(close, 20)
+        assert bool(ma["A00001"]) is True, "130 > MA20 101.5"
+        assert bool(ma["A00002"]) is False, "90 < MA20 99.5"
+        assert bool(ma["A00003"]) is True, "110 > MA20 100.5"
+        assert bool(ma["B00003"]) is True, "220 > MA20 201"
+        assert bool(ma["B00001"]) is False, "195 < MA20 199.75"
+
+        nh = new_high_flags(close, 252, 0.99)
+        assert bool(nh["A00001"]) is True, "130 이 최고 종가"
+        assert bool(nh["A00002"]) is False, "90 < 100 x 0.99"
+        assert bool(nh["B00001"]) is False, "195 < 200 x 0.99"
+        assert bool(nh["B00003"]) is True, "220 이 최고 종가"
+
+    def t_sector_turnover_share():
+        """거래대금 비중. 분모는 전체 시장(미분류 포함).
+
+        섹터 A 60 · 섹터 B 40 · 미분류 50 -> 시장 150
+          A = 60/150 = 40.0%   B = 40/150 = 26.667%
+        거래대금이 상수라 20일 평균 = 당일 -> 변화율 0.0%
+        """
+        from stocknews.sector_metrics import sector_turnover_share
+        _, amt, sectors, _ = _sector_fixture()
+        t = sector_turnover_share(amt, sectors, 20)
+        near(t.loc[_SEC_A, "share"], 40.0, tol=1e-9, label="A 비중")
+        near(t.loc[_SEC_B, "share"], 200.0 / 7.5, tol=1e-9, label="B 비중")
+        near(t.loc[_SEC_A, "share_chg"], 0.0, tol=1e-9, label="A 변화율")
+        assert list(t.index) == sorted([_SEC_A, _SEC_B]) or set(t.index) == \
+            {_SEC_A, _SEC_B}, list(t.index)
+        # 미분류는 행이 없어야 한다 (분모에만 들어간다)
+        from stocknews.sector_metrics import UNCLASSIFIED
+        assert UNCLASSIFIED not in t.index, "미분류가 집계에 들어갔다"
+        # 합이 100% 가 아니어야 한다 — 차이가 미분류 비중이다
+        near(float(t["share"].sum()), 200.0 / 3.0, tol=1e-9, label="비중 합")
+
+    def t_sector_rs_and_rank():
+        """RS = 섹터 시총가중 평균 − 코스피. 순위는 20d RS 기준.
+
+        섹터 A 시총 3:1:1
+          5일  = (30x3 + (-10)x1 + 10x1)/5 = 90/5  = +18%
+          20일 = (160x3 + (-10)x1 + 10x1)/5 = 480/5 = +96%
+        섹터 B 시총 1:1:1 (사실상 동일가중)
+          5일 = 20일 = (-2.5 - 10 + 10)/3 = -0.8333%
+        코스피 5%/5% 가정 -> RS_5d A=+13.0 B=-5.8333
+                             RS_20d A=+91.0 B=-5.8333
+        """
+        from stocknews.sector_metrics import compute_sector_metrics
+        close, amt, sectors, caps = _sector_fixture()
+        rows = compute_sector_metrics(close, amt, sectors, caps, 5.0, 5.0,
+                                      scan_date="2026-08-27")
+        by = _rows_by_sector(rows)
+        assert set(by) == {_SEC_A, _SEC_B}, set(by)
+        a, b = by[_SEC_A], by[_SEC_B]
+
+        near(a["rs_5d"], 13.0, tol=1e-9, label="A RS 5일")
+        near(a["rs_20d"], 91.0, tol=1e-9, label="A RS 20일")
+        near(b["rs_5d"], -0.8333333333 - 5.0, tol=1e-6, label="B RS 5일")
+        near(b["rs_20d"], -0.8333333333 - 5.0, tol=1e-6, label="B RS 20일")
+
+        assert a["rs_rank"] == 1 and b["rs_rank"] == 2, (a["rs_rank"],
+                                                        b["rs_rank"])
+        assert a["n_stocks"] == 3 and b["n_stocks"] == 3
+        assert a["scan_date"] == "2026-08-27"
+
+    def t_sector_equal_weight_fallback():
+        """시총이 하나라도 없으면 그 섹터는 동일가중으로 떨어진다.
+
+        동일가중 A 5일 = (30 - 10 + 10)/3 = +10% -> RS = +5.0
+        (시총가중이면 +18% -> RS = +13.0 이므로 값으로 구분된다)
+        """
+        from stocknews.sector_metrics import compute_sector_metrics
+        close, amt, sectors, caps = _sector_fixture()
+        caps = caps.copy()
+        caps["A00001"] = np.nan          # 하나만 비운다
+        rows = compute_sector_metrics(close, amt, sectors, caps, 5.0, 5.0)
+        near(_rows_by_sector(rows)[_SEC_A]["rs_5d"], 5.0, tol=1e-9,
+             label="동일가중 A RS 5일")
+        # 시총을 아예 안 주면 전부 동일가중
+        rows2 = compute_sector_metrics(close, amt, sectors, None, 5.0, 5.0)
+        near(_rows_by_sector(rows2)[_SEC_A]["rs_5d"], 5.0, tol=1e-9,
+             label="시총 없음 -> 동일가중")
+
+    def t_sector_breadth_and_newhigh():
+        """폭과 신고가 비율.
+
+        A: MA20 위 A1·A3 -> 2/3 = 66.667% · 신고가 A1·A3 -> 2건 66.667%
+        B: MA20 위 B3    -> 1/3 = 33.333% · 신고가 B3    -> 1건 33.333%
+        """
+        from stocknews.sector_metrics import compute_sector_metrics
+        close, amt, sectors, caps = _sector_fixture()
+        by = _rows_by_sector(compute_sector_metrics(
+            close, amt, sectors, caps, 5.0, 5.0))
+        near(by[_SEC_A]["breadth_ma20"], 200.0 / 3.0, tol=1e-9, label="A 폭")
+        near(by[_SEC_B]["breadth_ma20"], 100.0 / 3.0, tol=1e-9, label="B 폭")
+        assert by[_SEC_A]["new_high_cnt"] == 2, by[_SEC_A]["new_high_cnt"]
+        assert by[_SEC_B]["new_high_cnt"] == 1, by[_SEC_B]["new_high_cnt"]
+        near(by[_SEC_A]["new_high_pct"], 200.0 / 3.0, tol=1e-9, label="A 신고가%")
+        near(by[_SEC_B]["new_high_pct"], 100.0 / 3.0, tol=1e-9, label="B 신고가%")
+
+    def t_sector_momentum_persist():
+        """모멘텀 지속성: 과거에도 상위 1/3, 지금도 상위 1/3 이면 1.
+
+        섹터 6개 중 상위 1/3 = 2개 (int(6 x 1/3) = 2).
+        """
+        from stocknews.sector_metrics import _fill_ranks
+        rows = [{"sector": f"S{i}", "rs_20d": float(10 - i), "rs_rank": None,
+                 "momentum_persist": None} for i in range(6)]
+        prev = {f"S{i}": i + 1 for i in range(6)}   # 과거 순위 = S0..S5
+        _fill_ranks(rows, prev, 1.0 / 3.0)
+        by = {r["sector"]: r for r in rows}
+        assert by["S0"]["rs_rank"] == 1 and by["S5"]["rs_rank"] == 6
+        assert by["S0"]["momentum_persist"] == 1, "과거 1위·현재 1위인데 0"
+        assert by["S1"]["momentum_persist"] == 1, "과거 2위·현재 2위인데 0"
+        assert by["S2"]["momentum_persist"] == 0, "과거 3위는 상위 1/3 아님"
+        assert by["S5"]["momentum_persist"] == 0
+
+        # 과거 스냅샷이 없으면 전부 None (0 이 아니다)
+        rows2 = [{"sector": "S0", "rs_20d": 1.0, "rs_rank": None,
+                  "momentum_persist": None}]
+        _fill_ranks(rows2, None, 1.0 / 3.0)
+        assert rows2[0]["momentum_persist"] is None, \
+            "과거 스냅샷이 없는데 0/1 로 단정했다"
+        assert rows2[0]["rs_rank"] == 1
+
+        # 그 섹터만 과거 순위가 없으면 그 섹터만 None
+        rows3 = [{"sector": "NEW", "rs_20d": 5.0, "rs_rank": None,
+                  "momentum_persist": None},
+                 {"sector": "OLD", "rs_20d": 1.0, "rs_rank": None,
+                  "momentum_persist": None}]
+        _fill_ranks(rows3, {"OLD": 1}, 1.0 / 3.0)
+        got = {r["sector"]: r["momentum_persist"] for r in rows3}
+        assert got["NEW"] is None, "신규 섹터를 0 으로 단정했다"
+        assert got["OLD"] == 0, got
+
+    def t_sector_null_on_short_data():
+        """데이터 부족은 NULL. 0 으로 채우면 '보합'으로 읽힌다."""
+        from stocknews.sector_metrics import (above_ma, compute_sector_metrics,
+                                              new_high_flags, ticker_returns)
+        close, amt, sectors, caps = _sector_fixture(bars=3)
+
+        assert ticker_returns(close, 5).empty, "3봉으로 5일 수익률을 만들었다"
+        assert ticker_returns(close, 20).empty
+        assert above_ma(close, 20).empty, "3봉으로 MA20 을 만들었다"
+
+        by = _rows_by_sector(compute_sector_metrics(
+            close, amt, sectors, caps, 5.0, 5.0))
+        for sec in (_SEC_A, _SEC_B):
+            r = by[sec]
+            assert r["rs_5d"] is None, r
+            assert r["rs_20d"] is None, r
+            assert r["rs_rank"] is None, "RS 가 없는데 순위를 줬다"
+            assert r["momentum_persist"] is None
+            assert r["breadth_ma20"] is None, "MA20 이 없는데 폭을 줬다"
+            # 신고가는 2봉만 있어도 판정 가능하다
+            assert r["new_high_cnt"] is not None
+            assert r["n_stocks"] == 3
+
+        # 봉이 1개면 신고가도 판정 불가
+        one, one_amt, s1, c1 = _sector_fixture(bars=1)
+        assert new_high_flags(one, 252, 0.99).empty
+        by1 = _rows_by_sector(compute_sector_metrics(
+            one, one_amt, s1, c1, 5.0, 5.0))
+        assert by1[_SEC_A]["new_high_cnt"] is None, by1[_SEC_A]
+
+        # 코스피 수익률이 없으면 RS 만 비고 나머지는 남는다
+        close2, amt2, s2, c2 = _sector_fixture()
+        by2 = _rows_by_sector(compute_sector_metrics(
+            close2, amt2, s2, c2, None, None))
+        assert by2[_SEC_A]["rs_5d"] is None and by2[_SEC_A]["rs_20d"] is None
+        assert by2[_SEC_A]["breadth_ma20"] is not None, \
+            "코스피가 없다고 폭까지 버렸다"
+        assert by2[_SEC_A]["turnover_share"] is not None
+
+        # 입력이 아예 없으면 빈 목록
+        assert compute_sector_metrics(None, None, {}, None, 1.0, 1.0) == []
+        assert compute_sector_metrics(pd.DataFrame(), pd.DataFrame(),
+                                      sectors, caps, 1.0, 1.0) == []
+
+    def t_sector_store_roundtrip():
+        """저장 → 조회 → 덮어쓰기 + 과거 순위 조회."""
+        from stocknews.sector_metrics import compute_sector_metrics
+        from stocknews.store import Store
+        s = Store(tmp / "secmet.db")
+        close, amt, sectors, caps = _sector_fixture()
+        rows = compute_sector_metrics(close, amt, sectors, caps, 5.0, 5.0,
+                                      scan_date="2026-08-27")
+        assert s.has_sector_metrics("2026-08-27") is False
+        assert s.upsert_sector_metrics(rows) == 2
+        assert s.has_sector_metrics("2026-08-27") is True
+
+        got = s.sector_metrics_on("2026-08-27")
+        assert len(got) == 2, len(got)
+        assert list(got["sector"]) == [_SEC_A, _SEC_B], list(got["sector"])
+        near(float(got.iloc[0]["rs_20d"]), 91.0, tol=1e-9, label="저장된 RS")
+        assert got.iloc[0]["created_at"], "created_at 이 비었다"
+
+        assert s.sector_rs_ranks("2026-08-27") == {_SEC_A: 1, _SEC_B: 2}
+        assert s.sector_rs_ranks("2026-01-01") == {}
+
+        # 덮어쓰기 — 행이 늘지 않아야 한다
+        assert s.upsert_sector_metrics(rows) == 2
+        assert len(s.sector_metrics_on("2026-08-27")) == 2
+
+    def t_sector_field_matrix():
+        """field_matrix 가 amt 를 종가와 같은 모양으로 준다."""
+        from stocknews.store import Store
+        s = Store(tmp / "secmet_fm.db")
+        idx = pd.DatetimeIndex(pd.bdate_range(end="2026-08-27", periods=5))
+        for code, amt_v in (("AAA555", 111.0), ("BBB555", 222.0)):
+            s.upsert_prices(code, pd.DataFrame({
+                "시가": np.full(5, 100.0), "고가": np.full(5, 100.0),
+                "저가": np.full(5, 100.0), "종가": np.full(5, 100.0),
+                "거래량": np.full(5, 1e6),
+                "거래대금": np.full(5, amt_v)}, index=idx), allow_today=True)
+        m = s.field_matrix("amt", days=10)
+        assert list(m.columns) == ["AAA555", "BBB555"], list(m.columns)
+        near(float(m["AAA555"].iloc[-1]), 111.0, tol=1e-6, label="amt")
+        c = s.price_matrix(days=10)
+        assert list(m.index) == list(c.index), "종가와 축이 다르다"
+        try:
+            s.field_matrix("없는컬럼", days=5)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("알 수 없는 컬럼을 통과시켰다")
+
+    def t_sector_collect_isolated():
+        """수집기는 하루 1회 · 실패를 삼킨다 · daily 를 죽이지 않는다."""
+        from stocknews.sector_metrics import (collect_sector_metrics,
+                                              compute_sector_metrics)
+        from stocknews.store import Store
+        s = Store(tmp / "secmet_col.db")
+        close, amt, sectors, caps = _sector_fixture()
+        s.upsert_sector_metrics(compute_sector_metrics(
+            close, amt, sectors, caps, 5.0, 5.0, scan_date="2026-08-27"))
+        out = collect_sector_metrics(s, "2026-08-27")
+        assert out["skipped"] is True and out["sectors"] == 0, out
+
+        # 시세가 없는 새 DB -> 조용히 0
+        s2 = Store(tmp / "secmet_empty.db")
+        out2 = collect_sector_metrics(s2, "2026-08-27", use_fdr=False)
+        assert out2["sectors"] == 0 and out2["skipped"] is False, out2
+        assert s2.has_sector_metrics("2026-08-27") is False
+
+        # store 가 터져도 예외가 올라오지 않아야 한다
+        class _Boom:
+            def has_sector_metrics(self, d):
+                raise RuntimeError("DB 없음")
+
+        assert collect_sector_metrics(_Boom(), "2026-08-27")["sectors"] == 0
+        assert collect_sector_metrics(s, "")["sectors"] == 0
+
+    def t_sector_unclassified_excluded():
+        """미분류는 행을 만들지 않는다. 전 종목이 미분류면 빈 목록."""
+        from stocknews.sector_metrics import UNCLASSIFIED, compute_sector_metrics
+        close, amt, sectors, caps = _sector_fixture()
+        rows = compute_sector_metrics(close, amt, sectors, caps, 5.0, 5.0)
+        assert UNCLASSIFIED not in {r["sector"] for r in rows}
+        allna = {k: UNCLASSIFIED for k in sectors}
+        assert compute_sector_metrics(close, amt, allna, caps, 5.0, 5.0) == []
+
+    def t_sector_cuts_at_scan_date():
+        """기준일 이후 봉을 잘라야 한다. 실측으로 맞은 버그의 회귀 가드.
+
+        행렬 끝에 '13종목만 들어온 부분 적재일'이 붙어 있으면, 자르지
+        않으면 마지막 행이 대부분 NaN 이라 거의 모든 섹터가 NULL 이 된다.
+        (2026-08-28 이 실제로 그랬고 157섹터 중 146개가 NULL 이었다)
+        """
+        from stocknews.sector_metrics import compute_sector_metrics
+        close, amt, sectors, caps = _sector_fixture()
+
+        # 하루 뒤 부분 적재일을 붙인다 — A1 만 값이 있고 나머지는 NaN
+        nxt = close.index[-1] + pd.Timedelta(days=1)
+        part = pd.DataFrame(
+            [[999.0] + [np.nan] * (len(close.columns) - 1)],
+            index=[nxt], columns=close.columns)
+        dirty = pd.concat([close, part])
+        dirty_amt = pd.concat([amt, pd.DataFrame(
+            [[1.0] + [np.nan] * (len(amt.columns) - 1)],
+            index=[nxt], columns=amt.columns)])
+
+        scan = close.index[-1].strftime("%Y-%m-%d")
+        by = _rows_by_sector(compute_sector_metrics(
+            dirty, dirty_amt, sectors, caps, 5.0, 5.0, scan_date=scan))
+        # 자르고 나면 앵커 테스트와 같은 값이 나와야 한다
+        near(by[_SEC_A]["rs_5d"], 13.0, tol=1e-9, label="자른 뒤 A RS 5일")
+        near(by[_SEC_A]["rs_20d"], 91.0, tol=1e-9, label="자른 뒤 A RS 20일")
+        near(by[_SEC_A]["breadth_ma20"], 200.0 / 3.0, tol=1e-9, label="A 폭")
+        near(by[_SEC_A]["turnover_share"], 40.0, tol=1e-9, label="A 비중")
+        assert by[_SEC_B]["rs_20d"] is not None, "B 섹터가 NULL 이 됐다"
+
+        # 자르지 않으면(기준일 미지정) 오염된 값이 나온다 — 대조군
+        dirty_rows = _rows_by_sector(compute_sector_metrics(
+            dirty, dirty_amt, sectors, caps, 5.0, 5.0))
+        assert dirty_rows[_SEC_B]["rs_20d"] is None, \
+            "부분 적재일이 섞였는데 B 가 계산됐다 (대조군이 성립 안 함)"
+
+    def t_sector_turnover_fallback():
+        """amt 가 비어 있으면 종가x거래량으로 근사한다.
+
+        이 저장소의 prices.amt 는 전 행 NULL 이다. 폴백이 없으면 거래대금
+        집중도가 영구히 NULL 로 남는다 (universe.liquidity_filter 와 같은 폴백).
+        """
+        from stocknews.sector_metrics import turnover_matrix
+        from stocknews.store import Store
+        s = Store(tmp / "secmet_turn.db")
+        idx = pd.DatetimeIndex(pd.bdate_range(end="2026-08-27", periods=5))
+        for code, px, vol in (("AAA666", 100.0, 10.0), ("BBB666", 200.0, 5.0)):
+            s.upsert_prices(code, pd.DataFrame({
+                "시가": np.full(5, px), "고가": np.full(5, px),
+                "저가": np.full(5, px), "종가": np.full(5, px),
+                "거래량": np.full(5, vol)},   # 거래대금 컬럼 없음
+                index=idx), allow_today=True)
+        m, src = turnover_matrix(s, 10)
+        assert src == "close*volume", src
+        near(float(m["AAA666"].iloc[-1]), 1000.0, tol=1e-6, label="100x10")
+        near(float(m["BBB666"].iloc[-1]), 1000.0, tol=1e-6, label="200x5")
+
+        # amt 가 있으면 그걸 쓴다
+        s2 = Store(tmp / "secmet_turn2.db")
+        s2.upsert_prices("AAA777", pd.DataFrame({
+            "시가": np.full(5, 100.0), "고가": np.full(5, 100.0),
+            "저가": np.full(5, 100.0), "종가": np.full(5, 100.0),
+            "거래량": np.full(5, 10.0),
+            "거래대금": np.full(5, 7.0)}, index=idx), allow_today=True)
+        m2, src2 = turnover_matrix(s2, 10)
+        assert src2 == "amt", src2
+        near(float(m2["AAA777"].iloc[-1]), 7.0, tol=1e-6, label="amt 우선")
+
+        # 빈 DB
+        m3, src3 = turnover_matrix(Store(tmp / "secmet_turn3.db"), 10)
+        assert src3 == "none" and m3.empty
+
+    def t_sector_record_only():
+        """기록 전용 증명. 점수·추천·스크리닝·알림에 참조가 없어야 한다."""
+        import inspect
+        from stocknews import (exits, liquidation, notify, renderer, screener,
+                               weekly)
+        from stocknews.daily import select_recommendations
+
+        tokens = ("sector_metrics", "rs_20d", "rs_5d", "breadth_ma20",
+                  "turnover_share", "momentum_persist", "new_high_cnt",
+                  "SectorConfig", "collect_sector_metrics")
+        for mod in (renderer, screener, notify, exits, weekly, liquidation):
+            src = inspect.getsource(mod)
+            for tk in tokens:
+                assert tk not in src, \
+                    f"{mod.__name__} 가 {tk} 를 참조한다 (기록 전용 위반)"
+
+        # 점수·선정 함수가 실제로 참조하지 않는지
+        for fn in (screener.screen_one, screener.check_exclusion,
+                   select_recommendations, liquidation.evaluate_liquidation):
+            names = set(fn.__code__.co_names)
+            for tk in ("sector_metrics", "collect_sector_metrics",
+                       "rs_20d", "breadth_ma20"):
+                assert tk not in names, f"{fn.__name__} 가 {tk} 를 본다"
+
+        # sector_metrics 가 점수·표시 모듈을 import 하지 않는지
+        import stocknews.sector_metrics as SM
+        src = inspect.getsource(SM)
+        for bad in ("from .screener", "from .renderer", "from .notify",
+                    "from .exits", "from .liquidation", "from .weekly"):
+            assert bad not in src, f"sector_metrics 가 {bad} 를 한다"
+
+    def t_sector_recos_schema_unchanged():
+        """recos 스키마에 변화가 없어야 한다 (기록 전용의 다른 한쪽 증명)."""
+        import sqlite3
+        from stocknews.store import Store
+        s = Store(tmp / "secmet_schema.db")
+        con = sqlite3.connect(s.path)
+        try:
+            cols = [r[1] for r in con.execute(
+                "PRAGMA table_info(recos)").fetchall()]
+        finally:
+            con.close()
+        assert cols == ["d", "rank", "ticker", "name", "price", "slot",
+                        "grade", "value_score", "trend_score", "reason"], cols
+
+    check("sector", "종목 단위 계산 앵커", t_sector_ticker_math)
+    check("sector", "거래대금 비중 (분모=전체시장)", t_sector_turnover_share)
+    check("sector", "RS + 순위 앵커 (시총가중)", t_sector_rs_and_rank)
+    check("sector", "시총 없으면 동일가중", t_sector_equal_weight_fallback)
+    check("sector", "폭 + 신고가 비율", t_sector_breadth_and_newhigh)
+    check("sector", "모멘텀 지속성 (없으면 NULL)", t_sector_momentum_persist)
+    check("sector", "데이터 부족은 NULL", t_sector_null_on_short_data)
+    check("sector", "저장/조회/덮어쓰기 + 과거순위", t_sector_store_roundtrip)
+    check("sector", "field_matrix (amt 피벗)", t_sector_field_matrix)
+    check("sector", "수집기 격리 (하루1회·실패삼킴)", t_sector_collect_isolated)
+    check("sector", "미분류 집계 제외", t_sector_unclassified_excluded)
+    check("sector", "기준일 이후 봉 절단 (부분적재 방어)", t_sector_cuts_at_scan_date)
+    check("sector", "거래대금 폴백 (종가x거래량)", t_sector_turnover_fallback)
+    check("sector", "기록 전용 증명 (참조 부재)", t_sector_record_only)
+    check("sector", "recos 스키마 불변", t_sector_recos_schema_unchanged)
+
     # ───────── 재진입 금지 쿨다운 + 월간 회고 ─────────
     from stocknews.config import COOLDOWN_DAYS
     from stocknews.contracts import COOLDOWN_REASON, MANUAL_REASON

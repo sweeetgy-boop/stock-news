@@ -283,6 +283,26 @@ CREATE TABLE IF NOT EXISTS flags (
 --
 -- recos 는 건드리지 않는다. scan_date 로 조인하면 되므로 스키마를
 -- 바꿀 이유가 없다.
+-- 섹터 지표. **기록 전용이다.** market_context 와 같은 취급이다.
+-- 점수·추천·스크리닝·알림 어디에도 쓰지 않는다.
+CREATE TABLE IF NOT EXISTS sector_metrics (
+  scan_date          TEXT NOT NULL,
+  sector             TEXT NOT NULL,
+  n_stocks           INTEGER,
+  rs_5d              REAL,
+  rs_20d             REAL,
+  rs_rank            INTEGER,
+  momentum_persist   INTEGER,
+  breadth_ma20       REAL,
+  turnover_share     REAL,
+  turnover_share_chg REAL,
+  new_high_cnt       INTEGER,
+  new_high_pct       REAL,
+  created_at         TEXT,
+  PRIMARY KEY (scan_date, sector)
+);
+CREATE INDEX IF NOT EXISTS ix_secmet_date ON sector_metrics(scan_date);
+
 CREATE TABLE IF NOT EXISTS market_context (
   scan_date         TEXT PRIMARY KEY,
   kospi_close       REAL,
@@ -985,6 +1005,81 @@ class Store:
             return pd.read_sql_query(
                 "SELECT * FROM market_context ORDER BY scan_date DESC LIMIT ?",
                 con, params=(int(days),))
+
+    # ────────────────── 섹터 지표 (기록 전용) ──────────────────
+    _SEC_COLS = ("scan_date", "sector", "n_stocks", "rs_5d", "rs_20d",
+                 "rs_rank", "momentum_persist", "breadth_ma20",
+                 "turnover_share", "turnover_share_chg",
+                 "new_high_cnt", "new_high_pct")
+
+    def has_sector_metrics(self, d) -> bool:
+        """그 거래일 섹터 지표가 이미 있는가. 하루 1회만 계산하려고 본다."""
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM sector_metrics WHERE scan_date=? LIMIT 1",
+                (_d(d),)).fetchone()
+        return row is not None
+
+    def upsert_sector_metrics(self, rows: list[dict]) -> int:
+        """섹터 지표 다건. 같은 (거래일, 섹터) 는 덮어쓴다."""
+        if not rows:
+            return 0
+        now = _now_str()
+        payload = []
+        for r in rows:
+            vals = [r.get(c) for c in self._SEC_COLS]
+            vals[0] = _d(vals[0])
+            payload.append((*vals, now))
+        marks = ",".join("?" * (len(self._SEC_COLS) + 1))
+        sets = ",".join(f"{c}=excluded.{c}" for c in self._SEC_COLS[2:])
+        with closing(self._conn()) as con:
+            con.executemany(
+                f"INSERT INTO sector_metrics({','.join(self._SEC_COLS)},"
+                f"created_at) VALUES({marks}) "
+                f"ON CONFLICT(scan_date,sector) DO UPDATE SET {sets},"
+                f"created_at=excluded.created_at", payload)
+            con.commit()
+        return len(payload)
+
+    def sector_metrics_on(self, d) -> pd.DataFrame:
+        """그 거래일 섹터 지표 전체."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM sector_metrics WHERE scan_date=? "
+                "ORDER BY rs_rank", con, params=(_d(d),))
+
+    def sector_rs_ranks(self, d) -> dict:
+        """{섹터: rs_rank} — 모멘텀 지속성 판정에 쓸 과거 스냅샷."""
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT sector,rs_rank FROM sector_metrics "
+                "WHERE scan_date=? AND rs_rank IS NOT NULL",
+                (_d(d),)).fetchall()
+        return {s: int(r) for s, r in rows}
+
+    def field_matrix(self, field: str, days: int = 30) -> pd.DataFrame:
+        """임의 시세 컬럼의 피벗 (index=날짜, columns=종목코드).
+
+        `price_matrix` 는 종가 전용이다. 섹터 거래대금 집중도를 구하려면
+        `amt` 도 같은 모양으로 필요해서 일반화했다.
+        """
+        if field not in _COLS:
+            raise ValueError(f"알 수 없는 컬럼: {field} (가능: {sorted(_COLS)})")
+        with closing(self._conn()) as con:
+            dates = pd.read_sql_query(
+                "SELECT DISTINCT d FROM prices ORDER BY d DESC LIMIT ?",
+                con, params=(int(days),))
+            if dates.empty:
+                return pd.DataFrame()
+            start = dates["d"].min()
+            df = pd.read_sql_query(
+                f"SELECT d,ticker,{field} FROM prices WHERE d>=?",
+                con, params=(start,))
+        if df.empty:
+            return pd.DataFrame()
+        m = df.pivot(index="d", columns="ticker", values=field)
+        m.index = pd.to_datetime(m.index)
+        return m.sort_index()
 
     def exit_log_history(self, days: int = 60) -> pd.DataFrame:
         since = (_now_kst() - timedelta(days=days)).strftime("%Y-%m-%d")

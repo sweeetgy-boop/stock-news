@@ -30,6 +30,7 @@ from .config import Config, DEFAULT
 from .contracts import ScreenResult
 from .data import load_index
 from .screener import rank_results, screen_one
+from .sector_metrics import collect_sector_metrics
 
 log = logging.getLogger(__name__)
 
@@ -302,12 +303,15 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     store.save_recos(trade_date, picks)
 
     # 추천 저장 **뒤에** 둔다. 지수 조회가 실패해도 스캔·추천 기록은
-    # 이미 커밋돼 있어야 한다.
+    # 이미 커밋돼 있어야 한다. 둘 다 기록 전용이고 예외를 삼킨다.
     mkt = collect_market_context(store, trade_date)
+    # 섹터 지표는 market_context 뒤에 둔다. 코스피 수익률을 그 기록에서
+    # 가져다 쓰므로, 순서가 바뀌면 같은 날 지수를 두 번 조회한다.
+    sec = collect_sector_metrics(store, trade_date, cfg=cfg)
 
     store.log_run("daily", started, len(results), len(errors),
                   note=f"snapshot={saved}, picks={len(picks)}")
 
     return {"trade_date": trade_date, "results": results, "errors": errors,
             "picks": picks, "snapshot_rows": saved,
-            "market_context": mkt}
+            "market_context": mkt, "sector_metrics": sec}
