@@ -3337,6 +3337,430 @@ def test_dividends(tmp: Path):
     check("dividend", "채점 경로 미참조", t_record_only_boundary)
 
 
+def test_dividend_screen(tmp: Path):
+    """배당 필터 F1~F6. 경계값을 합성 픽스처로 고정한다.
+
+    임계값(3.0% / 5년 / 80%)은 검증된 수치가 아니라 관행값이다. 그래서
+    '경계에서 어느 쪽이 통과인가'를 코드가 못박아야 나중에 상수를 옮길 때
+    무엇이 바뀌는지 알 수 있다.
+    """
+    from stocknews.config import DEFAULT, Config, DividendConfig
+    from stocknews.dividend_screen import (FILTERS, collect_dividend_screen,
+                                           per_of, screen_dividends,
+                                           screen_one, sector_per_medians)
+    from stocknews.store import Store
+
+    BASE = 2025
+    WON = 1e8          # 억원
+
+    def _years(dps, *, ni=1000 * WON, total=100 * WON, fcf=500 * WON,
+               payout=50.0, status="paid", years=5, per_year=None):
+        """`{사업연도: 레코드}`. dps 는 스칼라 또는 {연도: 값}."""
+        out = {}
+        for i in range(years):
+            y = BASE - i
+            d = dps.get(y) if isinstance(dps, dict) else dps
+            rec = {"dps": d, "net_income": ni, "total_dividend": total,
+                   "fcf": fcf, "payout_ratio": payout,
+                   "status": status if (d or 0) > 0 else "none"}
+            if per_year and y in per_year:
+                rec.update(per_year[y])
+            out[y] = rec
+        return out
+
+    # 기본값은 F6 이 실제로 평가되는 조합이다 (PER 10 vs 중앙값 10).
+    # 스킵 경로는 별도 테스트에서 cap/med 를 None 으로 줘서 확인한다.
+    def _one(years, *, price=10_000.0, cap=10_000 * WON, sector="반도체",
+             med=10.0, cfg=DEFAULT):
+        return screen_one("005930", "테스트", years, price=price,
+                          market_cap=cap, sector=sector,
+                          sector_per_median=med, base_year=BASE, cfg=cfg)
+
+    def t_base_passes():
+        """기준 픽스처는 전 필터를 통과해야 한다. 안 그러면 경계 테스트가
+        무엇을 재는지 알 수 없다."""
+        m = _one(_years(400.0))
+        assert m["passed"] is True, (m["failed_at"], m["reason"])
+        near(m["div_yield"], 4.0, label="수익률")
+        assert m["years_paid"] == 5 and m["cut_year"] is None, m
+
+    def t_f1_boundary():
+        """수익률 3.00% 통과 / 2.90% 탈락."""
+        ok = _one(_years(300.0))
+        assert ok["passed"] is True, (ok["failed_at"], ok["reason"])
+        near(ok["div_yield"], 3.0, label="경계 수익률")
+        bad = _one(_years(290.0))
+        assert bad["failed_at"] == "F1", bad
+        assert bad["no_data"] is False, "조건 미달을 판정 불가로 셌다"
+        assert "2.90" in bad["reason"], bad["reason"]
+
+    def t_f1_no_price_is_no_data():
+        """현재가가 없으면 판정 불가다. 탈락과 구분해야 한다."""
+        m = _one(_years(400.0), price=None)
+        assert m["failed_at"] == "F1" and m["no_data"] is True, m
+
+    def t_f2_boundary():
+        """5년 연속 통과 / 4년 탈락."""
+        four = _years({BASE: 400.0, BASE - 1: 400.0, BASE - 2: 400.0,
+                       BASE - 3: 400.0, BASE - 4: None})
+        four[BASE - 4]["status"] = "none"
+        four[BASE - 4]["dps"] = 0.0
+        m = _one(four)
+        assert m["failed_at"] == "F2", m
+        assert m["years_paid"] == 4 and m["no_data"] is False, m
+
+    def t_f2_cut_detected():
+        """중간에 감액이 있으면 5년 연속이어도 탈락이다."""
+        cut = _years({BASE: 400.0, BASE - 1: 250.0, BASE - 2: 300.0,
+                      BASE - 3: 200.0, BASE - 4: 100.0})
+        m = _one(cut)
+        assert m["failed_at"] == "F2", m
+        assert m["cut_year"] == BASE - 1, m["cut_year"]
+        assert "감액" in m["reason"], m["reason"]
+        # 같은 금액 유지는 감액이 아니다
+        flat = _years(400.0)
+        assert _one(flat)["cut_year"] is None
+
+    def t_f2_missing_years_is_no_data():
+        """연도 데이터가 모자라면 '연속성 미달'이 아니라 판정 불가다."""
+        short = _years(400.0, years=3)
+        m = _one(short)
+        assert m["failed_at"] == "F2" and m["no_data"] is True, m
+
+    def t_f3_boundary():
+        """성향 80.0% 통과 / 80.01% 탈락 / 0% 탈락 / None 판정 불가."""
+        assert _one(_years(400.0, payout=80.0))["passed"] is True
+        bad = _one(_years(400.0, payout=80.01))
+        assert bad["failed_at"] == "F3" and bad["no_data"] is False, bad
+        zero = _one(_years(400.0, payout=0.0))
+        assert zero["failed_at"] == "F3" and zero["no_data"] is False, zero
+        nod = _one(_years(400.0, payout=None))
+        assert nod["failed_at"] == "F3" and nod["no_data"] is True, nod
+
+    def t_f4_boundary():
+        """FCF == 배당총액 통과 / 1원 부족하면 탈락 / 없으면 판정 불가."""
+        eq = _one(_years(400.0, fcf=100 * WON, total=100 * WON))
+        assert eq["passed"] is True, (eq["failed_at"], eq["reason"])
+        short = _one(_years(400.0, fcf=100 * WON - 1.0, total=100 * WON))
+        assert short["failed_at"] == "F4" and short["no_data"] is False, short
+        nod = _one(_years(400.0, fcf=None))
+        assert nod["failed_at"] == "F4" and nod["no_data"] is True, nod
+
+    def t_f5_loss_year():
+        """5년 중 한 해라도 적자면 탈락. 결측이면 판정 불가."""
+        loss = _years(400.0, per_year={BASE - 2: {"net_income": -1.0}})
+        m = _one(loss)
+        assert m["failed_at"] == "F5" and m["no_data"] is False, m
+        assert str(BASE - 2) in m["reason"], m["reason"]
+        gone = _years(400.0, per_year={BASE - 2: {"net_income": None}})
+        m2 = _one(gone)
+        assert m2["failed_at"] == "F5" and m2["no_data"] is True, m2
+
+    def t_f6_median():
+        """PER 이 업종 중앙값 이하면 통과. 초과면 탈락."""
+        yrs = _years(400.0, ni=1000 * WON)
+        # 시가총액 10,000억 / 순이익 1,000억 -> PER 10
+        m = _one(yrs, cap=10_000 * WON, med=10.0)
+        near(m["per"], 10.0, label="PER")
+        assert m["passed"] is True, (m["failed_at"], m["reason"])
+        bad = _one(yrs, cap=10_000 * WON, med=9.99)
+        assert bad["failed_at"] == "F6" and bad["no_data"] is False, bad
+
+    def t_f6_pbr_always_skipped():
+        """F6 은 판정 불가면 스킵이다. 스킵 사실을 반드시 남긴다.
+
+        PBR 은 구할 수 없으므로 항상 스킵이다. PER 도 시가총액이나 업종
+        중앙값이 없으면 스킵한다 — 탈락으로 세면 '비싸서 떨어졌다'와
+        '데이터가 없어서 떨어졌다'가 F6 칸에 섞인다.
+        """
+        m = _one(_years(400.0))
+        assert "F6-PBR" in m["skipped"], m["skipped"]
+        assert "F6-PER" not in m["skipped"], "PER 이 있는데 스킵으로 적었다"
+        for label, kw in (("중앙값 없음", {"med": None}),
+                          ("시가총액 없음", {"cap": None})):
+            m2 = _one(_years(400.0), **kw)
+            assert m2["passed"] is True, (label, m2["failed_at"], m2["reason"])
+            assert "F6-PER" in m2["skipped"], (label, m2["skipped"])
+
+    def t_short_circuit():
+        """F1 과 F3 을 동시에 못 맞추면 F1 만 기록한다 (깔때기 합계 보존)."""
+        m = _one(_years(100.0, payout=95.0))
+        assert m["failed_at"] == "F1", m
+        assert set(k for k, _ in FILTERS) == {"F1", "F2", "F3", "F4",
+                                             "F5", "F6"}
+
+    def t_per_of():
+        near(per_of(1000.0, 100.0), 10.0, label="PER")
+        assert per_of(1000.0, -1.0) is None, "적자에 PER 을 매겼다"
+        assert per_of(1000.0, 0.0) is None
+        assert per_of(None, 100.0) is None
+        assert per_of(float("nan"), 100.0) is None
+
+    def t_sector_medians():
+        per = {"A0": 10.0, "B0": 20.0, "C0": 30.0, "D0": 40.0, "E0": 50.0,
+               "X0": 1.0, "Y0": 2.0, "Z0": 3.0}
+        sec = {"A0": "반도체", "B0": "반도체", "C0": "반도체",
+               "D0": "반도체", "E0": "반도체",
+               "X0": "조선", "Y0": "조선", "Z0": "조선"}
+        med = sector_per_medians(per, sec, min_members=5)
+        near(med["반도체"], 30.0, label="홀수 중앙값")
+        assert "조선" not in med, "표본 3종목 업종에 중앙값을 만들었다"
+        # 짝수 표본
+        per4 = {"A0": 10.0, "B0": 20.0, "C0": 30.0, "D0": 40.0}
+        sec4 = {k: "반도체" for k in per4}
+        near(sector_per_medians(per4, sec4, min_members=4)["반도체"], 25.0,
+             label="짝수 중앙값")
+        # 미분류는 집계하지 않는다
+        unk = sector_per_medians({"A0": 10.0} | per4,
+                                 {"A0": "미분류"} | sec4, min_members=1)
+        assert "미분류" not in unk, unk
+
+    def t_ranking_and_top_n():
+        """통과 종목은 수익률 내림차순, 상위 top_n 만 반환."""
+        s = Store(tmp / "divscr.db")
+        cfg = Config(dividend=DividendConfig(top_n=3))
+        tickers, prices = [], {}
+        for i in range(6):
+            code = "%05d0" % i
+            tickers.append({"ticker": code, "name": f"종목{i}",
+                            "market": "KOSPI", "sector": "반도체",
+                            "market_cap": 10_000 * WON, "shares": 1e6})
+            prices[code] = 10_000.0
+            rows = []
+            for y in range(BASE - 4, BASE + 1):
+                rows.append({"code": code, "fiscal_year": y,
+                             "dps": 300.0 + i * 50.0,
+                             "total_dividend": 100 * WON,
+                             "net_income": 1000 * WON, "payout_ratio": 50.0,
+                             "ocf": 600 * WON, "capex": 100 * WON,
+                             "fcf": 500 * WON, "status": "paid",
+                             "settle_dt": f"{y}-12-31"})
+            s.upsert_dividends(rows)
+        s.upsert_tickers(tickers)
+        idx = pd.DatetimeIndex([datetime(2026, 8, 31)])
+        for code, px in prices.items():
+            s.upsert_prices(code, pd.DataFrame(
+                {"시가": [px], "고가": [px], "저가": [px], "종가": [px],
+                 "거래량": [1000.0]}, index=idx), allow_today=True)
+
+        res = screen_dividends(s, cfg=cfg, base_year=BASE,
+                               trade_date="2026-08-31")
+        assert res["evaluated"] == 6, res
+        assert res["passed"] == 6, (res["passed"], res["funnel"])
+        assert len(res["top"]) == 3, "top_n 이 적용되지 않았다"
+        ys = [r["div_yield"] for r in res["top"]]
+        assert ys == sorted(ys, reverse=True), ys
+        near(ys[0], 5.5, label="1위 수익률")
+        assert res["top"][0]["rank"] == 1, res["top"][0]
+
+        stored = s.upsert_dividend_screen(res["rows"])
+        assert stored == 6, stored
+        fun = s.dividend_screen_funnel("2026-08-31")
+        assert fun["evaluated"] == 6 and fun["passed"] == 6, fun
+        got = s.dividend_screen_on("2026-08-31", passed_only=True)
+        assert len(got) == 6 and int(got.iloc[0]["rank"]) == 1, got.head()
+        assert "F6-PBR" in str(got.iloc[0]["skipped"]), got.iloc[0]["skipped"]
+
+    def t_funnel_sums():
+        """깔때기 합계 + 통과 = 평가 수. 순차 단락이라 중복이 없어야 한다."""
+        s = Store(tmp / "divfun.db")
+        tickers = []
+        idx = pd.DatetimeIndex([datetime(2026, 8, 31)])
+        # 0: 통과 / 1: F1 탈락 / 2: F3 탈락 / 3: F4 탈락
+        plan = [(400.0, 50.0, 500 * WON), (100.0, 50.0, 500 * WON),
+                (400.0, 95.0, 500 * WON), (400.0, 50.0, 1.0)]
+        for i, (dps, payout, fcf) in enumerate(plan):
+            code = "%05d0" % i
+            tickers.append({"ticker": code, "name": f"종목{i}",
+                            "market": "KOSPI", "sector": "반도체",
+                            "market_cap": 10_000 * WON, "shares": 1e6})
+            s.upsert_dividends([
+                {"code": code, "fiscal_year": y, "dps": dps,
+                 "total_dividend": 100 * WON, "net_income": 1000 * WON,
+                 "payout_ratio": payout, "ocf": None, "capex": None,
+                 "fcf": fcf, "status": "paid", "settle_dt": f"{y}-12-31"}
+                for y in range(BASE - 4, BASE + 1)])
+            s.upsert_prices(code, pd.DataFrame(
+                {"시가": [10_000.0], "고가": [10_000.0], "저가": [10_000.0],
+                 "종가": [10_000.0], "거래량": [1000.0]}, index=idx),
+                allow_today=True)
+        s.upsert_tickers(tickers)
+        res = screen_dividends(s, base_year=BASE, trade_date="2026-08-31")
+        assert res["evaluated"] == 4, res
+        assert res["passed"] == 1, (res["passed"], res["funnel"])
+        assert res["funnel"]["F1"] == 1, res["funnel"]
+        assert res["funnel"]["F3"] == 1, res["funnel"]
+        assert res["funnel"]["F4"] == 1, res["funnel"]
+        assert sum(res["funnel"].values()) + res["passed"] == 4, res["funnel"]
+
+    def t_price_from_trade_date_not_last_row():
+        """현재가는 기준일 행에서 뽑아야 한다. 행렬 마지막 행이 아니다.
+
+        `last_price_date()` 는 부분 적재된 날짜를 건너뛴다. 그래서 가격
+        행렬의 마지막 행이 기준일이 아닐 수 있다. 장중에 일부만 들어온
+        날의 값으로 수익률을 계산하면 에러 없이 조용히 틀린다.
+        """
+        s = Store(tmp / "divpx.db")
+        codes = ["%05d0" % i for i in range(4)]
+        s.upsert_tickers([{"ticker": c, "name": f"종목{c}", "market": "KOSPI",
+                           "sector": "반도체", "market_cap": 10_000 * WON,
+                           "shares": 1e6} for c in codes])
+        for c in codes:
+            s.upsert_dividends([
+                {"code": c, "fiscal_year": y, "dps": 400.0,
+                 "total_dividend": 100 * WON, "net_income": 1000 * WON,
+                 "payout_ratio": 50.0, "ocf": None, "capex": None,
+                 "fcf": 500 * WON, "status": "paid", "settle_dt": f"{y}-12-31"}
+                for y in range(BASE - 4, BASE + 1)])
+
+        def _px(code, day, px):
+            s.upsert_prices(code, pd.DataFrame(
+                {"시가": [px], "고가": [px], "저가": [px], "종가": [px],
+                 "거래량": [1000.0]}, index=pd.DatetimeIndex([day])),
+                allow_today=True)
+
+        full, partial = datetime(2026, 8, 27), datetime(2026, 8, 28)
+        for c in codes:
+            _px(c, full, 10_000.0)          # 전 종목 -> 완전한 날
+        _px(codes[0], partial, 40_000.0)    # 1종목만 -> 부분 적재된 날
+
+        assert s.last_price_date() == "2026-08-27", s.last_price_date()
+        pm = s.price_matrix(days=5)
+        assert str(pm.index[-1])[:10] == "2026-08-28", pm.index
+        res = screen_dividends(s, base_year=BASE)
+        assert res["scan_date"] == "2026-08-27", res["scan_date"]
+        assert res["priced"] == 4, res.get("priced")
+        # 부분 적재일(40,000원)을 썼다면 수익률 1.0% 로 F1 에서 떨어진다
+        assert res["passed"] == 4, (res["passed"], res["funnel"])
+        for r in res["rows"]:
+            near(r["price"], 10_000.0, label=f"{r['code']} 현재가")
+
+    def t_missing_trade_date_prices():
+        """기준일 시세가 행렬에 없으면 다른 날 값으로 대신하지 않는다."""
+        s = Store(tmp / "divpx2.db")
+        s.upsert_tickers([{"ticker": "005930", "name": "삼성전자",
+                           "market": "KOSPI", "sector": "반도체",
+                           "market_cap": 10_000 * WON, "shares": 1e6}])
+        s.upsert_dividends([
+            {"code": "005930", "fiscal_year": y, "dps": 400.0,
+             "total_dividend": 100 * WON, "net_income": 1000 * WON,
+             "payout_ratio": 50.0, "ocf": None, "capex": None,
+             "fcf": 500 * WON, "status": "paid", "settle_dt": f"{y}-12-31"}
+            for y in range(BASE - 4, BASE + 1)])
+        s.upsert_prices("005930", pd.DataFrame(
+            {"시가": [10_000.0], "고가": [10_000.0], "저가": [10_000.0],
+             "종가": [10_000.0], "거래량": [1000.0]},
+            index=pd.DatetimeIndex([datetime(2026, 8, 27)])),
+            allow_today=True)
+        res = screen_dividends(s, base_year=BASE, trade_date="2026-08-20")
+        assert res["priced"] == 0, res.get("priced")
+        assert res["funnel"]["F1"] == 1 and res["no_data"]["F1"] == 1, res
+
+    def t_collect_isolated():
+        """하루 1회 스킵 + 실패를 삼킨다."""
+        s = Store(tmp / "divscr2.db")
+        # 배당 데이터가 없으면 조용히 이유만 남긴다
+        out = collect_dividend_screen(s, base_year=BASE,
+                                      trade_date="2026-08-31")
+        assert out["reason"] == "no_dividends", out
+        assert out["stored"] == 0 and "error" not in out, out
+
+        class Boom:
+            path = s.path
+
+            def __getattr__(self, name):
+                raise RuntimeError("일부러 터뜨림")
+
+        out2 = collect_dividend_screen(Boom(), trade_date="2026-08-31")
+        assert "error" in out2 and out2["stored"] == 0, out2
+
+    def t_screen_skip_once_a_day():
+        s = Store(tmp / "divscr3.db")
+        idx = pd.DatetimeIndex([datetime(2026, 8, 31)])
+        s.upsert_tickers([{"ticker": "005930", "name": "삼성전자",
+                           "market": "KOSPI", "sector": "반도체",
+                           "market_cap": 10_000 * WON, "shares": 1e6}])
+        s.upsert_dividends([
+            {"code": "005930", "fiscal_year": y, "dps": 400.0,
+             "total_dividend": 100 * WON, "net_income": 1000 * WON,
+             "payout_ratio": 50.0, "ocf": None, "capex": None,
+             "fcf": 500 * WON, "status": "paid", "settle_dt": f"{y}-12-31"}
+            for y in range(BASE - 4, BASE + 1)])
+        s.upsert_prices("005930", pd.DataFrame(
+            {"시가": [10_000.0], "고가": [10_000.0], "저가": [10_000.0],
+             "종가": [10_000.0], "거래량": [1000.0]}, index=idx),
+            allow_today=True)
+        first = collect_dividend_screen(s, base_year=BASE,
+                                       trade_date="2026-08-31")
+        assert first["stored"] == 1 and first["skipped"] is False, first
+        second = collect_dividend_screen(s, base_year=BASE,
+                                         trade_date="2026-08-31")
+        assert second["skipped"] is True and second["stored"] == 0, second
+        forced = collect_dividend_screen(s, base_year=BASE,
+                                         trade_date="2026-08-31", force=True)
+        assert forced["stored"] == 1, forced
+
+    def t_config_constants():
+        """임계값이 config 한 곳에 있어야 한다."""
+        from stocknews.config import (DIV_MAX_PAYOUT, DIV_MIN_YEARS,
+                                      DIV_MIN_YIELD, DIV_TOP_N)
+        assert DIV_MIN_YIELD == 3.0 and DIV_MIN_YEARS == 5
+        assert DIV_MAX_PAYOUT == 80.0 and DIV_TOP_N == 15
+        d = DEFAULT.dividend
+        assert (d.min_yield, d.min_years, d.max_payout, d.top_n) == \
+            (DIV_MIN_YIELD, DIV_MIN_YEARS, DIV_MAX_PAYOUT, DIV_TOP_N)
+        # frozen 이어야 실행 중 임계값이 바뀌지 않는다
+        try:
+            d.min_yield = 1.0
+        except Exception:
+            pass
+        else:
+            raise AssertionError("DividendConfig 가 frozen 이 아니다")
+
+    def t_record_only_boundary():
+        """필터 엔진이 채점·알림 경로를 참조하지 않아야 한다."""
+        src = (Path(__file__).parent / "stocknews" / "dividend_screen.py"
+               ).read_text(encoding="utf-8")
+        for bad in ("from .screener", "from .liquidation", "from .exits",
+                    "from .renderer", "from .notify", "from .weekly",
+                    "from .daily"):
+            assert bad not in src, f"dividend_screen 이 {bad} 를 참조한다"
+        # 반대 방향도 확인: 채점 쪽이 배당을 끌어다 쓰면 안 된다
+        for mod in ("screener.py", "liquidation.py", "daily.py", "exits.py"):
+            other = (Path(__file__).parent / "stocknews" / mod
+                     ).read_text(encoding="utf-8")
+            assert "dividend" not in other, f"{mod} 가 배당을 참조한다"
+
+    check("dividend-screen", "기준 픽스처 전 필터 통과", t_base_passes)
+    check("dividend-screen", "F1 경계 (3.00% / 2.90%)", t_f1_boundary)
+    check("dividend-screen", "F1 현재가 없음 = 판정 불가",
+          t_f1_no_price_is_no_data)
+    check("dividend-screen", "F2 경계 (5년 / 4년)", t_f2_boundary)
+    check("dividend-screen", "F2 감액 탐지", t_f2_cut_detected)
+    check("dividend-screen", "F2 연도 부족 = 판정 불가",
+          t_f2_missing_years_is_no_data)
+    check("dividend-screen", "F3 경계 (80.0% / 80.01% / 0)", t_f3_boundary)
+    check("dividend-screen", "F4 경계 (FCF == 배당총액)", t_f4_boundary)
+    check("dividend-screen", "F5 적자 연도 / 결측", t_f5_loss_year)
+    check("dividend-screen", "F6 업종 중앙값 경계", t_f6_median)
+    check("dividend-screen", "F6 PBR 스킵 기록", t_f6_pbr_always_skipped)
+    check("dividend-screen", "순차 단락 (첫 탈락만 기록)", t_short_circuit)
+    check("dividend-screen", "PER 산출 (적자 None)", t_per_of)
+    check("dividend-screen", "업종 중앙값 (홀짝·표본·미분류)",
+          t_sector_medians)
+    check("dividend-screen", "수익률 정렬 + 상위 N", t_ranking_and_top_n)
+    check("dividend-screen", "깔때기 합계 = 평가 수", t_funnel_sums)
+    check("dividend-screen", "현재가 = 기준일 행 (부분적재 방어)",
+          t_price_from_trade_date_not_last_row)
+    check("dividend-screen", "기준일 시세 없으면 대체 금지",
+          t_missing_trade_date_prices)
+    check("dividend-screen", "수집기 격리 (실패 삼킴)", t_collect_isolated)
+    check("dividend-screen", "하루 1회 + --force", t_screen_skip_once_a_day)
+    check("dividend-screen", "임계값 config 이관 + frozen", t_config_constants)
+    check("dividend-screen", "채점 경로 미참조 (양방향)",
+          t_record_only_boundary)
+
+
 def test_docs():
     """라이선스와 면책 조항이 있어야 한다. 금융 코드의 필수 요건이다."""
     root = Path(__file__).parent
@@ -5705,6 +6129,7 @@ def main() -> int:
         test_kiwoom(tmp)
         test_kiwoom_rest(tmp)
         test_dividends(tmp)
+        test_dividend_screen(tmp)
         test_docs()
         test_env(tmp)
         test_joblock(tmp)

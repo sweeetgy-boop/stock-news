@@ -312,6 +312,34 @@ class SectorConfig:
     persist_top_fraction: float = 1.0 / 3.0   # 상위 이 비율이면 '상위권'
 
 
+# 배당주 필터 상수. 단계별 탈락 사유를 기록하려면 임계값이 코드 한 곳에
+# 모여 있어야 한다. 필터가 빡빡한지 판단할 때 고칠 곳이 여기 하나다.
+DIV_MIN_YIELD = 3.0      # F1 배당수익률 하한(%)
+DIV_MIN_YEARS = 5        # F2 연속 배당 연수 (감액 없음 포함)
+DIV_MAX_PAYOUT = 80.0    # F3 배당성향 상한(%)
+DIV_TOP_N = 15           # 리포트 상위 N
+# F6 업종 중앙값 비교에 필요한 최소 표본. 업종에 3종목만 있으면 중앙값이
+# 사실상 자기 자신이라 필터가 의미를 잃는다. 그때는 F6 을 스킵한다.
+DIV_SECTOR_MIN_MEMBERS = 5
+
+
+@dataclass(frozen=True)
+class DividendConfig:
+    """배당주 필터 파라미터.
+
+    **이 값들은 검증되지 않은 초기 설정이다.** 배당수익률 3%·성향 80%·
+    5년 연속은 흔히 쓰이는 관행값이고, 이 저장소의 채점 표본으로 검증한
+    수치가 아니다. 그래서 통과 종목이 0개로 나와도 상수를 먼저 완화하지
+    않는다 — 몇 개가 어느 필터에서 떨어졌는지를 먼저 본다.
+    """
+
+    min_yield: float = DIV_MIN_YIELD
+    min_years: int = DIV_MIN_YEARS
+    max_payout: float = DIV_MAX_PAYOUT
+    top_n: int = DIV_TOP_N
+    sector_min_members: int = DIV_SECTOR_MIN_MEMBERS
+
+
 @dataclass(frozen=True)
 class Config:
     ma: MAConfig = MAConfig()
@@ -322,6 +350,7 @@ class Config:
     audit: AuditConfig = AuditConfig()
     sector: SectorConfig = SectorConfig()
     news_freq: NewsFreqConfig = NewsFreqConfig()
+    dividend: DividendConfig = DividendConfig()
 
 
 DEFAULT = Config()

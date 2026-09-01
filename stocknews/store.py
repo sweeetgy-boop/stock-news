@@ -368,6 +368,47 @@ CREATE TABLE IF NOT EXISTS dividends (
   PRIMARY KEY (code, fiscal_year)
 );
 CREATE INDEX IF NOT EXISTS ix_div_year ON dividends(fiscal_year);
+
+-- 배당주 필터 판정. **통과와 탈락을 모두 남긴다.**
+--
+-- 통과 종목만 저장하면 '필터가 빡빡한가'를 판단할 근거가 없다.
+-- `failed_at` 은 처음 걸린 필터(F1~F6)이고 통과면 NULL 이다. 필터는
+-- 순차 단락이므로 종목마다 칸이 하나뿐이고, 그래서 깔때기 합계가 맞는다.
+--
+-- `reason` 이 '조건 미달'과 '판정 불가(데이터 없음)'를 구분한다. 둘을
+-- 섞으면 '수집이 덜 됐다'와 '조건이 빡빡하다'를 구분할 수 없다.
+--
+-- `skipped` 는 적용하지 못한 조건이다. PBR 은 이 저장소에서 구할 수
+-- 없어 항상 F6-PBR 이 들어간다 (자본총계가 없고 FDR 스냅샷에 BPS·PBR
+-- 컬럼이 없다). 스킵을 통과로 적으면 근거가 거짓이 된다.
+--
+-- `scan_date` 는 **거래일**이다 (price 의 기준일). fiscal_year 는 배당
+-- 실적의 사업연도이고 축이 다르다.
+CREATE TABLE IF NOT EXISTS dividend_screen (
+  scan_date         TEXT NOT NULL,
+  code              TEXT NOT NULL,
+  name              TEXT,
+  fiscal_year       INTEGER,
+  price             REAL,
+  dps               REAL,
+  div_yield         REAL,     -- %
+  years_paid        INTEGER,
+  payout            REAL,     -- %
+  fcf               REAL,
+  total_dividend    REAL,
+  per               REAL,
+  sector            TEXT,
+  sector_per_median REAL,
+  passed            INTEGER,  -- 1 통과
+  failed_at         TEXT,     -- F1..F6 / 통과면 NULL
+  reason            TEXT,
+  no_data           INTEGER,  -- 1 이면 조건 미달이 아니라 판정 불가
+  skipped           TEXT,
+  rank              INTEGER,  -- 통과 종목만. 수익률 내림차순
+  created_at        TEXT,
+  PRIMARY KEY (scan_date, code)
+);
+CREATE INDEX IF NOT EXISTS ix_divscr_date ON dividend_screen(scan_date);
 """
 
 _COLS = {"o": "시가", "h": "고가", "l": "저가", "c": "종가",
@@ -1338,6 +1379,78 @@ class Store:
         return {"active": int(active), "fiscal_year": int(fiscal_year),
                 "collected": int(got), "paid": int(paid),
                 "no_dividend": int(none_n), "asof": newest}
+
+    # ── 배당 필터 판정 ──
+    _DIVSCR_COLS = ("scan_date", "code", "name", "fiscal_year", "price",
+                    "dps", "div_yield", "years_paid", "payout", "fcf",
+                    "total_dividend", "per", "sector", "sector_per_median",
+                    "passed", "failed_at", "reason", "no_data", "skipped",
+                    "rank")
+
+    def has_dividend_screen(self, d) -> bool:
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM dividend_screen WHERE scan_date=? LIMIT 1",
+                (_d(d),)).fetchone()
+        return row is not None
+
+    def upsert_dividend_screen(self, rows: list[dict]) -> int:
+        """필터 판정 다건. 같은 (거래일, 종목) 은 덮어쓴다."""
+        if not rows:
+            return 0
+        now = _now_str()
+        payload = []
+        for r in rows:
+            vals = [r.get(c) for c in self._DIVSCR_COLS]
+            vals[0] = _d(vals[0])
+            # bool 을 그대로 넣으면 sqlite 가 0/1 로 저장하긴 하지만,
+            # None(판정 안 함)과 False 를 구분하려면 명시적으로 바꾼다.
+            for i in (14, 17):
+                vals[i] = None if vals[i] is None else int(bool(vals[i]))
+            payload.append((*vals, now))
+        marks = ",".join("?" * (len(self._DIVSCR_COLS) + 1))
+        sets = ",".join(f'"{c}"=excluded."{c}"'
+                        for c in self._DIVSCR_COLS[2:])
+        cols = ",".join(f'"{c}"' for c in self._DIVSCR_COLS)
+        with closing(self._conn()) as con:
+            con.executemany(
+                f"INSERT INTO dividend_screen({cols},created_at) "
+                f"VALUES({marks}) ON CONFLICT(scan_date,code) DO UPDATE SET "
+                f"{sets},created_at=excluded.created_at", payload)
+            con.commit()
+        return len(payload)
+
+    def dividend_screen_on(self, d, passed_only: bool = False) -> pd.DataFrame:
+        """그 거래일 필터 결과. 통과분은 순위 순, 탈락분은 코드 순."""
+        sql = "SELECT * FROM dividend_screen WHERE scan_date=?"
+        if passed_only:
+            sql += " AND passed=1"
+        sql += ' ORDER BY passed DESC, "rank", code'
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(sql, con, params=(_d(d),))
+
+    def dividend_screen_funnel(self, d) -> dict:
+        """`{필터: {"failed": n, "no_data": n}}` + 통과/평가 수.
+
+        필터가 빡빡한지 판단할 근거다. 순차 단락이라 각 칸이 '여기서
+        처음 떨어진 수'를 뜻하고, 합계 + 통과 = 평가 수가 된다.
+        """
+        with closing(self._conn()) as con:
+            total = con.execute(
+                "SELECT COUNT(*) FROM dividend_screen WHERE scan_date=?",
+                (_d(d),)).fetchone()[0]
+            passed = con.execute(
+                "SELECT COUNT(*) FROM dividend_screen WHERE scan_date=? "
+                "AND passed=1", (_d(d),)).fetchone()[0]
+            rows = con.execute(
+                "SELECT failed_at, SUM(1), SUM(COALESCE(no_data,0)) "
+                "FROM dividend_screen WHERE scan_date=? AND failed_at "
+                "IS NOT NULL GROUP BY failed_at ORDER BY failed_at",
+                (_d(d),)).fetchall()
+        return {"scan_date": _d(d), "evaluated": int(total),
+                "passed": int(passed),
+                "by_filter": {str(f): {"failed": int(n), "no_data": int(nd)}
+                              for f, n, nd in rows}}
 
     def news_theme_counts(self, days: int = 14) -> pd.DataFrame:
         """일자 x 카테고리 건수. 주간 테마 부침 분석용."""
