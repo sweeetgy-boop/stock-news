@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS positions (
   qty            INTEGER NOT NULL,
   remaining      INTEGER NOT NULL,
   -- 진입 시점 스냅샷. 절대 재계산하지 않는다.
+  stop_price     REAL,              -- 진입 시 확정. 청산 판정은 이 값만 본다
   entry_p0       REAL,
   entry_band_hi  REAL,
   entry_band_mid REAL,
@@ -293,6 +294,7 @@ class Store:
     # 않는다. 스키마가 늘어날 때마다 여기에 한 줄씩 넣는다.
     _MIGRATIONS = (
         ("flags", "capital_impair_at", "TEXT"),
+        ("positions", "stop_price", "REAL"),
     )
 
     def _init(self) -> None:
@@ -709,7 +711,7 @@ class Store:
     # ────────────────────────── 포지션 ──────────────────────────
     _POS_COLS = (
         "id", "ticker", "name", "track", "entry_date", "entry_price", "qty",
-        "remaining", "entry_p0", "entry_band_hi", "entry_band_mid",
+        "remaining", "stop_price", "entry_p0", "entry_band_hi", "entry_band_mid",
         "entry_band_lo", "entry_fib_0382", "entry_fib_0618", "entry_cross_low",
         "entry_credit_ratio", "exits_done", "peak_close", "band_break_streak",
         "ma_break_streak", "defer_until", "status", "opened_by", "note",
@@ -717,6 +719,7 @@ class Store:
 
     def open_position(self, ticker: str, name: str, track: str,
                       entry_date, entry_price: float, qty: int,
+                      stop_price: float,
                       snapshot: dict | None = None,
                       opened_by: str = "manual", note: str = "") -> int:
         """포지션 개시. snapshot 의 밴드/피보 값이 청산선의 기준이 된다.
@@ -724,21 +727,39 @@ class Store:
         여기서 저장한 값은 이후 절대 갱신하지 않는다. 매일 P0 를 다시
         계산하면 주가 하락에 맞춰 손절선도 내려가 손절이 영원히 발동하지
         않는다. 계좌를 녹이는 전형적인 방식이다.
+
+        `stop_price` 는 필수다. 기본값을 주지 않은 것은 의도다. 손절선
+        없는 포지션을 만들 수 있으면 언젠가 만들게 되고, 그 포지션은
+        계층 1 판정에서 조용히 빠진다. 값은 `exits.stop_price_for()` 로
+        계산한다(진입가 대비 `STOP_LOSS_PCT`).
         """
+        if stop_price is None:
+            raise ValueError(
+                "stop_price 는 필수입니다. 진입 시 손절선을 기록하지 않으면 "
+                "청산 판정에서 그 포지션이 조용히 빠집니다.")
+        sp = float(stop_price)
+        ep = float(entry_price)
+        if not (sp > 0):
+            raise ValueError(f"stop_price 가 양수가 아닙니다: {sp}")
+        if sp >= ep:
+            raise ValueError(
+                f"stop_price({sp:,.0f}) 가 진입가({ep:,.0f}) 이상입니다. "
+                f"진입 즉시 손절이 발동합니다.")
+
         s = snapshot or {}
         with closing(self._conn()) as con:
             cur = con.execute(
                 "INSERT INTO positions(ticker,name,track,entry_date,entry_price,"
-                "qty,remaining,entry_p0,entry_band_hi,entry_band_mid,"
+                "qty,remaining,stop_price,entry_p0,entry_band_hi,entry_band_mid,"
                 "entry_band_lo,entry_fib_0382,entry_fib_0618,entry_cross_low,"
                 "entry_credit_ratio,exits_done,peak_close,status,opened_by,"
-                "note,updated) VALUES(" + ",".join("?" * 21) + ")",
-                (ticker, name, track, _d(entry_date), float(entry_price),
-                 int(qty), int(qty),
+                "note,updated) VALUES(" + ",".join("?" * 22) + ")",
+                (ticker, name, track, _d(entry_date), ep,
+                 int(qty), int(qty), sp,
                  s.get("p0"), s.get("band_hi"), s.get("band_mid"),
                  s.get("band_lo"), s.get("fib_0382"), s.get("fib_0618"),
                  s.get("cross_low"), s.get("credit_ratio"),
-                 0, float(entry_price), "OPEN", opened_by, note, _now_str()))
+                 0, ep, "OPEN", opened_by, note, _now_str()))
             con.commit()
             return int(cur.lastrowid)
 

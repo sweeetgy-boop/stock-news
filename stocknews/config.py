@@ -116,6 +116,27 @@ class GateConfig:
     reco_send_dow: int = RECO_SEND_DOW  # 추천 10선 발송 요일
 
 
+# 보유기간 규칙. **거래일 기준**이다. 달력일로 세면 주말·연휴에 카운터가
+# 앞서가서, 실제로는 3거래일밖에 안 지난 포지션이 만료 처리된다.
+#
+# MIN_HOLD_DAYS  이 기간 안에는 계층 2~7(트레일링·목표·시간·순환매)을
+#                억제한다. 진입 직후의 흔들림에 반응해 나가면 그물을
+#                던진 의미가 없다. 단 계층 0(무효화)과 계층 1(손절)은
+#                억제하지 않는다 — 상장폐지 위험과 손절선 이탈을 5일간
+#                막는 것은 최소보유일 규칙이 안전장치를 무력화하는 것이다.
+# MAX_HOLD_DAYS  도달하면 '보유기간 만료 — 재평가'를 계층 0으로 낸다.
+#                진입 근거에 유효기간을 주는 장치다. 어떤 규칙도 걸리지
+#                않아 무한 보유되는 경로를 막는다.
+MIN_HOLD_DAYS = 5
+MAX_HOLD_DAYS = 20
+
+# 진입가 대비 고정 손절 비율(%). 진입 시점에 `positions.stop_price` 로
+# 확정 기록되고, 청산 판정은 그 기록된 값만 본다. 판정 시점에 다시
+# 계산하면(예: 당일 ATR 로 폭을 넓히면) 손절선이 주가를 따라 움직여
+# 손절이 영원히 발동하지 않는다.
+STOP_LOSS_PCT = 10.0
+
+
 @dataclass(frozen=True)
 class ExitConfig:
     """청산 규칙 파라미터.
@@ -126,8 +147,10 @@ class ExitConfig:
       공통           -> +15% 절반 기계적 익절만 동일
 
     우선순위(작을수록 우선). 같은 날 여러 개가 걸리면 하나만 집행한다.
-      0 무효화 / 1 손절 / 2 트레일링 / 3 목표3차 / 4 목표2차
-      5 목표1차 / 6 시간 / 7 순환매
+      0 무효화 · 보유기간 만료 / 1 손절 / 2 트레일링 / 3 목표3차
+      4 목표2차 / 5 목표1차 / 6 시간 / 7 순환매
+
+    계층 0 안의 순서는 무효화 → 보유기간 만료다. 상세는 `exits.py` 참조.
     """
 
     # ── 계층 2: 목표(익절) ──
@@ -141,11 +164,14 @@ class ExitConfig:
 
     # ── 계층 1: 손절 ──
     band_break_days: int = 3           # 밴드 하단 종가 연속 이탈 일수
-    hard_stop_pct: float = 10.0        # 밴드 외 진입 시 고정 손절(%)
+    stop_loss_pct: float = STOP_LOSS_PCT   # 진입가 대비 고정 손절(%)
     atr_window: int = 14
-    atr_mult: float = 2.0              # 밴드 외 진입 시 ATR 손절 배수
     ma_long_break_days: int = 2        # 종가가 MA60 아래 연속 일수
     cross_low_buffer_pct: float = 3.0  # 골든크로스 봉 저가 이탈 허용폭(%)
+
+    # ── 계층 0-b / 게이트: 보유기간 (거래일 기준) ──
+    min_hold_days: int = MIN_HOLD_DAYS
+    max_hold_days: int = MAX_HOLD_DAYS
 
     # ── 계층 3: 시간 ──
     time_stop_v_days: int = 15         # 트랙 V 시간 손절

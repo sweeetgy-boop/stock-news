@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 
 from .config import Config, DEFAULT
-from .contracts import ScreenResult
+from .contracts import RULE_NAME, ScreenResult
 
 __all__ = ["bar", "render_detail", "render_digest", "render_fib_list"]
 
@@ -714,10 +714,22 @@ LAYER_LABEL = {
 }
 
 
+def _dec_label(dec) -> str:
+    """계층 이름. 계층 0 은 무효화와 보유기간 만료가 공유하므로 규칙을 본다."""
+    return RULE_NAME.get(getattr(dec, "rule", ""),
+                         LAYER_LABEL.get(dec.layer, str(dec.layer)))
+
+
+def _dec_icon(dec) -> str:
+    if getattr(dec, "rule", "") == "hold:expired":
+        return "🗓"
+    return LAYER_ICON.get(dec.layer, "•")
+
+
 def render_exit_alert(dec, cfg: Config = DEFAULT) -> str:
     """청산 신호 1건. 무효화·손절은 즉시 나가야 하므로 단건 발송한다."""
-    icon = LAYER_ICON.get(dec.layer, "•")
-    label = LAYER_LABEL.get(dec.layer, str(dec.layer))
+    icon = _dec_icon(dec)
+    label = _dec_label(dec)
     act = "전량" if dec.action == "EXIT_ALL" else f"{dec.ratio * 100:.0f}% 부분"
     head = "🚨🚨 " if dec.urgent else ""
     lines = [
@@ -758,15 +770,15 @@ def render_exit_digest(res: dict, asof, cfg: Config = DEFAULT) -> str:
     out = [f"🗂 <b>[청산 판정 {len(decs)}건]</b> {res.get('trade_date') or ''}",
            f"• 보유 {n_pos}건{mtxt}", ""]
     for d in decs:
-        icon = LAYER_ICON.get(d.layer, "•")
-        label = LAYER_LABEL.get(d.layer, str(d.layer))
+        icon = _dec_icon(d)
+        label = _dec_label(d)
         act = "전량" if d.action == "EXIT_ALL" else f"{d.ratio * 100:.0f}%"
         out.append(f"{icon} <b>{_e(d.name)}</b> [{label}] {act} {d.qty:,}주")
         out.append(f"   {d.signal_price:,.0f}원 · {d.ret_pct:+.2f}%")
         out.append(f"   {_e(d.reason[:90])}")
     out.append("")
-    out.append("※ 우선순위: 무효화 > 손절 > 트레일링 > 목표3차 > 목표2차")
-    out.append("  > 목표1차 > 시간 > 순환매. 포지션당 1건만 집행합니다.")
+    out.append("※ 우선순위: 무효화 > 보유만료 > 손절 > 트레일링 > 목표3차")
+    out.append("  > 목표2차 > 목표1차 > 시간 > 순환매. 포지션당 1건만 집행합니다.")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
     return "\n".join(out)
 
@@ -788,8 +800,12 @@ def render_positions(positions: list, price_map: dict | None = None) -> str:
         out.append(f"   진입 {p.entry_date} @ {p.entry_price:,.0f}원 "
                    f"· 잔량 {p.remaining:,}/{p.qty:,}주 · {ret}")
         stops = []
+        # 손절선은 진입 시 기록된 stop_price 다. 밴드 하단을 '손절' 로
+        # 표시하면 실제 판정 기준과 다른 값을 보게 된다.
+        if p.stop_price:
+            stops.append(f"손절 {float(p.stop_price):,.0f}")
         if p.entry_band_lo:
-            stops.append(f"손절 {float(p.entry_band_lo):,.0f}")
+            stops.append(f"밴드하단 {float(p.entry_band_lo):,.0f}")
         if p.entry_band_hi:
             stops.append(f"목표 {float(p.entry_band_hi):,.0f}")
         if p.entry_fib_0382:

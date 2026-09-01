@@ -702,8 +702,10 @@ def test_store(tmp: Path):
         raise AssertionError("알 수 없는 필드인데 예외가 없음")
 
     def t_positions():
+        from stocknews.exits import stop_price_for
         pid = st.open_position(
             "000001", "급락종목", "VALUE", "2026-08-24", 455_000, 100,
+            stop_price=stop_price_for(455_000, DEFAULT),
             snapshot={"p0": 650_000, "band_hi": 546_000, "band_mid": 455_000,
                       "band_lo": 364_000, "fib_0382": 550_290,
                       "fib_0618": 454_710, "cross_low": None,
@@ -715,6 +717,7 @@ def test_store(tmp: Path):
         assert p.track == "VALUE" and p.remaining == 100
         near(p.entry_band_mid, 455_000, tol=1.0, label="스냅샷 밴드 중심")
         near(p.entry_credit_ratio, 4.2, label="진입 신용잔고율")
+        near(p.stop_price, 455_000 * 0.90, tol=1.0, label="기록된 손절선")
         assert p.in_band is True
 
     def t_state_update():
@@ -725,6 +728,28 @@ def test_store(tmp: Path):
         assert p2.band_break_streak == 2
         near(p2.entry_band_mid, 455_000, tol=1.0,
              label="상태 갱신이 스냅샷을 건드리지 않음")
+        near(p2.stop_price, 455_000 * 0.90, tol=1.0,
+             label="상태 갱신이 손절선을 건드리지 않음")
+
+    def t_open_position_requires_stop():
+        """손절선 없는 포지션은 만들 수 없어야 한다.
+
+        기본값을 주면 언젠가 빠뜨리게 되고, 그 포지션은 계층 1 판정에서
+        조용히 제외된다.
+        """
+        import inspect as _i
+        sig = _i.signature(st.open_position)
+        assert sig.parameters["stop_price"].default is _i.Parameter.empty, \
+            "stop_price 에 기본값이 있다"
+        for bad, why in ((None, "None"), (0, "0"), (-1, "음수"),
+                         (455_000, "진입가와 같음"), (500_000, "진입가보다 큼")):
+            try:
+                st.open_position("000009", "불량", "VALUE", "2026-08-24",
+                                 455_000, 10, stop_price=bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"stop_price={why} 인데 포지션이 생성됐다")
+        assert len(st.list_positions(None)) == 1, "실패한 시도가 적재됐다"
 
     def t_exit_signal_and_fill():
         from stocknews.contracts import DONE_TAKE1, ExitDecision
@@ -987,6 +1012,7 @@ def test_store(tmp: Path):
     check("store", "플래그 필드 초기화", t_flags_clear)
     check("store", "포지션 개시 + 스냅샷", t_positions)
     check("store", "파생 상태 갱신", t_state_update)
+    check("store", "손절선 없는 포지션 생성 거부", t_open_position_requires_stop)
     check("store", "청산 신호 -> 체결 2단계", t_exit_signal_and_fill)
     check("store", "포지션 종료", t_close)
     check("store", "뉴스 적재/조회", t_news)
@@ -1012,9 +1038,23 @@ def test_exits():
 
     ec = DEFAULT.exit
 
+    def _ago(bars: int) -> str:
+        """프레임 끝에서 `bars` 거래일 전. 진입일 봉을 1일로 세면 보유 = bars.
+
+        `_dates()` 는 n 과 무관하게 2026-08-24 에서 끝나므로 프레임 길이가
+        달라도 같은 날짜가 나온다.
+        """
+        return _dates(60)[-bars].strftime("%Y-%m-%d")
+
     def _pos(**kw):
+        # 보유 8거래일. MIN_HOLD_DAYS(5) 는 지났고 MAX_HOLD_DAYS(20) 은
+        # 안 됐다. 계층별 검사가 보유기간 규칙에 걸리지 않게 하려면 이
+        # 창 안에 있어야 한다. 예전 고정값("2026-01-05")은 보유 165일이라
+        # 전부 '보유기간 만료'로 잡힌다.
+        # stop_price 는 일부러 비운다. 계층 1 의 고정 손절을 끄고 나머지
+        # 계층을 독립 검증하기 위한 것이고, 고정 손절은 전용 픽스처로 본다.
         base = dict(id=1, ticker="000001", name="테스트", track="VALUE",
-                    entry_date="2026-01-05", entry_price=70_000, qty=100,
+                    entry_date=_ago(8), entry_price=70_000, qty=100,
                     remaining=100, entry_p0=100_000, entry_band_hi=84_000,
                     entry_band_mid=70_000, entry_band_lo=56_000,
                     entry_fib_0382=80_000, entry_fib_0618=70_000)
@@ -1119,11 +1159,14 @@ def test_exits():
         n = 200
         close = np.full(n, 70_100.0)      # 사실상 무변동
         df = _frame(close, spread=0.002)
-        p = _pos(entry_date=df.index[-20].strftime("%Y-%m-%d"),
+        # 보유 17일. time_stop_v_days(15) 는 넘고 max_hold_days(20) 는
+        # 안 넘어야 한다. 20 이면 '보유기간 만료'(계층 0)가 먼저 잡힌다.
+        p = _pos(entry_date=df.index[-17].strftime("%Y-%m-%d"),
                  entry_price=70_000, entry_fib_0382=999_000,
                  entry_band_hi=999_000)
         dec, st = evaluate_position(p, df, None, DEFAULT)
         assert st["bars_held"] >= ec.time_stop_v_days
+        assert st["bars_held"] < ec.max_hold_days
         assert dec is not None and dec.layer == 6, \
             f"시간 손절 미발동 (layer={dec.layer if dec else None})"
 
@@ -1135,7 +1178,7 @@ def test_exits():
         ])
         df = _frame(close, spread=0.004)
         p = _pos(track="TREND", entry_price=60_000,
-                 entry_date=df.index[-30].strftime("%Y-%m-%d"),
+                 entry_date=df.index[-15].strftime("%Y-%m-%d"),
                  entry_band_hi=None, entry_band_lo=None,
                  entry_fib_0382=None, entry_cross_low=48_000)
         dec, _ = evaluate_position(p, df, None, DEFAULT)
@@ -1148,7 +1191,7 @@ def test_exits():
                                 np.linspace(100_000, 62_000, 50)])
         df = _frame(close, spread=0.004)
         p = _pos(track="TREND", entry_price=95_000,
-                 entry_date=df.index[-40].strftime("%Y-%m-%d"),
+                 entry_date=df.index[-15].strftime("%Y-%m-%d"),
                  entry_band_hi=None, entry_band_lo=None, entry_fib_0382=None,
                  entry_cross_low=90_000)
         dec, _ = evaluate_position(p, df, None, DEFAULT)
@@ -1156,9 +1199,14 @@ def test_exits():
             f"MA60 이탈 손절 미발동 (layer={dec.layer if dec else None})"
 
     def t_no_signal():
-        """밴드 정중앙에서 조용히 있으면 아무 신호도 없어야 한다."""
-        p = _pos(entry_date=_dates(200)[-3].strftime("%Y-%m-%d"))
-        dec, _ = evaluate_position(p, _flat_at(70_000), None, DEFAULT)
+        """밴드 정중앙에서 조용히 있으면 아무 신호도 없어야 한다.
+
+        보유 8일 — 최소보유일을 지났으므로 '억제되어서' 무신호인 게 아니라
+        진짜로 걸리는 규칙이 없어서 무신호여야 한다.
+        """
+        p = _pos()
+        dec, st = evaluate_position(p, _flat_at(70_000), None, DEFAULT)
+        assert st["bars_held"] >= ec.min_hold_days, "게이트에 가려진 대조군"
         assert dec is None, f"신호가 없어야 하는데 layer={dec.layer}"
 
     def t_rotation():
@@ -1204,8 +1252,178 @@ def test_exits():
     check("exits", "추세 트레일링", t_trend_trailing)
     check("exits", "추세 MA60 이탈 손절", t_trend_ma_long_break)
     check("exits", "무신호 대조군", t_no_signal)
+    # ───────── 보유기간 계층 + 진입 시 손절 고정 ─────────
+    from stocknews.config import MAX_HOLD_DAYS, MIN_HOLD_DAYS, STOP_LOSS_PCT
+    from stocknews.exits import bars_held, stop_price_for
+
+    STOP = 70_000 * (1 - STOP_LOSS_PCT / 100.0)      # 63,000
+
+    def t_hold_anchor():
+        assert (MIN_HOLD_DAYS, MAX_HOLD_DAYS) == (5, 20), \
+            f"{MIN_HOLD_DAYS}/{MAX_HOLD_DAYS}"
+        near(STOP_LOSS_PCT, 10.0, label="STOP_LOSS_PCT")
+        assert ec.min_hold_days == MIN_HOLD_DAYS
+        assert ec.max_hold_days == MAX_HOLD_DAYS
+        near(ec.stop_loss_pct, STOP_LOSS_PCT, label="config 배선")
+        near(stop_price_for(100_000, DEFAULT), 90_000, tol=1e-9,
+             label="손절선 = 진입가 -10%")
+        assert MIN_HOLD_DAYS < MAX_HOLD_DAYS, "두 규칙이 서로를 무력화한다"
+
+    def t_bars_held_is_trading_days():
+        """보유 일수는 봉 개수다. 달력일로 세면 주말에 앞서간다."""
+        df = _flat_at(70_000)
+        for want in (1, 3, 8, 20):
+            p = _pos(entry_date=_ago(want))
+            assert bars_held(p, df) == want, \
+                f"{want}거래일 기대, 실제 {bars_held(p, df)}"
+        # 8거래일 전은 달력으로는 11일 전이다 (주말 2일 + 1)
+        d0 = datetime.strptime(_ago(8), "%Y-%m-%d")
+        d1 = datetime.strptime(_ago(1), "%Y-%m-%d")
+        assert (d1 - d0).days > 8, "픽스처에 주말이 안 끼었다"
+
+    def t_min_hold_stop_fires():
+        """최소보유일 이전에도 손절(계층 1)은 발동해야 한다."""
+        p = _pos(entry_date=_ago(3), stop_price=STOP)
+        dec, st = evaluate_position(p, _flat_at(60_000), None, DEFAULT)
+        assert st["bars_held"] < ec.min_hold_days, "픽스처가 최소보유일을 넘었다"
+        assert dec is not None and dec.layer == 1, \
+            f"최소보유일 내 손절 미발동 (layer={dec.layer if dec else None})"
+        assert dec.rule == "stop:fixed", dec.rule
+        assert dec.action == "EXIT_ALL" and dec.urgent is True
+
+    def t_min_hold_allows_invalidation():
+        """계층 0 무효화도 억제 대상이 아니다. 상장폐지 위험을 미룰 수 없다."""
+        p = _pos(entry_date=_ago(3), stop_price=STOP)
+        dec, _ = evaluate_position(p, _flat_at(70_000),
+                                   {"000001": {"관리종목": True}}, DEFAULT)
+        assert dec is not None and dec.layer == 0, \
+            f"최소보유일 내 무효화가 억제됐다 (layer={dec.layer if dec else None})"
+
+    def t_min_hold_suppresses_targets():
+        """최소보유일 이전에는 계층 2~7 이 전부 억제된다 (+ 대조군)."""
+        df = _flat_at(70_000 * 1.16)          # +16% -> 계층 5 조건 성립
+        kw = dict(entry_fib_0382=999_000, entry_band_hi=999_000,
+                  stop_price=STOP)
+        early, _ = evaluate_position(_pos(entry_date=_ago(3), **kw),
+                                     df, None, DEFAULT)
+        assert early is None, \
+            f"최소보유일 내 익절이 발동했다 (layer={early.layer if early else None})"
+        # 대조군: 같은 조건, 보유일만 넘김
+        late, st = evaluate_position(_pos(entry_date=_ago(8), **kw),
+                                     df, None, DEFAULT)
+        assert st["bars_held"] >= ec.min_hold_days
+        assert late is not None and late.layer == 5, \
+            f"대조군에서 익절이 안 났다 (layer={late.layer if late else None})"
+
+    def t_min_hold_suppresses_rotation():
+        """순환매(계층 7)도 억제 대상이다 (+ 대조군)."""
+        hot = np.full(60, 10_000.0)
+        hot[-1] = 11_200.0                    # +12%
+        cold = np.full(60, 10_000.0)
+        cold[-1] = 9_400.0                    # -6%  => 편차 18%
+        pmap = {"000001": _frame(hot, spread=0.002),
+                "000002": _frame(cold, spread=0.002)}
+        young = [_pos(id=1, ticker="000001", entry_price=10_000,
+                      entry_date=_ago(3)),
+                 _pos(id=2, ticker="000002", entry_price=10_000)]
+        assert evaluate_rotation(young, pmap, DEFAULT) == [], \
+            "최소보유일 미달 종목이 순환매로 청산됐다"
+        # 대조군: 급등 종목만 보유일을 넘김
+        old = [_pos(id=1, ticker="000001", entry_price=10_000,
+                    entry_date=_ago(8)),
+               _pos(id=2, ticker="000002", entry_price=10_000)]
+        decs = evaluate_rotation(old, pmap, DEFAULT)
+        assert len(decs) == 1 and decs[0].layer == 7, \
+            f"대조군에서 순환매가 안 났다 ({len(decs)}건)"
+
+    def t_max_hold_expiry():
+        """최대 보유일 도달 시 만료 신호. 계층 0, 규칙 hold:expired."""
+        df = _flat_at(70_000 * 1.05)          # +5%. 다른 계층 조건 미성립
+        kw = dict(entry_fib_0382=999_000, entry_band_hi=999_000,
+                  stop_price=STOP)
+        dec, st = evaluate_position(_pos(entry_date=_ago(20), **kw),
+                                    df, None, DEFAULT)
+        assert st["bars_held"] == ec.max_hold_days, st["bars_held"]
+        assert dec is not None and dec.layer == 0, \
+            f"만료 미발동 (layer={dec.layer if dec else None})"
+        assert dec.rule == "hold:expired", dec.rule
+        assert dec.action == "EXIT_ALL" and dec.ratio == 1.0
+        assert "보유기간 만료" in dec.reason and "재평가" in dec.reason
+        assert dec.detail["bars_held"] == 20
+        assert dec.urgent is False, "만료는 긴급 신호가 아니다"
+
+    def t_max_hold_control():
+        """대조군: 하루 전(19거래일)에는 아무 신호도 없어야 한다."""
+        df = _flat_at(70_000 * 1.05)
+        kw = dict(entry_fib_0382=999_000, entry_band_hi=999_000,
+                  stop_price=STOP)
+        dec, st = evaluate_position(_pos(entry_date=_ago(19), **kw),
+                                    df, None, DEFAULT)
+        assert st["bars_held"] == ec.max_hold_days - 1, st["bars_held"]
+        assert dec is None, \
+            f"19거래일에 신호가 났다 (rule={dec.rule if dec else None})"
+
+    def t_expiry_priority():
+        """계층 0 안의 순서: 무효화 → 만료. 그리고 만료 > 손절(계층 1)."""
+        kw = dict(entry_fib_0382=999_000, entry_band_hi=999_000,
+                  stop_price=STOP)
+        # 무효화가 만료를 이긴다
+        dec, _ = evaluate_position(_pos(entry_date=_ago(20), **kw),
+                                   _flat_at(70_000 * 1.05),
+                                   {"000001": {"관리종목": True}}, DEFAULT)
+        assert dec.rule.startswith("invalidation:"), dec.rule
+        # 만료가 손절을 이긴다. 단 손절 정보를 메시지에 실어야 한다.
+        dec2, _ = evaluate_position(_pos(entry_date=_ago(20), **kw),
+                                    _flat_at(60_000), None, DEFAULT)
+        assert dec2.rule == "hold:expired", dec2.rule
+        assert dec2.detail["stop_hit"] is True, dec2.detail
+        assert "손절선" in dec2.reason and "이탈" in dec2.reason, dec2.reason
+        # 만료 전이면 손절이 그대로 발동한다
+        dec3, _ = evaluate_position(_pos(entry_date=_ago(19), **kw),
+                                    _flat_at(60_000), None, DEFAULT)
+        assert dec3 is not None and dec3.rule == "stop:fixed", \
+            f"19거래일 손절 미발동 ({dec3.rule if dec3 else None})"
+
+    def t_stop_uses_recorded_value_only():
+        """같은 가격에서 기록된 손절선만으로 판정이 갈려야 한다."""
+        df = _flat_at(60_000)
+        hit, _ = evaluate_position(_pos(entry_date=_ago(3), stop_price=63_000),
+                                   df, None, DEFAULT)
+        miss, _ = evaluate_position(_pos(entry_date=_ago(3), stop_price=55_000),
+                                    df, None, DEFAULT)
+        assert hit is not None and hit.rule == "stop:fixed"
+        assert miss is None or miss.rule != "stop:fixed", \
+            "손절선 아래가 아닌데 고정 손절이 발동했다"
+        # 판정 시점에 ATR 로 손절폭을 다시 계산하면 손절선이 주가를 따라
+        # 움직인다. 그 경로가 되살아나지 않게 호출 자체를 막는다.
+        names = set(evaluate_position.__code__.co_names)
+        assert "atr" not in names, "판정 시점에 ATR 로 손절폭을 재계산한다"
+
+    def t_no_stop_mutation_api():
+        """손절선 사후 수정 경로가 없어야 한다."""
+        import inspect
+        from stocknews.store import Store
+
+        for n in dir(Store):
+            if n.startswith("_"):
+                continue
+            assert "stop" not in n.lower(), f"손절선 조작 API 로 보인다: {n}"
+        src = inspect.getsource(Store.touch_position_state)
+        assert "stop_price" not in src, "상태 갱신이 손절선을 건드린다"
+
     check("exits", "계층7 순환매", t_rotation)
     check("exits", "순환매 보류 (편차 5% 미만)", t_rotation_hold)
+    check("hold", "보유기간·손절 앵커", t_hold_anchor)
+    check("hold", "보유 일수 = 거래일", t_bars_held_is_trading_days)
+    check("hold", "최소보유일 내 손절 발동", t_min_hold_stop_fires)
+    check("hold", "최소보유일 내 무효화 발동", t_min_hold_allows_invalidation)
+    check("hold", "최소보유일 내 목표 억제 + 대조군", t_min_hold_suppresses_targets)
+    check("hold", "최소보유일 내 순환매 억제 + 대조군", t_min_hold_suppresses_rotation)
+    check("hold", "최대보유일 만료 재평가", t_max_hold_expiry)
+    check("hold", "만료 대조군 (19거래일)", t_max_hold_control)
+    check("hold", "계층 우선순위 (무효화>만료>손절)", t_expiry_priority)
+    check("hold", "기록된 손절선만 사용", t_stop_uses_recorded_value_only)
+    check("hold", "손절선 수정 API 부재", t_no_stop_mutation_api)
 
 
 # ══════════════════════════ 8. 뉴스 정리 ══════════════════════════

@@ -56,7 +56,7 @@ import pandas as pd
 from stocknews.config import DEFAULT
 from stocknews.daily import run_daily, scan_all, select_recommendations
 from stocknews.env import load_env
-from stocknews.exits import run_exits
+from stocknews.exits import run_exits, stop_price_for
 from stocknews.backtest import (BacktestConfig, control_random, control_rsi,
                                 run_backtest, simulate_exit_rules,
                                 summarize, summarize_exits, sweep_thresholds)
@@ -1299,8 +1299,11 @@ def mode_pos_open(store: Store, args) -> int:
 
     track = args.track or ("TREND" if res.trend_score >= res.value_score
                            else "VALUE")
+    # 손절선은 여기서 한 번 확정된다. 이후 재계산·수정 경로는 없다.
+    stop_price = stop_price_for(entry_price, DEFAULT)
     pos_id = store.open_position(code, name, track, entry_date, entry_price,
-                                 int(args.qty), snapshot=snap,
+                                 int(args.qty), stop_price=stop_price,
+                                 snapshot=snap,
                                  opened_by="cli", note=args.note or "")
 
     log.info("포지션 개시 #%d %s(%s) %s %d주 @ %.0f",
@@ -1312,7 +1315,12 @@ def mode_pos_open(store: Store, args) -> int:
 
     _say(f"\n포지션 #{pos_id} 개시: {name} ({code}) [{track}]")
     _say(f"  진입 {entry_date} @ {entry_price:,.0f}원 x {int(args.qty):,}주")
-    _say(f"  손절선(밴드 하단 -44%) : {_won('band_lo')}")
+    _say(f"  손절선(진입가 -{DEFAULT.exit.stop_loss_pct:.0f}%) "
+         f": {stop_price:,.0f}원   ← 고정. 수정 API 없음")
+    _say(f"  보유기간 {DEFAULT.exit.min_hold_days}~"
+         f"{DEFAULT.exit.max_hold_days}거래일 "
+         f"(최소 전 비손절 청산 억제 / 최대 도달 시 재평가)")
+    _say(f"  밴드 하단(-44%)        : {_won('band_lo')}")
     _say(f"  대량청산 중심(-30%)    : {_won('band_mid')}")
     _say(f"  목표선(밴드 상단 -16%) : {_won('band_hi')}")
     _say(f"  피보 0.382 (2차 익절)  : {_won('fib_0382')}")
@@ -1322,6 +1330,9 @@ def mode_pos_open(store: Store, args) -> int:
     SUMMARY.update({"pos_id": int(pos_id), "ticker": code, "name": name,
                     "track": track, "entry_date": entry_date,
                     "entry_price": entry_price, "qty": int(args.qty),
+                    "stop_price": stop_price,
+                    "min_hold_days": DEFAULT.exit.min_hold_days,
+                    "max_hold_days": DEFAULT.exit.max_hold_days,
                     "snapshot": snap})
     return EXIT_OK
 
