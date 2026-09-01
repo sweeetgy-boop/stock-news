@@ -28,11 +28,13 @@ import pandas as pd
 
 from .config import Config, DEFAULT
 from .contracts import ScreenResult
+from .data import load_index
 from .screener import rank_results, screen_one
 
 log = logging.getLogger(__name__)
 
-__all__ = ["scan_all", "select_recommendations", "run_daily"]
+__all__ = ["scan_all", "select_recommendations", "run_daily",
+           "market_context", "collect_market_context"]
 
 SLOT_PLAN = (("SEQ", 2), ("VALUE", 5), ("TREND", 3))
 
@@ -177,6 +179,110 @@ def select_recommendations(results: list[ScreenResult], meta: pd.DataFrame,
     return picked[:top_n]
 
 
+# ══════════════════ 시장 상태 기록 (기록 전용) ══════════════════
+# 이 블록의 산출물은 `market_context` 테이블에만 들어간다. 점수·추천·
+# 게이트·리포트 어디에도 쓰지 않는다. 채점 표본이 쌓인 뒤 '어떤 장에서
+# 통했나'를 되짚기 위한 것이고, 지금 판단에 쓰면 표본 20건도 안 되는
+# 시점에 국면 필터를 넣는 셈이 된다.
+def _close_series(df, scan_date) -> pd.Series | None:
+    """`scan_date` 이하 구간의 종가 시리즈 (오름차순).
+
+    FDR 은 'Close', 내부 규격은 '종가' 를 쓰므로 둘 다 받는다.
+    """
+    if df is None or len(df) == 0:
+        return None
+    col = next((c for c in ("종가", "Close") if c in df.columns), None)
+    if col is None:
+        return None
+    s = df[col].astype("float64").dropna()
+    idx = pd.DatetimeIndex(s.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    s.index = idx
+    s = s.sort_index()
+    s = s[s.index <= pd.Timestamp(scan_date)]
+    return s if len(s) else None
+
+
+def _ret_pct(s: pd.Series | None, bars: int) -> float | None:
+    """`bars` 거래일 수익률(%). 봉이 부족하면 None.
+
+    달력일이 아니라 봉 개수로 센다. `s.iloc[-1]` 대비 `s.iloc[-(bars+1)]`
+    이므로 두 지점이 정확히 `bars` 봉 떨어져 있다.
+    """
+    if s is None or len(s) < bars + 1:
+        return None
+    a = float(s.iloc[-(bars + 1)])
+    b = float(s.iloc[-1])
+    if a <= 0:
+        return None
+    return (b / a - 1.0) * 100.0
+
+
+def market_context(kospi, kosdaq, scan_date: str,
+                   ma_window: int = 200) -> dict | None:
+    """추천 시점 시장 상태. 순수 계산 — 네트워크·DB 를 만지지 않는다.
+
+    KOSPI 종가를 못 구하면 None (기록할 게 없다). 봉이 부족한 항목만
+    None 으로 남기고 나머지는 채운다. 0 으로 채우면 '보합'으로 읽힌다.
+    """
+    ks = _close_series(kospi, scan_date)
+    if ks is None:
+        return None
+    close = float(ks.iloc[-1])
+    ma = float(ks.iloc[-ma_window:].mean()) if len(ks) >= ma_window else None
+    kq = _close_series(kosdaq, scan_date)
+    return {
+        "scan_date": scan_date,
+        "kospi_close": close,
+        "kospi_ma200": ma,
+        "kospi_above_ma200": None if ma is None else int(close > ma),
+        "kospi_ret_5d": _ret_pct(ks, 5),
+        "kospi_ret_20d": _ret_pct(ks, 20),
+        "kosdaq_close": None if kq is None else float(kq.iloc[-1]),
+        "kosdaq_ret_5d": _ret_pct(kq, 5),
+    }
+
+
+def collect_market_context(store, trade_date: str, bars: int = 300,
+                           fetch=None) -> dict | None:
+    """지수를 조회해 시장 상태를 기록한다. 하루 1회.
+
+    **실패해도 예외를 올리지 않는다.** 지수 조회가 안 되는 날에 daily
+    전체가 실패하면 정작 중요한 스캔·추천 기록이 날아간다. 경고만 남기고
+    None 을 돌린다.
+
+    fetch : 테스트용 주입구. (name, bars) -> DataFrame|None
+    """
+    if not trade_date:
+        return None
+    try:
+        if store.has_market_context(trade_date):
+            return None
+        get = fetch or (lambda name, n: load_index(name, bars=n))
+        kospi = get("KOSPI", bars)
+        kosdaq = get("KOSDAQ", bars)
+        row = market_context(kospi, kosdaq, trade_date)
+        if row is None:
+            log.warning("시장 상태 계산 불가 (KOSPI 종가 없음) — %s 생략",
+                        trade_date)
+            return None
+        store.upsert_market_context(row)
+    except Exception as exc:  # noqa: BLE001 - daily 를 죽이지 않는다
+        log.warning("시장 상태 기록 실패 — 건너뜁니다 (%s: %s)",
+                    type(exc).__name__, exc)
+        return None
+
+    ma = row["kospi_ma200"]
+    log.info("시장 상태 기록 %s · KOSPI %.2f (MA200 %s · %s) · 5일 %s",
+             trade_date, row["kospi_close"],
+             f"{ma:.2f}" if ma is not None else "-",
+             {1: "위", 0: "아래"}.get(row["kospi_above_ma200"], "판정불가"),
+             f"{row['kospi_ret_5d']:+.2f}%"
+             if row["kospi_ret_5d"] is not None else "-")
+    return row
+
+
 def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
               tickers: dict | None = None) -> dict:
     """저녁 배치 본체. 스캔 → 스냅샷 저장 → 10선 선정 → 저장."""
@@ -194,8 +300,14 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     meta = store.ticker_meta()
     picks = select_recommendations(results, meta, top_n=top_n, cfg=cfg)
     store.save_recos(trade_date, picks)
+
+    # 추천 저장 **뒤에** 둔다. 지수 조회가 실패해도 스캔·추천 기록은
+    # 이미 커밋돼 있어야 한다.
+    mkt = collect_market_context(store, trade_date)
+
     store.log_run("daily", started, len(results), len(errors),
                   note=f"snapshot={saved}, picks={len(picks)}")
 
     return {"trade_date": trade_date, "results": results, "errors": errors,
-            "picks": picks, "snapshot_rows": saved}
+            "picks": picks, "snapshot_rows": saved,
+            "market_context": mkt}

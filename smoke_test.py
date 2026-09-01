@@ -3991,6 +3991,194 @@ def test_daily_weekly(st, tmp: Path):
     check("audit", "진행률 산술 (0 에서 멈춤)", t_progress_math)
     check("audit", "진행률 줄 형식 + 위치", t_progress_line_rendered)
 
+    # ───────── 시장 상태 기록 (기록 전용) ─────────
+    def _index_frame(closes: np.ndarray) -> pd.DataFrame:
+        """FDR 형태의 지수 프레임 (컬럼명 'Close')."""
+        idx = pd.DatetimeIndex(pd.bdate_range(end="2026-08-27",
+                                              periods=len(closes)))
+        return pd.DataFrame({"Close": closes.astype("float64")}, index=idx)
+
+    def t_mkt_above_ma200():
+        """MA200 위 판정 + 수익률 앵커.
+
+        300봉 전부 100, 마지막만 300.
+          MA200 = (199x100 + 300) / 200 = 101.00
+          종가 300 > 101 -> above=1
+          5일/20일 수익률 = 300/100 - 1 = +200.00%
+        """
+        from stocknews.daily import market_context
+        c = np.full(300, 100.0)
+        c[-1] = 300.0
+        m = market_context(_index_frame(c), None, "2026-08-27")
+        near(m["kospi_close"], 300.0, tol=1e-9, label="종가")
+        near(m["kospi_ma200"], 101.0, tol=1e-9, label="MA200")
+        assert m["kospi_above_ma200"] == 1, m["kospi_above_ma200"]
+        near(m["kospi_ret_5d"], 200.0, tol=1e-9, label="5일 수익률")
+        near(m["kospi_ret_20d"], 200.0, tol=1e-9, label="20일 수익률")
+        # KOSDAQ 을 안 주면 그 항목만 비워야 한다 (0 으로 채우면 보합으로 읽힌다)
+        assert m["kosdaq_close"] is None and m["kosdaq_ret_5d"] is None
+        assert m["scan_date"] == "2026-08-27"
+
+    def t_mkt_below_ma200():
+        """MA200 아래 판정. 300봉 전부 100, 마지막만 50.
+
+        MA200 = (199x100 + 50) / 200 = 99.75 · 종가 50 < 99.75 -> 0
+        """
+        from stocknews.daily import market_context
+        c = np.full(300, 100.0)
+        c[-1] = 50.0
+        m = market_context(_index_frame(c), None, "2026-08-27")
+        near(m["kospi_ma200"], 99.75, tol=1e-9, label="MA200")
+        assert m["kospi_above_ma200"] == 0, m["kospi_above_ma200"]
+        near(m["kospi_ret_5d"], -50.0, tol=1e-9, label="5일 수익률")
+
+    def t_mkt_ma200_boundary():
+        """종가 == MA200 이면 '위'가 아니다. 부등호를 확정한다."""
+        from stocknews.daily import market_context
+        m = market_context(_index_frame(np.full(300, 100.0)), None,
+                           "2026-08-27")
+        near(m["kospi_ma200"], 100.0, tol=1e-9, label="MA200")
+        assert m["kospi_above_ma200"] == 0, "종가=MA200 을 '위'로 판정했다"
+        near(m["kospi_ret_5d"], 0.0, tol=1e-9, label="5일 수익률")
+
+    def t_mkt_windows_differ():
+        """5일창과 20일창이 서로 다른 봉을 봐야 한다 (off-by-one 방어).
+
+        300봉 기본 100 · idx[-21]=200 · idx[-1]=110
+          5일  = 110/100 - 1 = +10.00%   (idx[-6] = 100)
+          20일 = 110/200 - 1 = -45.00%   (idx[-21] = 200)
+          MA200 = (198x100 + 200 + 110)/200 = 100.55
+        """
+        from stocknews.daily import market_context
+        c = np.full(300, 100.0)
+        c[-21] = 200.0
+        c[-1] = 110.0
+        m = market_context(_index_frame(c), _index_frame(c), "2026-08-27")
+        near(m["kospi_ret_5d"], 10.0, tol=1e-9, label="5일 수익률")
+        near(m["kospi_ret_20d"], -45.0, tol=1e-9, label="20일 수익률")
+        near(m["kospi_ma200"], 100.55, tol=1e-9, label="MA200")
+        near(m["kosdaq_ret_5d"], 10.0, tol=1e-9, label="코스닥 5일")
+
+    def t_mkt_short_series():
+        """봉이 부족하면 그 항목만 None. 0 으로 채우지 않는다."""
+        from stocknews.daily import market_context
+        m = market_context(_index_frame(np.full(10, 100.0)), None,
+                           "2026-08-27")
+        assert m["kospi_ma200"] is None, m["kospi_ma200"]
+        assert m["kospi_above_ma200"] is None, "MA200 없이 위/아래를 판정했다"
+        assert m["kospi_ret_5d"] is not None, "5일은 계산 가능해야 한다"
+        assert m["kospi_ret_20d"] is None, "20일은 봉이 부족하다"
+        # 지수 자체가 없으면 기록할 게 없다
+        assert market_context(None, None, "2026-08-27") is None
+        assert market_context(pd.DataFrame(), None, "2026-08-27") is None
+
+    def t_mkt_store_roundtrip():
+        """저장 → 조회. 같은 거래일은 덮어쓴다."""
+        from stocknews.daily import market_context
+        from stocknews.store import Store
+        s = Store(tmp / "mkt.db")
+        assert s.has_market_context("2026-08-27") is False
+        c = np.full(300, 100.0)
+        c[-1] = 300.0
+        s.upsert_market_context(market_context(_index_frame(c), None,
+                                               "2026-08-27"))
+        assert s.has_market_context("2026-08-27") is True
+        got = s.market_context("2026-08-27")
+        near(got["kospi_ma200"], 101.0, tol=1e-9, label="저장된 MA200")
+        assert got["kospi_above_ma200"] == 1
+        assert got["created_at"], "created_at 이 비어 있다"
+        # 덮어쓰기
+        c2 = np.full(300, 100.0)
+        c2[-1] = 50.0
+        s.upsert_market_context(market_context(_index_frame(c2), None,
+                                               "2026-08-27"))
+        assert len(s.market_context_history(10)) == 1, "행이 중복 생성됐다"
+        assert s.market_context("2026-08-27")["kospi_above_ma200"] == 0
+
+    def t_mkt_collect_skips_when_present():
+        """이미 있으면 조회조차 하지 않는다 (하루 1회)."""
+        from stocknews.daily import collect_market_context, market_context
+        from stocknews.store import Store
+        s = Store(tmp / "mkt_skip.db")
+        c = np.full(300, 100.0)
+        c[-1] = 300.0
+        s.upsert_market_context(market_context(_index_frame(c), None,
+                                               "2026-08-27"))
+        calls = []
+
+        def _fetch(name, n):
+            calls.append(name)
+            return _index_frame(c)
+
+        assert collect_market_context(s, "2026-08-27", fetch=_fetch) is None
+        assert calls == [], f"이미 있는데 조회했다: {calls}"
+
+    def t_mkt_fetch_failure_is_survivable():
+        """지수 조회가 터져도 예외가 올라오지 않아야 한다."""
+        from stocknews.daily import collect_market_context
+        from stocknews.store import Store
+        s = Store(tmp / "mkt_fail.db")
+
+        def _boom(name, n):
+            raise RuntimeError("네트워크 없음")
+
+        assert collect_market_context(s, "2026-08-27", fetch=_boom) is None
+        assert s.has_market_context("2026-08-27") is False
+        # 빈 응답도 같다
+        assert collect_market_context(s, "2026-08-27",
+                                      fetch=lambda n, b: None) is None
+        assert s.has_market_context("2026-08-27") is False
+
+    def t_daily_survives_index_failure():
+        """지수 조회 실패에도 run_daily 는 정상 완료하고 추천을 저장한다."""
+        import stocknews.daily as D
+        from stocknews.daily import run_daily
+
+        orig = D.load_index
+        D.load_index = lambda name, bars=300: (_ for _ in ()).throw(
+            RuntimeError("지수 조회 실패"))
+        try:
+            res = run_daily(st, cfg=DEFAULT, top_n=3)
+        finally:
+            D.load_index = orig
+        assert isinstance(res, dict), type(res)
+        assert res["market_context"] is None, "실패인데 값이 들어왔다"
+        assert res["trade_date"], "기준일이 비었다"
+        assert "picks" in res and "results" in res
+        # 추천이 실제로 저장됐는지 (조회 실패가 저장을 막지 않았는지)
+        assert st.reco_count() > 0, "추천이 저장되지 않았다"
+
+    def t_mkt_not_used_anywhere():
+        """기록 전용. 표시·점수·게이트에 쓰이면 안 된다."""
+        import inspect
+        from stocknews import notify, renderer, screener, weekly
+
+        for mod in (renderer, screener, notify, weekly):
+            src = inspect.getsource(mod)
+            for token in ("market_context", "kospi_above_ma200",
+                          "kospi_ma200", "kospi_ret_"):
+                assert token not in src, \
+                    f"{mod.__name__} 가 {token} 을 참조한다 (기록 전용 위반)"
+        # 점수·선정 경로가 실제로 참조하지 않는지 (전역 이름으로 확인)
+        from stocknews.daily import select_recommendations
+        for fn in (screener.screen_one, select_recommendations):
+            names = set(fn.__code__.co_names)
+            assert "market_context" not in names, \
+                f"{fn.__name__} 가 시장 상태를 참조한다"
+            assert "collect_market_context" not in names, \
+                f"{fn.__name__} 가 시장 상태 수집을 호출한다"
+
+    check("market", "MA200 위 판정 + 수익률 앵커", t_mkt_above_ma200)
+    check("market", "MA200 아래 판정", t_mkt_below_ma200)
+    check("market", "종가=MA200 경계", t_mkt_ma200_boundary)
+    check("market", "5일창 != 20일창 (off-by-one)", t_mkt_windows_differ)
+    check("market", "봉 부족은 None (0 채우기 금지)", t_mkt_short_series)
+    check("market", "저장/조회/덮어쓰기", t_mkt_store_roundtrip)
+    check("market", "이미 있으면 조회 안 함", t_mkt_collect_skips_when_present)
+    check("market", "조회 실패를 삼킨다", t_mkt_fetch_failure_is_survivable)
+    check("market", "조회 실패에도 daily 완료", t_daily_survives_index_failure)
+    check("market", "기록 전용 (표시·점수 미반영)", t_mkt_not_used_anywhere)
+
     # ───────── 재진입 금지 쿨다운 + 월간 회고 ─────────
     from stocknews.config import COOLDOWN_DAYS
     from stocknews.contracts import COOLDOWN_REASON, MANUAL_REASON

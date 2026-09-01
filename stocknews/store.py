@@ -275,6 +275,25 @@ CREATE TABLE IF NOT EXISTS flags (
   cooldown_from   TEXT,
   cooldown_reason TEXT
 );
+
+-- 추천 시점의 시장 상태. **기록 전용이다.**
+-- 점수·추천·게이트 어디에도 쓰지 않는다. 채점 데이터가 쌓인 뒤
+-- '어떤 장에서 통했나'를 되짚기 위한 것이고, 지금 이 값을 판단에 쓰면
+-- 표본 20건도 안 되는 시점에 국면 필터를 넣는 셈이 된다.
+--
+-- recos 는 건드리지 않는다. scan_date 로 조인하면 되므로 스키마를
+-- 바꿀 이유가 없다.
+CREATE TABLE IF NOT EXISTS market_context (
+  scan_date         TEXT PRIMARY KEY,
+  kospi_close       REAL,
+  kospi_ma200       REAL,
+  kospi_above_ma200 INTEGER,
+  kospi_ret_5d      REAL,
+  kospi_ret_20d     REAL,
+  kosdaq_close      REAL,
+  kosdaq_ret_5d     REAL,
+  created_at        TEXT
+);
 """
 
 _COLS = {"o": "시가", "h": "고가", "l": "저가", "c": "종가",
@@ -922,6 +941,50 @@ class Store:
     def price_dates(self) -> list[str]:
         """적재된 거래일 전체(오름차순). 거래일 간격 계산의 기준."""
         return self._price_dates()
+
+    # ────────────────── 시장 상태 (기록 전용) ──────────────────
+    _MKT_COLS = ("scan_date", "kospi_close", "kospi_ma200",
+                 "kospi_above_ma200", "kospi_ret_5d", "kospi_ret_20d",
+                 "kosdaq_close", "kosdaq_ret_5d")
+
+    def has_market_context(self, d) -> bool:
+        """그 거래일 시장 상태가 이미 있는가. 하루 1회만 조회하려고 본다."""
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM market_context WHERE scan_date=?",
+                (_d(d),)).fetchone()
+        return row is not None
+
+    def upsert_market_context(self, row: dict) -> None:
+        """시장 상태 1행. 같은 거래일은 덮어쓴다."""
+        vals = [row.get(c) for c in self._MKT_COLS]
+        vals[0] = _d(vals[0])
+        marks = ",".join("?" * (len(self._MKT_COLS) + 1))
+        sets = ",".join(f"{c}=excluded.{c}" for c in self._MKT_COLS[1:])
+        with closing(self._conn()) as con:
+            con.execute(
+                f"INSERT INTO market_context({','.join(self._MKT_COLS)},"
+                f"created_at) VALUES({marks}) "
+                f"ON CONFLICT(scan_date) DO UPDATE SET {sets},"
+                f"created_at=excluded.created_at",
+                (*vals, _now_str()))
+            con.commit()
+
+    def market_context(self, d) -> dict | None:
+        """그 거래일 시장 상태 1행. 없으면 None."""
+        cols = self._MKT_COLS + ("created_at",)
+        with closing(self._conn()) as con:
+            row = con.execute(
+                f"SELECT {','.join(cols)} FROM market_context "
+                f"WHERE scan_date=?", (_d(d),)).fetchone()
+        return dict(zip(cols, row)) if row else None
+
+    def market_context_history(self, days: int = 60) -> pd.DataFrame:
+        """최근 거래일 시장 상태. 채점 결과와 조인해 국면별로 볼 때 쓴다."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM market_context ORDER BY scan_date DESC LIMIT ?",
+                con, params=(int(days),))
 
     def exit_log_history(self, days: int = 60) -> pd.DataFrame:
         since = (_now_kst() - timedelta(days=days)).strftime("%Y-%m-%d")

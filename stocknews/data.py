@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 
 __all__ = ["normalize_ohlcv", "load_ohlcv", "load_investor", "load_shorting",
            "make_loader", "market_snapshot", "verify_snapshot_date",
-           "close_on", "REF_TICKERS"]
+           "close_on", "load_index", "INDEX_SYMBOLS", "REF_TICKERS"]
 
 # 날짜 대조용 기준 종목. 거래정지 가능성이 낮은 초대형주만 쓴다.
 REF_TICKERS = ("005930", "000660", "005380")
@@ -213,6 +213,38 @@ def close_on(ticker: str, trade_date: str) -> float | None:
     except (IndexError, ValueError, TypeError):
         return None
     return v if v > 0 else None
+
+
+# 지수 심볼. FDR 규격이다.
+INDEX_SYMBOLS = {"KOSPI": "KS11", "KOSDAQ": "KQ11"}
+
+
+def load_index(name: str, bars: int = 300) -> pd.DataFrame | None:
+    """지수 일봉. FinanceDataReader 만 쓴다.
+
+    name : "KOSPI" / "KOSDAQ" (또는 FDR 심볼 자체)
+    bars : 확보하려는 **거래일** 수. MA200 을 구하려면 200거래일이
+           필요하고 그건 달력으로 약 290일이다. 그래서 달력 창을
+           거래일의 1.6배 + 여유로 잡는다.
+
+    실패하면 None 을 돌린다. 예외를 던지지 않는 이유는 호출부(daily)가
+    이 값 없이도 정상 완료해야 하기 때문이다.
+    """
+    sym = INDEX_SYMBOLS.get(str(name).upper(), str(name))
+    end = now_kst()
+    start = end - timedelta(days=int(bars * 1.6) + 30)
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.DataReader(sym, start.strftime("%Y-%m-%d"),
+                            end.strftime("%Y-%m-%d"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("지수 조회 실패 %s(%s): %s: %s",
+                    name, sym, type(exc).__name__, exc)
+        return None
+    if df is None or df.empty or "Close" not in df.columns:
+        log.warning("지수 응답이 비어 있습니다 %s(%s)", name, sym)
+        return None
+    return df.sort_index()
 
 
 def verify_snapshot_date(prices: pd.DataFrame, trade_date: str,
