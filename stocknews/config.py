@@ -72,6 +72,16 @@ class CreditConfig:
     short_shift: int = 2           # 공매도 잔고 공시 지연(영업일)
 
 
+# 성적을 판단 근거로 쓰기 전에 필요한 **채점 완료** 표본 수.
+#
+# 누적 추천 건수가 아니라 채점이 도래한 건수를 세야 한다. 추천 100건을
+# 쌓아도 보유기간이 지나지 않았으면 성적은 0건이다. 진행률을 추천 건수로
+# 표시하면 '거의 다 됐다'고 착각하게 된다.
+#
+# 20건은 승률이 우연과 구분되기 시작하는 최소선이다. 여전히 적다.
+MIN_SCORED_FOR_JUDGMENT = 20
+
+
 @dataclass(frozen=True)
 class AuditConfig:
     """자기검증(사후 채점) 파라미터.
@@ -86,7 +96,9 @@ class AuditConfig:
     """
 
     horizons: tuple[int, ...] = (5, 10, 20)   # 채점 보유기간 (거래일)
-    min_sample: int = 20        # 이 표본에 닿기 전에는 성적을 신뢰하지 않는다
+    # 판단 기준. 종이거래 배너와 진행률 줄이 같은 숫자를 봐야 하므로
+    # 상수 하나에서 가져온다. 둘이 갈라지면 어느 쪽이 맞는지 알 수 없다.
+    min_sample: int = MIN_SCORED_FOR_JUDGMENT
     lookback_dates: int = 60    # 조회할 추천 일자 수
 
 

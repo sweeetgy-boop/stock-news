@@ -3818,6 +3818,162 @@ def test_daily_weekly(st, tmp: Path):
         assert isinstance(a, dict) and "n" in a
         assert "by_horizon" not in a, "단일 API 가 다중 형태를 돌려줬다"
 
+    # ───────── 채점 진행률 + 알파 분포 ─────────
+    def _dist_store(name: str, ends: list[float]):
+        """알파 분포 앵커용 픽스처.
+
+        평탄 종목 5개를 넣어 **시장 중위 수익률이 정확히 0** 이 되게 한다.
+        그러면 alpha = ret 이 되어 중앙값·최대·최소를 손으로 검산할 수 있다.
+        추천 종목은 첫 봉만 100 이고 이후는 목표가로 고정하므로, 어느
+        horizon 에서 채점해도 수익률이 같다.
+        """
+        from stocknews.store import Store
+        s = Store(tmp / name)
+        days = 30
+        idx = pd.DatetimeIndex(pd.bdate_range("2026-03-02", periods=days))
+        vol = np.full(days, 1e6)
+
+        def _put(code, series):
+            s.upsert_prices(code, pd.DataFrame({
+                "시가": series, "고가": series, "저가": series,
+                "종가": series, "거래량": vol}, index=idx), allow_today=True)
+
+        for i in range(5):
+            _put(f"FLT{i:03d}", np.full(days, 100.0))
+        d0 = idx[0].strftime("%Y-%m-%d")
+        for rank, end in enumerate(ends, 1):
+            series = np.full(days, float(end))
+            series[0] = 100.0
+            code = f"RCO{rank:03d}"
+            _put(code, series)
+            _insert_reco(s, d0, code, f"종목{rank}", "VALUE", "A", rank=rank)
+        return s
+
+    def _dist_cfg():
+        from stocknews.config import AuditConfig, Config
+        return Config(audit=AuditConfig(horizons=(5, 10, 20)))
+
+    def t_alpha_dist_odd():
+        """분포 앵커 · 홀수 3건. 알파 [+10, +4, -3].
+
+        평균 11/3 = +3.667 · 중앙값 +4.00 · 최대 +10.00 · 최소 -3.00
+        알파 승률 2/3 = 66.7%
+        """
+        from stocknews.weekly import audit_multi
+        s = _dist_store("dist_odd.db", [110.0, 104.0, 97.0])
+        by = audit_multi(s, cfg=_dist_cfg())["by_horizon"]
+        for h in (5, 10, 20):
+            d = by[h]
+            assert d["n"] == 3, f"{h}일 표본 {d['n']}"
+            near(d["mean_alpha"], 11.0 / 3.0, tol=0.01, label=f"{h}일 평균알파")
+            near(d["median_alpha"], 4.0, tol=0.01, label=f"{h}일 중앙알파")
+            near(d["max_alpha"], 10.0, tol=0.01, label=f"{h}일 최대알파")
+            near(d["min_alpha"], -3.0, tol=0.01, label=f"{h}일 최소알파")
+            near(d["mean_mkt"], 0.0, tol=1e-9, label=f"{h}일 시장중위")
+            near(d["alpha_win_rate"], 200.0 / 3.0, tol=0.01,
+                 label=f"{h}일 알파승률")
+
+    def t_alpha_dist_even():
+        """분포 앵커 · 짝수 4건. 알파 [+10, +4, -3, +8].
+
+        짝수에서는 중앙값이 가운데 두 값의 평균이다.
+        정렬 [-3, +4, +8, +10] -> 중앙값 (4+8)/2 = +6.00
+        평균 19/4 = +4.75 · 최대 +10.00 · 최소 -3.00 · 승률 3/4 = 75%
+        """
+        from stocknews.weekly import audit_multi
+        s = _dist_store("dist_even.db", [110.0, 104.0, 97.0, 108.0])
+        by = audit_multi(s, cfg=_dist_cfg())["by_horizon"]
+        for h in (5, 10, 20):
+            d = by[h]
+            assert d["n"] == 4, f"{h}일 표본 {d['n']}"
+            near(d["mean_alpha"], 4.75, tol=0.01, label=f"{h}일 평균알파")
+            near(d["median_alpha"], 6.0, tol=0.01,
+                 label=f"{h}일 중앙알파(짝수 = 가운데 둘의 평균)")
+            near(d["max_alpha"], 10.0, tol=0.01, label=f"{h}일 최대알파")
+            near(d["min_alpha"], -3.0, tol=0.01, label=f"{h}일 최소알파")
+            near(d["alpha_win_rate"], 75.0, tol=0.01, label=f"{h}일 알파승률")
+
+    def t_dist_columns_rendered():
+        """표에 중앙·최대·최소가 실제로 찍혀야 한다."""
+        from stocknews.renderer import _horizon_rows
+        from stocknews.weekly import audit_multi
+        s = _dist_store("dist_render.db", [110.0, 104.0, 97.0])
+        rows, scored = _horizon_rows(audit_multi(s, cfg=_dist_cfg()))
+        assert scored == 3, scored
+        r5 = [x for x in rows if x.strip().startswith("5일")][0]
+        for want in ("+3.67", "+4.00", "+10.00", "-3.00"):
+            assert want in r5, f"{want} 누락: {r5}"
+        assert "α승률" in rows[0], rows[0]
+        for label in ("평균", "중앙", "최대", "최소"):
+            assert label in rows[0], f"헤더에 {label} 없음: {rows[0]}"
+
+    def t_pending_shows_not_due():
+        """채점 0건 horizon 은 '미도래'. 0% 나 빈 숫자를 쓰면 안 된다."""
+        from stocknews.renderer import _horizon_rows
+        a = {"horizons": [5, 10, 20], "by_horizon": {
+            5: {"horizon": 5, "n": 2, "pending": 0, "alpha_win_rate": 50.0,
+                "mean_alpha": 1.0, "median_alpha": 1.0,
+                "max_alpha": 3.0, "min_alpha": -1.0},
+            10: {"horizon": 10, "n": 0, "pending": 7, "note": "미도래"},
+            20: {"horizon": 20, "n": 0, "pending": 7, "note": "미도래"},
+        }}
+        rows, scored = _horizon_rows(a)
+        assert scored == 1, scored
+        for h in (10, 20):
+            r = [x for x in rows if x.strip().startswith(f"{h}일")][0]
+            assert "미도래" in r, f"{h}일 행에 미도래 표기 없음: {r}"
+            assert "(7건)" in r, f"{h}일 미도래 건수 없음: {r}"
+            assert "%" not in r, f"{h}일 미도래 행에 퍼센트: {r}"
+            assert "0.00" not in r, f"{h}일 미도래 행에 0 숫자: {r}"
+
+    def t_progress_math():
+        """진행률 산술. 남은 건수는 기준 미달일 때만 나오고 0 에서 멈춘다."""
+        from stocknews.config import MIN_SCORED_FOR_JUDGMENT
+        from stocknews.weekly import scoring_progress
+
+        assert MIN_SCORED_FOR_JUDGMENT == 20, MIN_SCORED_FOR_JUDGMENT
+        assert DEFAULT.audit.min_sample == MIN_SCORED_FOR_JUDGMENT, \
+            "배너와 진행률이 다른 숫자를 본다"
+
+        a = {"total_recos": 50, "horizons": [5, 10, 20], "by_horizon": {
+            5: {"n": 30, "pending": 5}, 10: {"n": 22, "pending": 8},
+            20: {"n": 25, "pending": 10}}}
+        p = scoring_progress(a, MIN_SCORED_FOR_JUDGMENT)
+        assert p["judge_horizon"] == 20, "기준이 가장 긴 기간이 아니다"
+        assert p["scored"] == {5: 30, 10: 22, 20: 25}, p["scored"]
+        assert p["pending"] == {5: 5, 10: 8, 20: 10}, p["pending"]
+        assert p["remaining"] == 0, "기준을 넘었는데 남은 건수가 나왔다"
+        assert p["ready"] is True
+
+        a["by_horizon"][20] = {"n": 3, "pending": 10}
+        p2 = scoring_progress(a, MIN_SCORED_FOR_JUDGMENT)
+        assert p2["remaining"] == 17, p2["remaining"]
+        assert p2["ready"] is False
+
+    def t_progress_line_rendered():
+        """진행률 줄 형식. 종이거래 문구 바로 아래에 있어야 한다."""
+        from stocknews.renderer import _progress_line, render_weekly
+        from stocknews.weekly import weekly_report
+
+        ln = _progress_line({"progress": {
+            "total_recos": 43, "horizons": [5, 10, 20],
+            "scored": {5: 12, 10: 7, 20: 3}, "pending": {5: 1, 10: 6, 20: 10},
+            "min_scored": 20, "judge_horizon": 20,
+            "remaining": 17, "ready": False}})[0]
+        assert "누적 추천 43건" in ln, ln
+        for part in ("5d:12건", "10d:7건", "20d:3건"):
+            assert part in ln, f"{part} 누락: {ln}"
+        assert "판단 기준(20건, 20d)까지 17건" in ln, ln
+        assert _progress_line({}) == [], "progress 없으면 줄을 만들지 않아야 한다"
+
+        # 리포트에서의 위치: 종이거래 문구 다음 줄
+        txt = render_weekly(weekly_report(st, DEFAULT),
+                            datetime(2026, 8, 28, 16, 30), DEFAULT)
+        lines = txt.splitlines()
+        i = next(k for k, x in enumerate(lines) if "검증 기간 — 실거래 아님" in x)
+        assert "검증 진행" in lines[i + 1], \
+            f"진행률 줄이 배너 아래가 아니다: {lines[i + 1]!r}"
+
     check("daily", "플래그 배선 (배제 발동)", t_scan_all_flag_wiring)
     check("daily", "플래그 해제 후 정상 채점", t_scan_all_after_clear)
     check("daily", "추천 선정", t_select)
@@ -3828,6 +3984,12 @@ def test_daily_weekly(st, tmp: Path):
     check("audit", "미도래는 채점 제외", t_audit_pending_excluded)
     check("audit", "리포트 표 + 종이거래 문구", t_audit_render_table)
     check("audit", "단일 API 하위호환", t_audit_recos_still_single)
+    check("audit", "알파 분포 앵커 (홀수 3건)", t_alpha_dist_odd)
+    check("audit", "알파 분포 앵커 (짝수 4건)", t_alpha_dist_even)
+    check("audit", "분포 열 렌더", t_dist_columns_rendered)
+    check("audit", "채점 0건 = 미도래 표기", t_pending_shows_not_due)
+    check("audit", "진행률 산술 (0 에서 멈춤)", t_progress_math)
+    check("audit", "진행률 줄 형식 + 위치", t_progress_line_rendered)
 
     # ───────── 재진입 금지 쿨다운 + 월간 회고 ─────────
     from stocknews.config import COOLDOWN_DAYS

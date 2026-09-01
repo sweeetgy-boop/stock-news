@@ -28,16 +28,16 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
-from .config import Config, DEFAULT
+from .config import MIN_SCORED_FOR_JUDGMENT, Config, DEFAULT
 from .contracts import STOP_RULE_PREFIX
 from .trading_day import as_date, now_kst
 
 log = logging.getLogger(__name__)
 
-__all__ = ["audit_recos", "audit_multi", "score_momentum", "persistence",
-           "churn", "band_eta", "weekly_events", "sector_concentration",
-           "is_first_friday", "prev_month_bounds", "monthly_review",
-           "weekly_report"]
+__all__ = ["audit_recos", "audit_multi", "scoring_progress", "score_momentum",
+           "persistence", "churn", "band_eta", "weekly_events",
+           "sector_concentration", "is_first_friday", "prev_month_bounds",
+           "monthly_review", "weekly_report"]
 
 
 # ────────────────────────── 1. 자기 검증 ──────────────────────────
@@ -103,7 +103,12 @@ def _summarize(df: pd.DataFrame, horizon: int, pending: int,
         "mean_ret": float(df["ret"].mean()),
         "median_ret": float(df["ret"].median()),
         "mean_mkt": float(df["mkt"].mean()),
+        # 알파 분포. 평균만 보면 한 종목이 만든 평균과 고르게 나온 평균을
+        # 구분할 수 없다. 중앙값·최대·최소를 함께 낸다.
         "mean_alpha": float(df["alpha"].mean()),
+        "median_alpha": float(df["alpha"].median()),
+        "max_alpha": float(df["alpha"].max()),
+        "min_alpha": float(df["alpha"].min()),
         "best": df.nlargest(3, "ret")[["name", "ret"]].to_dict("records"),
         "worst": df.nsmallest(3, "ret")[["name", "ret"]].to_dict("records"),
         "by_slot": (df.groupby("slot")["alpha"]
@@ -164,13 +169,48 @@ def audit_multi(store, cfg: Config = DEFAULT,
         out["by_horizon"] = {
             h: {"horizon": h, "n": 0, "pending": 0, "no_price": 0,
                 "note": "누적 데이터 부족"} for h in hs}
-        return out
+    else:
+        out["sampled_recos"] = int(len(recos))
+        for h in hs:
+            df, pending, no_price = _score_horizon(recos, pm, h)
+            out["by_horizon"][h] = _summarize(df, h, pending, no_price)
 
-    out["sampled_recos"] = int(len(recos))
-    for h in hs:
-        df, pending, no_price = _score_horizon(recos, pm, h)
-        out["by_horizon"][h] = _summarize(df, h, pending, no_price)
+    out["progress"] = scoring_progress(out, ac.min_sample)
     return out
+
+
+def scoring_progress(a: dict,
+                     min_scored: int = MIN_SCORED_FOR_JUDGMENT) -> dict:
+    """채점 진행률. 판단 기준까지 몇 건 남았는지 센다.
+
+    **누적 추천이 아니라 채점 완료 건수를 센다.** 추천 100건을 쌓아도
+    보유기간이 지나지 않았으면 성적은 0건이다. 진행률을 추천 건수로
+    표시하면 다 됐다고 착각한다.
+
+    기준 기간은 **가장 긴 보유기간**이다. 짧은 기간이 먼저 채워지므로
+    남은 시간을 결정하는 건 가장 긴 기간이다.
+    """
+    by = a.get("by_horizon") or {}
+    hs = a.get("horizons") or sorted(by)
+
+    def _cell(h, key):
+        d = by.get(h) or by.get(str(h)) or {}
+        return int(d.get(key) or 0)
+
+    scored = {h: _cell(h, "n") for h in hs}
+    judge = max(hs) if hs else None
+    done = scored.get(judge, 0) if judge is not None else 0
+    need = int(min_scored)
+    return {
+        "total_recos": int(a.get("total_recos") or 0),
+        "horizons": list(hs),
+        "scored": scored,
+        "pending": {h: _cell(h, "pending") for h in hs},
+        "judge_horizon": judge,
+        "min_scored": need,
+        "remaining": max(0, need - done),
+        "ready": done >= need,
+    }
 
 
 # ────────────────────── 1-b. 월간 회고 (전월) ──────────────────────

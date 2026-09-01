@@ -357,6 +357,27 @@ def _paper_banner(a: dict) -> list[str]:
             f"기록만 누적 중 (현재 {n}건/최소 {need}건)"]
 
 
+def _progress_line(a: dict) -> list[str]:
+    """채점 진행률. 종이거래 문구 바로 아래에 붙는다.
+
+    배너의 '현재 N건'은 누적 추천이고, 이 줄의 '채점 완료'는 보유기간이
+    경과한 건수다. 둘은 다르다 — 추천 100건을 쌓아도 기간이 지나지
+    않았으면 성적은 0건이다. 그 차이를 한 줄에서 보여준다.
+    """
+    p = a.get("progress") or {}
+    if not p:
+        return []
+    hs = p.get("horizons") or []
+    scored = p.get("scored") or {}
+    done = " / ".join(
+        f"{h}d:{int(scored.get(h) or scored.get(str(h)) or 0)}건" for h in hs)
+    judge = p.get("judge_horizon")
+    return [f"📈 검증 진행: 누적 추천 {int(p.get('total_recos') or 0)}건"
+            f" | 채점 완료 {done or '-'}"
+            f" | 판단 기준({int(p.get('min_scored') or 0)}건, {judge}d)까지 "
+            f"{int(p.get('remaining') or 0)}건"]
+
+
 def _audit_single(a: dict) -> list[str]:
     """단일 보유기간 블록 (audit_recos 반환 형태)."""
     if not a or a.get("n", 0) == 0:
@@ -396,8 +417,8 @@ def _horizon_rows(a: dict) -> tuple[list[str], int]:
     # 한글 헤더는 표시 폭으로 맞춘다. `{:>4}` 는 글자 수로 채워서 전각
     # 문자에서 열이 어긋난다 (구분선 길이도 함께 틀어진다).
     head = " ".join(_pad(t, w) for t, w in (
-        ("보유", 4), ("표본", 5), ("미도래", 6), ("승률", 6),
-        ("초과승률", 8), ("평균", 7), ("초과", 8)))
+        ("보유", 4), ("표본", 4), ("α승률", 6),
+        ("평균", 7), ("중앙", 7), ("최대", 7), ("최소", 7)))
     rows = [head, "-" * _display_width(head)]
     scored = 0
     for h in hs:
@@ -407,14 +428,15 @@ def _horizon_rows(a: dict) -> tuple[list[str], int]:
         # 첫 열에 '일'(전각)이 섞여 있으므로 헤더와 같은 폭 계산을 쓴다.
         lbl = _pad(f"{h}일", 4)
         if n == 0:
-            rows.append(f"{lbl} {'-':>5} {pend:>6} {'-':>6} {'-':>8} "
-                        f"{'-':>7} {'-':>8}")
+            # 0%나 빈 숫자를 넣으면 '성적이 나쁘다'로 읽힌다. 채점이
+            # 아직 도래하지 않았다는 사실만 적는다.
+            rows.append(f"{lbl} 미도래 ({pend}건)")
             continue
         scored += 1
         rows.append(
-            f"{lbl} {n:>5} {pend:>6} {d['win_rate']:>5.0f}% "
-            f"{d['alpha_win_rate']:>7.0f}% {d['mean_ret']:>+6.2f}% "
-            f"{d['mean_alpha']:>+7.2f}%p")
+            f"{lbl} {n:>4} {d['alpha_win_rate']:>5.0f}% "
+            f"{d['mean_alpha']:>+7.2f} {d['median_alpha']:>+7.2f} "
+            f"{d['max_alpha']:>+7.2f} {d['min_alpha']:>+7.2f}")
     return rows, scored
 
 
@@ -430,7 +452,8 @@ def _audit_table(a: dict) -> list[str]:
         return ["• 데이터 부족"]
 
     rows, scored = _horizon_rows(a)
-    out = ["<pre>" + "\n".join(rows) + "</pre>"]
+    out = ["<pre>" + "\n".join(rows) + "</pre>",
+           "• 평균·중앙·최대·최소는 초과수익(알파, %p) 분포입니다"]
     if scored == 0:
         pend_total = sum(int((by.get(h) or {}).get("pending") or 0) for h in hs)
         out.append(f"• 채점 가능한 표본이 없다 (미도래 {pend_total}건). "
@@ -475,6 +498,7 @@ def _monthly_block(m: dict) -> list[str]:
     ]
     rows, _ = _horizon_rows(m)
     out.append("<pre>" + "\n".join(rows) + "</pre>")
+    out.append("  평균·중앙·최대·최소는 초과수익(알파, %p)")
 
     out.append(f"진입 ({len(ent)}건)")
     if ent:
@@ -538,6 +562,7 @@ def render_weekly(rep: dict, asof, cfg: Config = DEFAULT) -> str:
         f"📅 <b>[주간 누적 분석]</b> {rep.get('trade_date')}",
     ]
     out += _paper_banner(audit)
+    out += _progress_line(audit)
     out += [
         f"• 집계 {rep.get('days_covered', 0)}거래일 · "
         f"관측 {rep.get('universe_size', 0):,}종목",
