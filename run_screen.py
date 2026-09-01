@@ -454,9 +454,25 @@ def mode_daily(store: Store, args) -> int:
 
 
 def mode_weekly(store: Store, args) -> int:
+    # --monthly 를 주면 전월 회고를 강제로 붙인다. 기본은 '그 달의 첫
+    # 금요일인가'로 자동 판정한다.
     rep = weekly_report(store, cfg=DEFAULT, week_days=args.week_days,
-                        horizon=args.horizon)
+                        horizon=args.horizon,
+                        monthly=True if args.monthly else None)
     SUMMARY["days_covered"] = rep.get("days_covered", 0)
+    mon = rep.get("monthly")
+    SUMMARY["monthly"] = bool(mon)
+    if mon:
+        c = mon.get("compliance") or {}
+        SUMMARY["monthly_review"] = {
+            "month": mon.get("month"), "recos": mon.get("recos", 0),
+            "entries": len(mon.get("entries") or []),
+            "exits": len(mon.get("exits") or []),
+            "min_hold_violations": c.get("min_hold_violations", 0),
+            "stop_not_executed": c.get("stop_not_executed", 0),
+            "reentry_violations": c.get("reentry_violations", 0),
+            "compliance_pct": c.get("compliance_pct"),
+        }
     _emit(render_weekly(rep, now_kst(), DEFAULT), args.dry_run)
     return EXIT_OK
 
@@ -1198,6 +1214,13 @@ def mode_flags(store: Store, args) -> int:
             _say(f"  {code}  {memo}")
         _say("  조치: DELETE FROM prices WHERE ticker='코드' 후 backfill 재실행\n")
 
+    cool = stats.get("_cooldown_list") or []
+    if cool:
+        _say(f"\n재진입 금지 {stats.get('cooldown_active', 0)}종목 "
+             f"(손절 후 {DEFAULT.exit.cooldown_days}거래일 · 만료 시 자동 해제):")
+        _say("  " + ", ".join(cool))
+        _say()
+
     summary = flag_summary(store)
     n_excluded = 0 if summary is None else int(len(summary))
     if n_excluded:
@@ -1256,6 +1279,8 @@ def mode_exits(store: Store, args) -> int:
         "exits": [{"ticker": d.ticker, "name": d.name, "layer": d.layer,
                    "rule": d.rule, "action": d.action, "qty": d.qty,
                    "ret_pct": d.ret_pct} for d in decs],
+        # 손절이 난 종목은 그 자리에서 재진입 금지가 걸린다.
+        "cooldown_added": res.get("cooldown_added") or [],
     })
     if errs:
         log.warning("청산 판정 오류 %d건: %s", len(errs), errs[:3])
@@ -1438,6 +1463,9 @@ def main(argv=None) -> int:
     ap.add_argument("--catchup", type=int, default=7,
                     help="update 시 소급 확인할 일수")
     ap.add_argument("--week-days", type=int, default=5, help="주간 집계 거래일수")
+    ap.add_argument("--monthly", action="store_true",
+                    help="weekly 에 전월 회고를 강제로 붙인다 "
+                         "(기본: 매월 첫 금요일에만 자동)")
     ap.add_argument("--horizon", type=int, default=5,
                     help="자기검증 보유 가정 거래일수")
     ap.add_argument("--ignore-window", action="store_true",

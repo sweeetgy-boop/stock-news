@@ -136,6 +136,15 @@ MAX_HOLD_DAYS = 20
 # 손절이 영원히 발동하지 않는다.
 STOP_LOSS_PCT = 10.0
 
+# 손절 청산 후 재진입 금지 기간(거래일). 만료되면 자동 해제된다.
+#
+# 손절은 '진입 판단이 틀렸다'는 기록이다. 그런데 손절 직후의 종목은
+# 스크리너 눈에 가장 매력적으로 보인다 — 더 싸졌고, 피보 되돌림은 더
+# 깊어졌고, 청산 밴드 안으로 더 들어갔다. 그래서 같은 종목을 며칠 만에
+# 다시 사는 일이 반복된다. 그물을 치는 게 아니라 물타기가 된다.
+# 이 기간은 그 경로를 코드로 막는다.
+COOLDOWN_DAYS = 20
+
 
 @dataclass(frozen=True)
 class ExitConfig:
@@ -172,6 +181,9 @@ class ExitConfig:
     # ── 계층 0-b / 게이트: 보유기간 (거래일 기준) ──
     min_hold_days: int = MIN_HOLD_DAYS
     max_hold_days: int = MAX_HOLD_DAYS
+
+    # ── 손절 후 재진입 금지 (거래일 기준) ──
+    cooldown_days: int = COOLDOWN_DAYS
 
     # ── 계층 3: 시간 ──
     time_stop_v_days: int = 15         # 트랙 V 시간 손절

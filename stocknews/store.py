@@ -27,6 +27,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from .config import COOLDOWN_DAYS
+from .contracts import COOLDOWN_REASON
+
 log = logging.getLogger(__name__)
 
 __all__ = ["Store"]
@@ -265,7 +268,12 @@ CREATE TABLE IF NOT EXISTS flags (
   updated        TEXT,
   -- 자본잠식만 별도 타임스탬프를 둔다. updated 는 행 전체 기준이라
   -- 로컬 판정이 매일 갱신되면 DART TTL 이 영원히 만료되지 않는다.
-  capital_impair_at TEXT
+  capital_impair_at TEXT,
+  -- 손절 청산 후 재진입 금지. 만료일이 아니라 '시작한 거래일'을 저장하고
+  -- 경과 거래일을 조회 시점에 센다. 만료일을 저장하면 20거래일 뒤가
+  -- 며칠인지 미리 알아야 하는데, 그건 미래 휴장일을 알아야 한다는 뜻이다.
+  cooldown_from   TEXT,
+  cooldown_reason TEXT
 );
 """
 
@@ -295,6 +303,8 @@ class Store:
     _MIGRATIONS = (
         ("flags", "capital_impair_at", "TEXT"),
         ("positions", "stop_price", "REAL"),
+        ("flags", "cooldown_from", "TEXT"),
+        ("flags", "cooldown_reason", "TEXT"),
     )
 
     def _init(self) -> None:
@@ -877,6 +887,42 @@ class Store:
                 "updated=? WHERE id=?", (note, _now_str(), int(pos_id)))
             con.commit()
 
+    def positions_between(self, start, end) -> pd.DataFrame:
+        """진입일이 구간 안인 포지션 (상태 무관). 월간 회고용."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT id,ticker,name,track,entry_date,entry_price,qty,"
+                "remaining,stop_price,status,opened_by FROM positions "
+                "WHERE entry_date>=? AND entry_date<=? ORDER BY entry_date,id",
+                con, params=(_d(start), _d(end)))
+
+    def exit_log_between(self, start, end) -> pd.DataFrame:
+        """청산 신호일이 구간 안인 이력 + 진입 정보.
+
+        규칙 준수율은 '언제 들어가서 언제 신호가 났는지'를 함께 봐야
+        계산된다. 그래서 positions 를 조인해서 준다.
+        """
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT e.id,e.position_id,e.d,e.ticker,e.name,e.layer,e.rule,"
+                "e.action,e.ratio,e.qty,e.signal_price,e.ret_pct,e.net_ret_pct,"
+                "e.executed,e.fill_price,e.filled_at,"
+                "p.entry_date,p.entry_price,p.stop_price,p.track "
+                "FROM exit_log e LEFT JOIN positions p ON p.id=e.position_id "
+                "WHERE e.d>=? AND e.d<=? ORDER BY e.d,e.id",
+                con, params=(_d(start), _d(end)))
+
+    def recos_between(self, start, end) -> pd.DataFrame:
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT d,rank,ticker,name,price,slot,grade,value_score,"
+                "trend_score,reason FROM recos WHERE d>=? AND d<=? "
+                "ORDER BY d,rank", con, params=(_d(start), _d(end)))
+
+    def price_dates(self) -> list[str]:
+        """적재된 거래일 전체(오름차순). 거래일 간격 계산의 기준."""
+        return self._price_dates()
+
     def exit_log_history(self, days: int = 60) -> pd.DataFrame:
         since = (_now_kst() - timedelta(days=days)).strftime("%Y-%m-%d")
         with closing(self._conn()) as con:
@@ -1020,15 +1066,23 @@ class Store:
             con.execute(f"UPDATE flags SET {field}=NULL")
             con.commit()
 
-    def load_flags(self) -> dict:
-        """{ticker: {한글키: 값}} 형태. screener.check_exclusion 계약에 맞춘다."""
+    def load_flags(self, cooldown_days: int = COOLDOWN_DAYS) -> dict:
+        """{ticker: {한글키: 값}} 형태. screener.check_exclusion 계약에 맞춘다.
+
+        재진입금지는 저장된 만료 플래그가 아니라 **조회 시점에 경과
+        거래일을 세서** 판정한다. 그래서 청소 잡이 돌지 않아도 만료가
+        자동 반영된다. `expire_cooldowns()` 는 표를 정리하는 용도다.
+        """
+        after = self._trading_days_after_map()
         with closing(self._conn()) as con:
             cur = con.execute(
                 "SELECT ticker,admin_issue,alert_issue,audit_refusal,"
-                "capital_impair,recent_offering,halt_history,penny_risk FROM flags")
+                "capital_impair,recent_offering,halt_history,penny_risk,"
+                "cooldown_from FROM flags")
             rows = cur.fetchall()
         out = {}
-        for (t, adm, alt, aud, imp, off, halt, penny) in rows:
+        for (t, adm, alt, aud, imp, off, halt, penny, cd_from) in rows:
+            elapsed = after(cd_from) if cd_from else None
             out[t] = {
                 "관리종목": bool(adm),
                 "투자주의환기": bool(alt),
@@ -1038,8 +1092,105 @@ class Store:
                 "대규모증자": bool(off),
                 "거래정지이력": bool(halt),
                 "동전주위험": bool(penny),
+                "재진입금지": bool(elapsed is not None
+                                   and elapsed < int(cooldown_days)),
+                "재진입금지_시작": cd_from,
+                "재진입금지_경과": elapsed,
             }
         return out
+
+    # ────────────────────── 재진입 금지 (쿨다운) ──────────────────────
+    def _price_dates(self) -> list[str]:
+        """적재된 거래일 전체(오름차순). 경과 거래일 계산의 기준."""
+        with closing(self._conn()) as con:
+            return [d for (d,) in con.execute(
+                "SELECT DISTINCT d FROM prices ORDER BY d").fetchall()]
+
+    def _trading_days_after_map(self):
+        """`d` 이후 경과 거래일을 돌려주는 함수. 날짜 목록을 1회만 읽는다.
+
+        종목마다 COUNT 쿼리를 날리면 2,800회가 된다.
+        """
+        dates = self._price_dates()
+
+        def after(d) -> int:
+            if not d:
+                return 0
+            ds = _d(d)
+            # ds 보다 큰 날짜의 개수 = 그 날 이후 경과 거래일
+            lo, hi = 0, len(dates)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if dates[mid] <= ds:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return len(dates) - lo
+
+        return after
+
+    def trading_days_after(self, d) -> int:
+        """`d` 이후 경과 거래일. 당일은 세지 않는다."""
+        return self._trading_days_after_map()(d)
+
+    def set_cooldown(self, ticker: str, from_date,
+                     reason: str = COOLDOWN_REASON) -> None:
+        """재진입 금지 시작. 같은 종목이면 더 최근 날짜만 남긴다.
+
+        손절이 두 번 나면 늦은 쪽부터 다시 세야 한다. 이전 날짜로
+        되돌아가면 쿨다운이 짧아진다.
+        """
+        ds = _d(from_date)
+        newer = ("flags.cooldown_from IS NULL "
+                 "OR excluded.cooldown_from>flags.cooldown_from")
+        with closing(self._conn()) as con:
+            con.execute(
+                "INSERT INTO flags(ticker,cooldown_from,cooldown_reason,updated) "
+                "VALUES(?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET "
+                f"cooldown_from=CASE WHEN {newer} "
+                "THEN excluded.cooldown_from ELSE flags.cooldown_from END,"
+                f"cooldown_reason=CASE WHEN {newer} "
+                "THEN excluded.cooldown_reason ELSE flags.cooldown_reason END,"
+                "updated=excluded.updated",
+                (ticker, ds, reason, _now_str()))
+            con.commit()
+
+    def cooldown_state(self, cooldown_days: int = COOLDOWN_DAYS) -> dict:
+        """{ticker: {from, reason, elapsed, remaining, active}}"""
+        after = self._trading_days_after_map()
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT ticker,cooldown_from,cooldown_reason FROM flags "
+                "WHERE cooldown_from IS NOT NULL ORDER BY cooldown_from DESC"
+            ).fetchall()
+        out = {}
+        for t, d0, why in rows:
+            el = after(d0)
+            out[t] = {"from": d0, "reason": why, "elapsed": el,
+                      "remaining": max(0, int(cooldown_days) - el),
+                      "active": el < int(cooldown_days)}
+        return out
+
+    def expire_cooldowns(self, cooldown_days: int = COOLDOWN_DAYS,
+                         reason: str = COOLDOWN_REASON) -> list[str]:
+        """경과한 자동 쿨다운을 지운다. 해제된 종목 목록 반환.
+
+        `reason` 이 일치하는 것만 지운다. 자동 청소가 사람이 넣은 항목을
+        지우면 수동 배제가 조용히 풀린다.
+        """
+        state = self.cooldown_state(cooldown_days)
+        gone = [t for t, s in state.items()
+                if not s["active"] and s["reason"] == reason]
+        if not gone:
+            return []
+        marks = ",".join("?" * len(gone))
+        with closing(self._conn()) as con:
+            con.execute(
+                f"UPDATE flags SET cooldown_from=NULL,cooldown_reason=NULL,"
+                f"updated=? WHERE ticker IN ({marks})",
+                (_now_str(), *gone))
+            con.commit()
+        return gone
 
     # 필드별 타임스탬프 컬럼. 없으면 행 전체의 updated 를 쓴다.
     _FLAG_TS_COL = {"capital_impair": "capital_impair_at"}

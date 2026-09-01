@@ -3829,6 +3829,305 @@ def test_daily_weekly(st, tmp: Path):
     check("audit", "리포트 표 + 종이거래 문구", t_audit_render_table)
     check("audit", "단일 API 하위호환", t_audit_recos_still_single)
 
+    # ───────── 재진입 금지 쿨다운 + 월간 회고 ─────────
+    from stocknews.config import COOLDOWN_DAYS
+    from stocknews.contracts import COOLDOWN_REASON, MANUAL_REASON
+
+    def _cool_store(name: str, n_days: int = 45):
+        """거래일 n_days, 종목 2개(평탄) 픽스처. 2026-07-01 부터."""
+        from stocknews.store import Store
+        s = Store(tmp / name)
+        idx = pd.DatetimeIndex(pd.bdate_range("2026-07-01", periods=n_days))
+        flat = np.full(n_days, 100.0)
+        for code in ("AAA222", "BBB222"):
+            s.upsert_prices(code, pd.DataFrame({
+                "시가": flat, "고가": flat, "저가": flat, "종가": flat,
+                "거래량": np.full(n_days, 1e6),
+            }, index=idx), allow_today=True)
+        return s, [d.strftime("%Y-%m-%d") for d in idx]
+
+    def t_cooldown_anchor():
+        from stocknews.screener import HARD_EXCLUSION_FLAGS
+        assert COOLDOWN_DAYS == 20, COOLDOWN_DAYS
+        assert DEFAULT.exit.cooldown_days == COOLDOWN_DAYS, "config 배선 누락"
+        assert COOLDOWN_REASON != MANUAL_REASON, "자동/수동 사유가 같다"
+        assert COOLDOWN_REASON.startswith("AUTO:"), COOLDOWN_REASON
+        keys = [k for k, _ in HARD_EXCLUSION_FLAGS]
+        assert "재진입금지" in keys, f"하드 배제에 없다: {keys}"
+
+    def t_cooldown_hard_exclusion():
+        """스크리닝 하드 배제 단계에서 걸려야 한다 (+ 대조군)."""
+        from stocknews.screener import check_exclusion, screen_one
+        blocked = check_exclusion({"재진입금지": True}, None, None)
+        assert blocked and "재진입" in blocked, blocked
+        assert check_exclusion({"재진입금지": False}, None, None) is None
+        # 스크리너 전체 경로에서도 배제로 끝나야 한다
+        r = screen_one("000001", "손절종목", fixture_crash(),
+                       flags={"재진입금지": True})
+        assert r.excluded and "재진입" in r.excluded, r.excluded
+        assert r.grade == "NONE" and r.value_score == 0.0
+
+    def t_cooldown_expiry_boundary():
+        """만료 전후 대조군. 경과 거래일로 판정해야 한다."""
+        s, dates = _cool_store("cool_edge.db")
+        # 마지막 거래일 기준 19거래일 전에 손절 -> 경과 19 -> 활성
+        s.set_cooldown("AAA222", dates[-19], COOLDOWN_REASON)
+        # 21거래일 전 -> 경과 21 -> 만료
+        s.set_cooldown("BBB222", dates[-21], COOLDOWN_REASON)
+
+        assert s.trading_days_after(dates[-19]) == 18, \
+            s.trading_days_after(dates[-19])
+        st_ = s.cooldown_state(COOLDOWN_DAYS)
+        assert st_["AAA222"]["active"] is True, st_["AAA222"]
+        assert st_["BBB222"]["active"] is False, st_["BBB222"]
+
+        fl = s.load_flags(COOLDOWN_DAYS)
+        assert fl["AAA222"]["재진입금지"] is True
+        assert fl["BBB222"]["재진입금지"] is False
+        # 경과 일수를 그대로 노출해야 원인을 볼 수 있다
+        assert fl["AAA222"]["재진입금지_경과"] == 18, fl["AAA222"]
+        assert fl["AAA222"]["재진입금지_시작"] == dates[-19]
+
+    def t_cooldown_auto_release():
+        """만료 시 자동 해제. 수동 사유는 건드리지 않는다."""
+        s, dates = _cool_store("cool_rel.db")
+        s.set_cooldown("AAA222", dates[-30], COOLDOWN_REASON)   # 만료
+        s.set_cooldown("BBB222", dates[-30], MANUAL_REASON)     # 만료지만 수동
+        gone = s.expire_cooldowns(COOLDOWN_DAYS, COOLDOWN_REASON)
+        assert gone == ["AAA222"], gone
+        state = s.cooldown_state(COOLDOWN_DAYS)
+        assert "AAA222" not in state, "자동 항목이 지워지지 않았다"
+        assert state["BBB222"]["reason"] == MANUAL_REASON, \
+            "자동 청소가 수동 배제를 지웠다"
+
+    def t_cooldown_trading_days_not_calendar():
+        """달력일이 아니라 거래일로 세야 한다."""
+        s, dates = _cool_store("cool_cal.db")
+        d0 = dates[-11]
+        s.set_cooldown("AAA222", d0, COOLDOWN_REASON)
+        el = s.cooldown_state(COOLDOWN_DAYS)["AAA222"]["elapsed"]
+        assert el == 10, f"경과 거래일 {el}"
+        cal = (datetime.strptime(dates[-1], "%Y-%m-%d")
+               - datetime.strptime(d0, "%Y-%m-%d")).days
+        assert cal > el, f"픽스처에 주말이 안 끼었다 (달력 {cal})"
+
+    def t_cooldown_latest_stop_wins():
+        """손절이 두 번 나면 늦은 쪽부터 다시 센다."""
+        s, dates = _cool_store("cool_latest.db")
+        s.set_cooldown("AAA222", dates[-25], COOLDOWN_REASON)
+        s.set_cooldown("AAA222", dates[-5], COOLDOWN_REASON)    # 더 최근
+        assert s.cooldown_state()["AAA222"]["from"] == dates[-5]
+        s.set_cooldown("AAA222", dates[-30], COOLDOWN_REASON)   # 과거로 되돌림
+        assert s.cooldown_state()["AAA222"]["from"] == dates[-5], \
+            "과거 손절일로 되돌아가 쿨다운이 짧아졌다"
+
+    def t_cooldown_from_exit_log():
+        """손절 이력에서 쿨다운을 재구성한다 (배치가 죽었던 경우 복구)."""
+        from stocknews.contracts import ExitDecision
+        from stocknews.exits import stop_price_for
+        from stocknews.flags import sync_stop_cooldowns
+
+        s, dates = _cool_store("cool_sync.db")
+        pid = s.open_position("AAA222", "손절종목", "VALUE", dates[-12],
+                              100.0, 10, stop_price=stop_price_for(100.0, DEFAULT))
+        pid2 = s.open_position("BBB222", "익절종목", "TREND", dates[-12],
+                               100.0, 10, stop_price=stop_price_for(100.0, DEFAULT))
+
+        def _dec(pid_, ticker, rule, layer):
+            return ExitDecision(
+                ticker=ticker, name="x", position_id=pid_, layer=layer,
+                rule=rule, action="EXIT_ALL", ratio=1.0, qty=10,
+                signal_price=90.0, ret_pct=-10.0, net_ret_pct=-10.5,
+                reason="테스트", urgent=True)
+
+        s.record_exit_signal(_dec(pid, "AAA222", "stop:fixed", 1), dates[-8])
+        s.record_exit_signal(_dec(pid2, "BBB222", "target:take1", 5), dates[-8])
+
+        out = sync_stop_cooldowns(s, COOLDOWN_DAYS)
+        assert out["active"] == 1, out
+        assert out["active_list"] == ["AAA222"], out["active_list"]
+        fl = s.load_flags(COOLDOWN_DAYS)
+        assert fl["AAA222"]["재진입금지"] is True
+        assert fl.get("BBB222", {}).get("재진입금지") in (False, None), \
+            "손절이 아닌 청산에 쿨다운이 걸렸다"
+
+    def t_first_friday():
+        from stocknews.weekly import is_first_friday, prev_month_bounds
+        from datetime import date as _d
+        # 2026-08-01 은 토요일이라 8월 첫 금요일은 7일이다 (경계)
+        assert _d(2026, 8, 1).weekday() == 5, "픽스처 요일 불일치"
+        assert is_first_friday(_d(2026, 8, 7)) is True
+        assert is_first_friday(_d(2026, 8, 14)) is False
+        assert is_first_friday(_d(2026, 9, 4)) is True
+        assert is_first_friday(_d(2026, 9, 11)) is False
+        assert is_first_friday(_d(2026, 9, 3)) is False, "목요일인데 통과"
+        assert prev_month_bounds(_d(2026, 9, 4)) == \
+            ("2026-08-01", "2026-08-31", "2026-08")
+        # 연초 경계
+        assert prev_month_bounds(_d(2026, 1, 2)) == \
+            ("2025-12-01", "2025-12-31", "2025-12")
+
+    _month_cache: list = []
+
+    def _month_store():
+        """전월(2026-08) 진입 3건 · 청산 2건 픽스처.
+
+        여러 검사가 같이 쓰므로 한 번만 만든다. 매번 만들면 같은 DB 파일에
+        추천이 두 번 들어가 UNIQUE(d, rank) 에 걸린다.
+        """
+        if _month_cache:
+            return _month_cache[0]
+        from stocknews.contracts import ExitDecision
+        from stocknews.exits import stop_price_for
+        from stocknews.store import Store
+
+        s = Store(tmp / "monthly.db")
+        idx = pd.DatetimeIndex(pd.bdate_range("2026-07-01", "2026-09-01"))
+        flat = np.full(len(idx), 100.0)
+        for code in ("AAA333", "BBB333"):
+            s.upsert_prices(code, pd.DataFrame({
+                "시가": flat, "고가": flat, "저가": flat, "종가": flat,
+                "거래량": np.full(len(idx), 1e6),
+            }, index=idx), allow_today=True)
+
+        sp = stop_price_for(100.0, DEFAULT)
+        # ① 08-03 진입 -> 08-05 익절 체결. 보유 3거래일 = 최소보유일 위반
+        p1 = s.open_position("AAA333", "조기청산", "VALUE", "2026-08-03",
+                             100.0, 10, stop_price=sp)
+        # ② 08-03 진입 -> 08-20 손절 신호, 미체결 = 손절 미이행
+        p2 = s.open_position("BBB333", "손절방치", "VALUE", "2026-08-03",
+                             100.0, 10, stop_price=sp)
+        # ③ 08-25 진입 (② 손절 4거래일 뒤 같은 종목) = 재진입 위반
+        s.open_position("BBB333", "재진입", "VALUE", "2026-08-25",
+                        100.0, 10, stop_price=sp)
+
+        def _dec(pid_, ticker, name, rule, layer, ratio=1.0):
+            return ExitDecision(
+                ticker=ticker, name=name, position_id=pid_, layer=layer,
+                rule=rule, action="EXIT_ALL" if ratio >= 1.0 else "TRIM",
+                ratio=ratio, qty=10, signal_price=100.0, ret_pct=0.0,
+                net_ret_pct=-0.5, reason="테스트", urgent=layer <= 1)
+
+        lid1 = s.record_exit_signal(
+            _dec(p1, "AAA333", "조기청산", "target:take1", 5), "2026-08-05")
+        s.confirm_exit(lid1, 100.0)                 # 체결 -> 검증 대상
+        s.record_exit_signal(
+            _dec(p2, "BBB333", "손절방치", "stop:fixed", 1), "2026-08-20")
+        # 손절은 체결하지 않는다 (미이행)
+        for i, code in enumerate(("AAA333", "BBB333")):
+            _insert_reco(s, "2026-08-04", code, f"추천{i}", "VALUE", "A",
+                         rank=i + 1)
+        _month_cache.append(s)
+        return s
+
+    def t_monthly_lists():
+        """진입/청산 전체 목록이 나와야 한다."""
+        from stocknews.weekly import monthly_review
+        from datetime import date as _d
+        m = monthly_review(_month_store(), DEFAULT, asof=_d(2026, 9, 4))
+        assert m["month"] == "2026-08", m["month"]
+        assert (m["start"], m["end"]) == ("2026-08-01", "2026-08-31")
+        assert len(m["entries"]) == 3, [e["ticker"] for e in m["entries"]]
+        assert len(m["exits"]) == 2, [e["rule"] for e in m["exits"]]
+        assert m["recos"] == 2, m["recos"]
+        assert {e["rule"] for e in m["exits"]} == {"target:take1", "stop:fixed"}
+        assert m["horizons"] == [5, 10, 20]
+        assert set(m["by_horizon"]) == {5, 10, 20}
+
+    def t_monthly_compliance():
+        """규칙 준수율 3종을 각각 정확히 세야 한다."""
+        from stocknews.weekly import monthly_review
+        from datetime import date as _d
+        c = monthly_review(_month_store(), DEFAULT,
+                           asof=_d(2026, 9, 4))["compliance"]
+        assert c["min_hold_days"] == 5 and c["cooldown_days"] == 20
+        assert c["min_hold_violations"] == 1, c["min_hold_list"]
+        v = c["min_hold_list"][0]
+        assert v["ticker"] == "AAA333" and v["held"] == 3, v
+        assert c["stop_not_executed"] == 1, c["stop_not_executed_list"]
+        assert c["stop_not_executed_list"][0]["ticker"] == "BBB333"
+        assert c["reentry_violations"] == 1, c["reentry_list"]
+        r = c["reentry_list"][0]
+        assert r["stop_date"] == "2026-08-20" and r["entry_date"] == "2026-08-25"
+        assert r["gap_bars"] == 4, r
+        assert c["violations"] == 3, c
+        assert c["compliance_pct"] is not None
+
+    def t_monthly_compliance_clean():
+        """대조군: 위반이 없으면 0건 · 준수율 100%."""
+        from stocknews.contracts import ExitDecision
+        from stocknews.exits import stop_price_for
+        from stocknews.store import Store
+        from stocknews.weekly import monthly_review
+        from datetime import date as _d
+
+        s = Store(tmp / "monthly_clean.db")
+        idx = pd.DatetimeIndex(pd.bdate_range("2026-07-01", "2026-09-01"))
+        flat = np.full(len(idx), 100.0)
+        s.upsert_prices("AAA444", pd.DataFrame({
+            "시가": flat, "고가": flat, "저가": flat, "종가": flat,
+            "거래량": np.full(len(idx), 1e6)}, index=idx), allow_today=True)
+        pid = s.open_position("AAA444", "정상", "VALUE", "2026-08-03", 100.0,
+                              10, stop_price=stop_price_for(100.0, DEFAULT))
+        lid = s.record_exit_signal(ExitDecision(
+            ticker="AAA444", name="정상", position_id=pid, layer=5,
+            rule="target:take1", action="EXIT_ALL", ratio=1.0, qty=10,
+            signal_price=100.0, ret_pct=0.0, net_ret_pct=-0.5,
+            reason="테스트", urgent=False), "2026-08-14")   # 보유 10거래일
+        s.confirm_exit(lid, 100.0)
+
+        c = monthly_review(s, DEFAULT, asof=_d(2026, 9, 4))["compliance"]
+        assert c["min_hold_violations"] == 0, c["min_hold_list"]
+        assert c["stop_not_executed"] == 0, c["stop_not_executed_list"]
+        assert c["reentry_violations"] == 0, c["reentry_list"]
+        assert c["violations"] == 0 and c["compliance_pct"] == 100.0, c
+
+    def t_monthly_render_numbers_only():
+        """숫자와 목록만. 해석 문구가 붙으면 안 된다."""
+        from stocknews.renderer import _monthly_block
+        from stocknews.weekly import monthly_review
+        from datetime import date as _d
+
+        m = monthly_review(_month_store(), DEFAULT, asof=_d(2026, 9, 4))
+        txt = "\n".join(_monthly_block(m))
+        assert "전월 회고 2026-08" in txt
+        assert "2026-08-01 ~ 2026-08-31" in txt
+        assert "진입 (3건)" in txt and "청산 (2건)" in txt
+        assert "AAA333" in txt and "BBB333" in txt
+        assert "최소보유일(5거래일) 위반 1건" in txt, txt
+        assert "손절 미이행 1건" in txt
+        assert "재진입 금지(20거래일) 위반 1건" in txt
+        assert "준수율" in txt
+        assert "<pre>" in txt, "보유기간 표가 등폭으로 감싸이지 않았다"
+        banned = ("개선", "양호", "우수", "부진", "권고", "예상", "전망",
+                  "추천합니다", "주의 필요", "⚠️")
+        for w in banned:
+            assert w not in txt, f"해석 문구가 들어갔다: {w}"
+
+    def t_weekly_monthly_gate():
+        """전월 회고는 매월 첫 금요일에만 붙는다. 강제 옵션은 유지."""
+        from stocknews.weekly import weekly_report
+        assert weekly_report(st, DEFAULT, monthly=False)["monthly"] is None
+        forced = weekly_report(st, DEFAULT, monthly=True)["monthly"]
+        assert isinstance(forced, dict) and "compliance" in forced
+        # 자동 판정은 오늘 날짜에 의존하므로 값만 확인한다
+        auto = weekly_report(st, DEFAULT)
+        assert "monthly" in auto
+
+    check("cooldown", "COOLDOWN_DAYS 앵커 + 하드배제 등록", t_cooldown_anchor)
+    check("cooldown", "스크리닝 하드 배제 + 대조군", t_cooldown_hard_exclusion)
+    check("cooldown", "만료 전후 경계 (거래일)", t_cooldown_expiry_boundary)
+    check("cooldown", "만료 자동 해제 (수동 보존)", t_cooldown_auto_release)
+    check("cooldown", "달력일 아님", t_cooldown_trading_days_not_calendar)
+    check("cooldown", "늦은 손절일이 이김", t_cooldown_latest_stop_wins)
+    check("cooldown", "손절 이력에서 재구성", t_cooldown_from_exit_log)
+    check("monthly", "첫 금요일 판정 + 전월 경계", t_first_friday)
+    check("monthly", "진입/청산 전체 목록", t_monthly_lists)
+    check("monthly", "규칙 준수율 3종", t_monthly_compliance)
+    check("monthly", "준수 대조군 (100%)", t_monthly_compliance_clean)
+    check("monthly", "숫자·목록만 (해석 문구 금지)", t_monthly_render_numbers_only)
+    check("monthly", "첫 금요일 게이트 + 강제 옵션", t_weekly_monthly_gate)
+
 
 # ══════════════════════════ 11. 임포트 / 모듈 무결성 ══════════════════════════
 def test_imports():

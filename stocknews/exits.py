@@ -67,7 +67,8 @@ import numpy as np
 import pandas as pd
 
 from .config import Config, DEFAULT
-from .contracts import DONE_TAKE1, DONE_TAKE2, ExitDecision, Position
+from .contracts import (COOLDOWN_REASON, DONE_TAKE1, DONE_TAKE2,
+                        STOP_RULE_PREFIX, ExitDecision, Position)
 from .indicators import cross_series, moving_averages
 from .store import _now_kst
 
@@ -523,11 +524,24 @@ def run_exits(store, cfg: Config = DEFAULT,
             errors.append(("rotation", f"{type(exc).__name__}: {exc}"))
 
     decisions.sort(key=lambda d: (d.layer, -abs(d.ret_pct)))
+    cooled: list[str] = []
     for dec in decisions:
         try:
             store.record_exit_signal(dec, trade_date)
         except Exception as exc:  # noqa: BLE001
             errors.append((dec.ticker, f"기록 실패 {exc}"))
+        # 손절이 나면 그 자리에서 재진입 금지를 건다. flags 배치를 기다리면
+        # 그 사이에 도는 daily 가 같은 종목을 다시 추천한다.
+        if dec.rule.startswith(STOP_RULE_PREFIX):
+            try:
+                store.set_cooldown(dec.ticker, trade_date or dec.detail.get("d"),
+                                   COOLDOWN_REASON)
+                cooled.append(dec.ticker)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((dec.ticker, f"쿨다운 기록 실패 {exc}"))
+    if cooled:
+        log.info("재진입 금지 %d종목 (%d거래일): %s",
+                 len(cooled), cfg.exit.cooldown_days, ", ".join(cooled[:10]))
 
     store.log_run("exits", started, len(decisions), len(errors),
                   note=f"positions={len(positions)}, market={market_ret:.2f}%"
@@ -537,4 +551,4 @@ def run_exits(store, cfg: Config = DEFAULT,
              len(positions), len(decisions), len(errors))
     return {"positions": len(positions), "decisions": decisions,
             "errors": errors, "market_ret": market_ret,
-            "trade_date": trade_date}
+            "trade_date": trade_date, "cooldown_added": cooled}

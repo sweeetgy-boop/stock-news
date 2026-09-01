@@ -7,6 +7,7 @@ parse_mode='HTML' 을 쓰므로 종목명/뉴스제목은 반드시 escape 한�
 from __future__ import annotations
 
 import html
+import unicodedata
 
 from .config import Config, DEFAULT
 from .contracts import RULE_NAME, ScreenResult
@@ -16,6 +17,19 @@ __all__ = ["bar", "render_detail", "render_digest", "render_fib_list"]
 
 def _e(s) -> str:
     return html.escape(str(s), quote=False)
+
+
+def _display_width(s: str) -> int:
+    """등폭 폰트에서의 표시 폭. 전각(W/F) 문자는 2칸이다."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1
+               for ch in str(s))
+
+
+def _pad(text, width: int, align: str = ">") -> str:
+    """한글 섞인 표 정렬. `{:>4}` 는 글자 수로 채워 전각에서 어긋난다."""
+    s = str(text)
+    gap = max(0, width - _display_width(s))
+    return (s + " " * gap) if align == "<" else (" " * gap + s)
 
 
 def bar(r: float, n: int = 10) -> str:
@@ -372,6 +386,38 @@ def _audit_single(a: dict) -> list[str]:
     return lines
 
 
+def _horizon_rows(a: dict) -> tuple[list[str], int]:
+    """보유기간 비교표의 본문 줄만. (줄 목록, 채점된 기간 수).
+
+    해석 문구가 붙지 않은 순수한 표다. 월간 회고가 이것만 쓴다.
+    """
+    by = a.get("by_horizon") or {}
+    hs = a.get("horizons") or sorted(by)
+    # 한글 헤더는 표시 폭으로 맞춘다. `{:>4}` 는 글자 수로 채워서 전각
+    # 문자에서 열이 어긋난다 (구분선 길이도 함께 틀어진다).
+    head = " ".join(_pad(t, w) for t, w in (
+        ("보유", 4), ("표본", 5), ("미도래", 6), ("승률", 6),
+        ("초과승률", 8), ("평균", 7), ("초과", 8)))
+    rows = [head, "-" * _display_width(head)]
+    scored = 0
+    for h in hs:
+        d = by.get(h) or by.get(str(h)) or {}
+        n = int(d.get("n") or 0)
+        pend = int(d.get("pending") or 0)
+        # 첫 열에 '일'(전각)이 섞여 있으므로 헤더와 같은 폭 계산을 쓴다.
+        lbl = _pad(f"{h}일", 4)
+        if n == 0:
+            rows.append(f"{lbl} {'-':>5} {pend:>6} {'-':>6} {'-':>8} "
+                        f"{'-':>7} {'-':>8}")
+            continue
+        scored += 1
+        rows.append(
+            f"{lbl} {n:>5} {pend:>6} {d['win_rate']:>5.0f}% "
+            f"{d['alpha_win_rate']:>7.0f}% {d['mean_ret']:>+6.2f}% "
+            f"{d['mean_alpha']:>+7.2f}%p")
+    return rows, scored
+
+
 def _audit_table(a: dict) -> list[str]:
     """보유기간별 성적을 나란히. 어느 기간에서 알파가 나는지 비교용.
 
@@ -383,23 +429,7 @@ def _audit_table(a: dict) -> list[str]:
     if not hs:
         return ["• 데이터 부족"]
 
-    head = f"{'보유':>4} {'표본':>5} {'미도래':>6} {'승률':>6} {'초과승률':>8} {'평균':>7} {'초과':>8}"
-    rows = [head, "-" * len(head)]
-    scored = 0
-    for h in hs:
-        d = by.get(h) or by.get(str(h)) or {}
-        n = int(d.get("n") or 0)
-        pend = int(d.get("pending") or 0)
-        if n == 0:
-            rows.append(f"{h:>3}일 {'-':>5} {pend:>6} {'-':>6} {'-':>8} "
-                        f"{'-':>7} {'-':>8}")
-            continue
-        scored += 1
-        rows.append(
-            f"{h:>3}일 {n:>5} {pend:>6} {d['win_rate']:>5.0f}% "
-            f"{d['alpha_win_rate']:>7.0f}% {d['mean_ret']:>+6.2f}% "
-            f"{d['mean_alpha']:>+7.2f}%p")
-
+    rows, scored = _horizon_rows(a)
     out = ["<pre>" + "\n".join(rows) + "</pre>"]
     if scored == 0:
         pend_total = sum(int((by.get(h) or {}).get("pending") or 0) for h in hs)
@@ -426,6 +456,79 @@ def _audit_block(a: dict) -> list[str]:
     if "by_horizon" in a:
         return head + _audit_table(a)
     return head + _audit_single(a)
+
+
+def _monthly_block(m: dict) -> list[str]:
+    """전월 회고. **숫자와 목록만.** 해석 문구를 넣지 않는다.
+
+    '개선됐다' / '양호하다' 같은 말은 표본이 20건도 안 되는 시점에
+    확신을 만들어낸다. 판단은 사람이 한다.
+    """
+    ent = m.get("entries") or []
+    ex = m.get("exits") or []
+    out = [
+        f"━━ 전월 회고 {m.get('month', '')} ━━",
+        f"• 기간 {m.get('start', '')} ~ {m.get('end', '')}",
+        f"• 추천 {m.get('recos', 0)}건 · 진입 {len(ent)}건 · 청산 {len(ex)}건",
+        "",
+        "보유기간별 성적",
+    ]
+    rows, _ = _horizon_rows(m)
+    out.append("<pre>" + "\n".join(rows) + "</pre>")
+
+    out.append(f"진입 ({len(ent)}건)")
+    if ent:
+        for p in ent:
+            sp = p.get("stop_price")
+            sps = f" · 손절 {float(sp):,.0f}" if sp else ""
+            out.append(f"  {str(p.get('entry_date', ''))[5:]} "
+                       f"{_e(str(p.get('name') or ''))}({p.get('ticker')}) "
+                       f"{p.get('track')} {float(p.get('entry_price') or 0):,.0f}원 "
+                       f"x {int(p.get('qty') or 0):,}주{sps} "
+                       f"[{p.get('status')}]")
+    else:
+        out.append("  없음")
+
+    out.append(f"청산 ({len(ex)}건)")
+    if ex:
+        for e in ex:
+            act = "전량" if e.get("action") == "EXIT_ALL" else \
+                f"{float(e.get('ratio') or 0) * 100:.0f}%"
+            done = "체결" if int(e.get("executed") or 0) else "미체결"
+            ret = e.get("ret_pct")
+            rs = f"{float(ret):+.2f}%" if ret is not None else "-"
+            out.append(f"  {str(e.get('d', ''))[5:]} "
+                       f"{_e(str(e.get('name') or ''))}({e.get('ticker')}) "
+                       f"L{int(e.get('layer') or 0)} {e.get('rule')} "
+                       f"{act} {int(e.get('qty') or 0):,}주 · {rs} · {done}")
+    else:
+        out.append("  없음")
+
+    c = m.get("compliance") or {}
+    out.append("규칙 준수")
+    out.append(f"  최소보유일({c.get('min_hold_days', '-')}거래일) 위반 "
+               f"{c.get('min_hold_violations', 0)}건")
+    for x in (c.get("min_hold_list") or [])[:10]:
+        out.append(f"    - {_e(x['name'])}({x['ticker']}) "
+                   f"{x['entry_date']}→{x['d']} {x['held']}거래일 {x['rule']}")
+    out.append(f"  손절 미이행 {c.get('stop_not_executed', 0)}건")
+    for x in (c.get("stop_not_executed_list") or [])[:10]:
+        out.append(f"    - {_e(x['name'])}({x['ticker']}) {x['d']} {x['rule']}")
+    out.append(f"  재진입 금지({c.get('cooldown_days', '-')}거래일) 위반 "
+               f"{c.get('reentry_violations', 0)}건")
+    for x in (c.get("reentry_list") or [])[:10]:
+        out.append(f"    - {_e(x['name'])}({x['ticker']}) "
+                   f"손절 {x['stop_date']} → 진입 {x['entry_date']} "
+                   f"({x['gap_bars']}거래일)")
+    out.append(f"  검증 불가(수동 종료) {c.get('unverifiable_closes', 0)}건")
+    pct = c.get("compliance_pct")
+    checks = int(c.get("checks") or 0)
+    if pct is None or checks == 0:
+        out.append("  준수율 — (검사 대상 0건)")
+    else:
+        out.append(f"  준수율 {checks - int(c.get('violations') or 0)}/{checks} "
+                   f"({pct:.1f}%)")
+    return out
 
 
 def render_weekly(rep: dict, asof, cfg: Config = DEFAULT) -> str:
@@ -514,6 +617,11 @@ def render_weekly(rep: dict, asof, cfg: Config = DEFAULT) -> str:
             out.append(f"• ⚠️ 편중 경고: {_e(sec['warn'])} — 분산 배분 권고")
     else:
         out.append("• 업종 정보 없음")
+
+    mon = rep.get("monthly")
+    if mon:
+        out.append("")
+        out += _monthly_block(mon)
 
     out.append("")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")

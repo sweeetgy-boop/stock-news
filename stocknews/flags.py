@@ -40,6 +40,9 @@ from xml.etree import ElementTree
 import pandas as pd
 import requests
 
+from .config import COOLDOWN_DAYS
+from .contracts import COOLDOWN_REASON, STOP_RULE_PREFIX
+
 log = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
@@ -49,7 +52,7 @@ __all__ = [
     "fetch_admin_issues", "dart_corp_codes", "dart_capital_impairment",
     "dart_disclosure_events", "scan_local_flags", "detect_halt_history",
     "detect_penny_risk", "detect_price_discontinuity", "load_manual_flags",
-    "refresh_flags", "flag_summary",
+    "refresh_flags", "flag_summary", "sync_stop_cooldowns",
     "load_manual_credit", "refresh_credit",
 ]
 
@@ -462,11 +465,43 @@ def load_manual_flags(path: str | Path = "data/flags_manual.csv") -> list[dict]:
 
 
 # ══════════════════════════ 통합 갱신 ══════════════════════════
+def sync_stop_cooldowns(store, cooldown_days: int = COOLDOWN_DAYS,
+                        lookback_days: int = 180) -> dict:
+    """손절 청산 이력에서 재진입 금지를 재구성하고 만료된 것을 해제한다.
+
+    `run_exits` 가 손절이 나는 순간 쿨다운을 걸지만, 그것만으로는 부족하다.
+    청산 이력이 있는데 플래그가 없는 상태가 생길 수 있다 — 배치가 죽었거나
+    DB 를 옮겼거나 이 기능 이전에 쌓인 이력이 있는 경우다. 그래서 이력을
+    정본으로 보고 매번 다시 맞춘다(멱등).
+
+    해제는 **자동 사유 코드만** 대상이다. 사람이 넣은 배제를 자동 청소가
+    지우면 수동 판단이 조용히 풀린다.
+    """
+    hist = store.exit_log_history(days=lookback_days)
+    added: list[str] = []
+    if hist is not None and not hist.empty and "rule" in hist.columns:
+        stops = hist[hist["rule"].astype(str).str.startswith(STOP_RULE_PREFIX)]
+        # 종목별 가장 늦은 손절일부터 센다
+        for ticker, grp in stops.groupby("ticker"):
+            d0 = str(grp["d"].max())
+            store.set_cooldown(str(ticker), d0, COOLDOWN_REASON)
+            added.append(str(ticker))
+
+    released = store.expire_cooldowns(cooldown_days, COOLDOWN_REASON)
+    state = store.cooldown_state(cooldown_days)
+    active = [t for t, s in state.items() if s["active"]]
+    log.info("재진입 금지: 활성 %d종목 · 해제 %d종목 (기준 %d거래일)",
+             len(active), len(released), cooldown_days)
+    return {"seen": len(added), "active": len(active), "active_list": active,
+            "released": released, "cooldown_days": int(cooldown_days)}
+
+
 def refresh_flags(store, tickers: dict | None = None,
                   use_fdr: bool = True, use_dart: bool = True,
                   use_local: bool = True, use_manual: bool = True,
                   dart_limit: int = 0, dart_ttl_days: int = 30,
-                  offering_days: int = 60) -> dict:
+                  offering_days: int = 60,
+                  cooldown_days: int = COOLDOWN_DAYS) -> dict:
     """전 공급원 갱신. 성공한 공급원의 필드만 초기화 후 재기록한다."""
     started = datetime.now(KST)
     tickers = tickers or store.active_tickers()
@@ -539,6 +574,14 @@ def refresh_flags(store, tickers: dict | None = None,
         if manual:
             store.upsert_flags(manual)
         stats["manual"] = len(manual)
+
+    # ── ⑤ 재진입 금지 (손절 이력 기반, 자동 해제 포함) ──
+    # 수동 오버라이드보다 뒤에 둔다. 쿨다운은 전용 컬럼을 쓰므로 수동
+    # 항목과 충돌하지 않는다.
+    cd = sync_stop_cooldowns(store, cooldown_days)
+    stats["cooldown_active"] = cd["active"]
+    stats["cooldown_released"] = len(cd["released"])
+    stats["_cooldown_list"] = cd["active_list"][:20]
 
     store.log_run("flags", started,
                   sum(v for v in stats.values() if isinstance(v, int)), 0,
