@@ -76,11 +76,13 @@ from stocknews.trading_day import (is_definitely_closed, market_status,
                                    news_window_hours, should_scan_intraday)
 from stocknews.news import process_and_store, theme_shift
 from stocknews.news_sources import collect_all
-from stocknews.notify import AlertGate, send_telegram  # noqa: F401
-from stocknews.renderer import (render_detail, render_evening_brief,
-                                render_exit_alert, render_exit_digest,
-                                render_fib_list, render_morning_brief,
-                                render_news_weekly, render_positions,
+from stocknews.notify import (AlertGate, reco_send_allowed,  # noqa: F401
+                             reco_send_dow_label, send_telegram)
+from stocknews.renderer import (render_daily_holdings, render_detail,
+                                render_evening_brief, render_exit_alert,
+                                render_exit_digest, render_fib_list,
+                                render_morning_brief, render_news_weekly,
+                                render_positions, render_reco_stored,
                                 render_top10, render_weekly)
 from stocknews.screener import screen_one
 from stocknews.store import Store
@@ -362,21 +364,54 @@ def _closed_guard(store: Store, args, mode: str) -> str | None:
     return None
 
 
-def mode_daily(store: Store, args) -> int:
-    """저녁 전종목 스캔 + 추천 10선."""
-    reason = _closed_guard(store, args, "daily")
-    if reason:
-        log.info("%s", reason)
-        SUMMARY.update({"skipped": True, "reason": reason})
-        return EXIT_OK
+def _holdings_msg(store: Store, args, asof, trade_date: str, scanned: int,
+                  picks: int, dow_label: str) -> None:
+    """발송 요일이 아닌 날의 daily 메시지. 신규 추천은 넣지 않는다."""
+    positions = store.list_positions("OPEN")
+    pm = {p.ticker: store.load_ohlcv(p.ticker, days=5) for p in positions}
+    _emit(render_daily_holdings(positions, pm, asof, trade_date,
+                                scanned, picks, dow_label), args.dry_run)
 
+
+def mode_daily(store: Store, args) -> int:
+    """저녁 전종목 스캔 + 추천 10선.
+
+    스캔과 기록은 매일, 추천 발송은 주 1회(`GateConfig.reco_send_dow`).
+    채점 표본은 매일 쌓여야 하고, 사람의 결정은 주 1회여야 한다.
+    """
+    asof = now_kst()
+    send_ok, send_reason = reco_send_allowed(asof, DEFAULT, force=args.force)
+    dow_label = reco_send_dow_label(DEFAULT)
+    SUMMARY.update({"dow": asof.weekday(), "send_reason": send_reason,
+                    "reco_sent": False})
+
+    # 스캔 생략 판정과 발송 판정을 분리한다. 발송 요일(일요일)은 휴장이라
+    # 스캔이 항상 생략되는데, 예전처럼 여기서 함께 return 하면 주간 발송이
+    # 영구히 나가지 않는다.
+    skip = _closed_guard(store, args, "daily")
     trade_date = store.last_price_date()
-    if trade_date and store.has_scan(trade_date) and not args.force:
-        # 같은 거래일 스냅샷이 이미 있다. 재실행하면 Top-10 이 중복 발송된다.
-        log.info("%s 스냅샷이 이미 있습니다 — 생략 (--force 로 재실행)",
-                 trade_date)
-        SUMMARY.update({"skipped": True, "reason": "snapshot exists",
+    if not skip and trade_date and store.has_scan(trade_date) and not args.force:
+        # 같은 거래일 스냅샷이 이미 있다. 재실행하면 스냅샷이 중복 생성된다.
+        skip = "snapshot exists"
+
+    if skip:
+        log.info("%s", skip)
+        SUMMARY.update({"skipped": True, "reason": skip,
                         "trade_date": trade_date})
+        if not send_ok:
+            return EXIT_OK
+        # 발송 요일이다. 새로 스캔하지 않고 마지막 거래일에 기록된 추천을 낸다.
+        rows = store.reco_history(days=1)
+        n = 0 if rows is None else int(len(rows))
+        SUMMARY.update({"picks": n, "from_db": True})
+        if not n:
+            # 보낼 게 없으면 보내지 않는다. "추천 없음" 알림은 소음이다.
+            # 배치가 안 돈 것 자체는 --mode runs 가 잡는다.
+            log.warning("발송 요일이지만 기록된 추천이 없습니다 — 발송 생략")
+            return EXIT_OK
+        log.info("주간 추천 발송: 기록된 %d건 (스캔 생략)", n)
+        _emit(render_reco_stored(rows, asof, dow_label), args.dry_run)
+        SUMMARY["reco_sent"] = True
         return EXIT_OK
 
     tickers = _scan_pool(store, args)
@@ -385,10 +420,18 @@ def mode_daily(store: Store, args) -> int:
         return EXIT_PRECOND
 
     res = run_daily(store, cfg=DEFAULT, top_n=args.top, tickers=tickers)
-    asof = now_kst()
 
-    _emit(render_top10(res["picks"], asof, res["trade_date"],
-                       scanned=len(res["results"]), cfg=DEFAULT), args.dry_run)
+    if send_ok:
+        _emit(render_top10(res["picks"], asof, res["trade_date"],
+                           scanned=len(res["results"]), cfg=DEFAULT),
+              args.dry_run)
+        SUMMARY["reco_sent"] = True
+    else:
+        # 평일. 추천은 DB 에만 쌓고 보유 종목 상태만 보낸다.
+        log.info("발송 요일(%s) 이 아님 — 보유 요약만 발송 (추천 %d건 기록)",
+                 dow_label, len(res["picks"]))
+        _holdings_msg(store, args, asof, res["trade_date"],
+                      len(res["results"]), len(res["picks"]), dow_label)
 
     if args.with_fib:
         picked = [r for r in res["results"]

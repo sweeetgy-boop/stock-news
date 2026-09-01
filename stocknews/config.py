@@ -90,6 +90,17 @@ class AuditConfig:
     lookback_dates: int = 60    # 조회할 추천 일자 수
 
 
+# 추천 10선을 텔레그램으로 내보내는 요일. `datetime.weekday()` 규격이라
+# 월=0 … 일=6 이다. 6 = 일요일.
+#
+# 왜 주 1회인가: 매일 10선을 보내면 매일 판단을 요구받는다. 그러면 신호가
+# 아니라 알림 빈도가 매매를 지배한다. 스캔·기록은 매일 하되(채점 표본 확보)
+# 결정은 주 1회로 묶는다. 발송 요일을 일요일로 둔 이유는 장이 닫혀 있어
+# 그날 안에 주문을 낼 수 없고, 그래서 반사적 매매가 구조적으로 막히기
+# 때문이다. 월요일 개장까지 최소 하룻밤의 숙려 시간이 강제된다.
+RECO_SEND_DOW = 6
+
+
 @dataclass(frozen=True)
 class GateConfig:
     """알림 게이트 파라미터."""
@@ -102,6 +113,7 @@ class GateConfig:
     sequence_window: int = 20      # 매집 신호 -> 골든크로스 결합 허용 기간
     confluence_tol_pct: float = 3.0  # 피보 0.618선과 청산 중심선 겹침 허용치
     digest_top_n: int = 5
+    reco_send_dow: int = RECO_SEND_DOW  # 추천 10선 발송 요일
 
 
 @dataclass(frozen=True)

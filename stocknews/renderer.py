@@ -271,6 +271,66 @@ def render_top10(picks: list, asof, trade_date: str, scanned: int,
     return "\n".join(head) + "\n\n".join(body) + "\n" + "\n".join(tail)
 
 
+def render_reco_stored(rows, asof, send_dow_label: str = "일요일") -> str:
+    """DB 에 쌓인 추천으로 만드는 주간 10선.
+
+    발송 요일(기본 일요일)은 휴장일이라 그날 스캔이 돌지 않는다. 그래서
+    새로 스캔하지 않고 마지막 거래일에 이미 기록된 recos 를 그대로 낸다.
+    `render_top10` 은 `ScreenResult` 전체(피보/추세/유동성 객체)를 요구하지만
+    `recos` 테이블에는 그 원본이 없다. 없는 값을 추정해 채우면 발송된 숫자와
+    채점되는 숫자가 달라지므로, 저장된 열만 쓰는 별도 렌더러로 분리했다.
+
+    rows : store.reco_history(days=1) 결과 (DataFrame)
+    """
+    if rows is None or len(rows) == 0:
+        return ("🌙 <b>[주간 추천]</b>\n\n"
+                "• 기록된 추천이 없습니다. daily 를 먼저 실행하십시오.")
+
+    trade_date = str(rows.iloc[0]["d"])
+    head = [
+        f"🗓 <b>[주간 추천 {len(rows)}선]</b> 기준일 {trade_date}",
+        f"• 발송은 {send_dow_label} 1회 · 스캔과 기록은 매일 진행됩니다",
+        "",
+    ]
+    body = []
+    for _, r in rows.iterrows():
+        slot = str(r["slot"])
+        l1 = (f"{int(r['rank'])}. <b>{_e(str(r['name']))}</b> ({r['ticker']}) "
+              f"[{r['grade']}·{SLOT_LABEL.get(slot, slot)}]")
+        l2 = (f"   {float(r['price']):,.0f}원 · 매집 {float(r['value_score']):.1f}"
+              f" / 추세 {float(r['trend_score']):.1f}")
+        reason = str(r["reason"] or "").strip()
+        if len(reason) > 90:
+            reason = reason[:89] + "…"
+        l3 = f"   {_e(reason)}" if reason else ""
+        body.append("\n".join(x for x in (l1, l2, l3) if x))
+
+    tail = [
+        "",
+        "※ 매집=역추세 바닥 그물 / 추세=골든크로스 확증",
+        "※ 기준일 종가 기준입니다. 발송 시점 가격과 다릅니다.",
+        f"⏰ {asof:%Y-%m-%d %H:%M:%S}",
+    ]
+    return "\n".join(head) + "\n\n".join(body) + "\n" + "\n".join(tail)
+
+
+def render_daily_holdings(positions: list, price_map: dict | None, asof,
+                          trade_date: str, scanned: int, picks: int,
+                          send_dow_label: str = "일요일") -> str:
+    """발송 요일이 아닌 날의 daily 메시지. 보유 종목 상태만.
+
+    신규 추천 종목은 한 종목도 넣지 않는다. 개수만 알린다 — 파이프라인이
+    돌았는지는 알아야 하지만, 종목을 보여주면 주 1회 리듬이 무의미해진다.
+    """
+    out = [render_positions(positions, price_map), ""]
+    out.append("━━ 오늘 스캔 ━━")
+    out.append(f"• 기준일 {trade_date} · {scanned:,}종목 스캔 · "
+               f"추천 {picks}건 기록")
+    out.append(f"• 추천 목록은 {send_dow_label}에 발송됩니다")
+    out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
+    return "\n".join(out)
+
+
 def _paper_banner(a: dict) -> list[str]:
     """종이거래 고정 문구. 리포트 맨 위에 붙는다.
 

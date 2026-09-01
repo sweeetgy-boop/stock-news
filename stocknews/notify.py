@@ -22,7 +22,8 @@ from .contracts import ScreenResult
 from .trading_day import is_definitely_closed, trading_days_between
 
 __all__ = ["AlertWindow", "WINDOWS", "AlertGate", "send_telegram", "now_kst",
-           "TelegramNotConfigured"]
+           "TelegramNotConfigured", "DOW_KR", "reco_send_allowed",
+           "reco_send_dow_label"]
 
 
 class TelegramNotConfigured(RuntimeError):
@@ -43,6 +44,40 @@ def now_kst() -> datetime:
     09:00 KST 시간창이 영원히 열리지 않고, 에러도 없이 조용히 무음이 된다.
     """
     return datetime.now(KST).replace(tzinfo=None)
+
+
+# `datetime.weekday()` 순서 (월=0 … 일=6)
+DOW_KR = ("월", "화", "수", "목", "금", "토", "일")
+
+
+def reco_send_dow_label(cfg: Config = DEFAULT) -> str:
+    """설정된 발송 요일의 한글 이름. 사람이 읽는 문구에만 쓴다."""
+    return DOW_KR[int(cfg.gate.reco_send_dow) % 7] + "요일"
+
+
+def reco_send_allowed(now: datetime | None = None, cfg: Config = DEFAULT,
+                      force: bool = False) -> tuple[bool, str]:
+    """추천 10선을 오늘 내보내도 되는가. (허용여부, 사유코드).
+
+    G5(요일). 기존 G1~G4 와 독립이며, 오직 요일만 본다.
+
+    시각을 보지 않는 것이 의도다. `WINDOWS`/`AlertGate` 의 4대 시간창은
+    장중 즉시 속보(flash)의 유량 조절 장치이고, 이 게이트는 장 마감 후
+    배치(daily)의 발송 리듬이다. 둘을 한 판정에 섞으면 daily 를 몇 시에
+    돌리느냐에 따라 주간 발송이 조용히 사라진다 — 16:05 는 어느 창에도
+    속하지 않기 때문이다. 그래서 서로 참조하지 않는다.
+
+    사유코드
+      force     --force 로 요일 무시
+      send_dow  오늘이 발송 요일
+      off_dow   발송 요일이 아님 (보유 요약만 나간다)
+    """
+    now = now or now_kst()
+    if force:
+        return True, "force"
+    if now.weekday() == int(cfg.gate.reco_send_dow) % 7:
+        return True, "send_dow"
+    return False, "off_dow"
 
 
 @dataclass(frozen=True)

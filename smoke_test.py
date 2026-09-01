@@ -1398,6 +1398,237 @@ def test_notify(tmp: Path):
     check("notify", "창 밖 차단", t_outside_window)
 
 
+# ═══════════════════ 8-2c. 추천 발송 요일 게이트 (G5) ═══════════════════
+def test_reco_dow():
+    """추천 10선 주 1회 발송. 요일만 보고 시각은 보지 않는다.
+
+    픽스처는 2026-08-24(월) ~ 08-30(일) 7일이다. 달력을 잘못 짚으면 아래
+    검사 전부가 무의미해지므로 요일 자체를 먼저 검증한다.
+    """
+    import dataclasses
+    import inspect
+    from datetime import date as d_, datetime as dt
+    from stocknews.config import DEFAULT, RECO_SEND_DOW
+    from stocknews.contracts import Position
+    from stocknews.notify import (AlertGate, reco_send_allowed,
+                                  reco_send_dow_label)
+    from stocknews.renderer import render_daily_holdings, render_reco_stored
+
+    WEEK = [dt(2026, 8, 24 + i, 18, 20) for i in range(7)]   # 월(0) ~ 일(6)
+
+    def t_anchor():
+        assert RECO_SEND_DOW == 6, f"RECO_SEND_DOW={RECO_SEND_DOW} (일=6)"
+        assert DEFAULT.gate.reco_send_dow == RECO_SEND_DOW, "config 배선 누락"
+        assert [x.weekday() for x in WEEK] == list(range(7)), \
+            f"픽스처 요일 불일치 {[x.weekday() for x in WEEK]}"
+        assert WEEK[6].date() == d_(2026, 8, 30), "일요일 앵커 불일치"
+        assert reco_send_dow_label(DEFAULT) == "일요일"
+
+    def t_only_sunday():
+        """일요일만 발송. 월~토는 억제."""
+        for i, now in enumerate(WEEK):
+            ok, why = reco_send_allowed(now, DEFAULT)
+            if i == 6:
+                assert ok and why == "send_dow", f"일요일이 억제됨 ({why})"
+            else:
+                assert not ok and why == "off_dow", \
+                    f"weekday={i} 인데 발송 허용 ({ok}, {why})"
+
+    def t_force_bypass():
+        """--force 는 요일을 무시한다."""
+        for now in WEEK:
+            ok, why = reco_send_allowed(now, DEFAULT, force=True)
+            assert ok and why == "force", f"{now:%m-%d} force 우회 실패 ({why})"
+
+    def t_time_of_day_ignored():
+        """같은 요일이면 몇 시에 돌려도 판정이 같아야 한다.
+
+        daily 는 16:05 에 도는데 그 시각은 4대 시간창 어디에도 속하지
+        않는다. 요일 게이트가 시각을 보면 주간 발송이 조용히 사라진다.
+        """
+        for h, m in ((0, 5), (9, 10), (10, 5), (16, 5), (18, 20), (23, 55)):
+            assert reco_send_allowed(dt(2026, 8, 30, h, m), DEFAULT)[0], \
+                f"일요일 {h:02d}:{m:02d} 억제됨"
+            assert not reco_send_allowed(dt(2026, 8, 24, h, m), DEFAULT)[0], \
+                f"월요일 {h:02d}:{m:02d} 허용됨"
+
+    def t_no_window_coupling():
+        """시간창 로직과 상호 참조가 없어야 한다."""
+        # daily 실행 시각(16:05)은 어느 창에도 속하지 않는다. 그래서 두
+        # 판정을 한 곳에 섞으면 안 된다는 것이 이 검사의 근거다.
+        assert AlertGate.current_window(dt(2026, 8, 30, 16, 5)) is None, \
+            "16:05 가 시간창에 속한다 — 게이트 독립 전제가 깨졌다"
+        # 창 안(10:05)이어도 요일 판정은 바뀌지 않는다
+        assert reco_send_allowed(dt(2026, 8, 25, 10, 5), DEFAULT)[1] == "off_dow"
+        # 실제로 참조하는 전역 이름만 본다. 소스 문자열을 훑으면 설명
+        # 주석·독스트링에 이름이 나오는 것만으로 실패한다.
+        names = set(reco_send_allowed.__code__.co_names)
+        for banned in ("WINDOWS", "current_window", "in_window", "AlertGate",
+                       "is_definitely_closed"):
+            assert banned not in names, f"요일 게이트가 {banned} 를 참조한다"
+
+    def t_config_override():
+        """발송 요일은 config 로 옮길 수 있어야 한다 (호출부 하드코딩 금지)."""
+        cfg = dataclasses.replace(
+            DEFAULT, gate=dataclasses.replace(DEFAULT.gate, reco_send_dow=4))
+        assert reco_send_allowed(dt(2026, 8, 28, 18, 20), cfg)[0], \
+            "금요일로 바꿨는데 발송 안 됨"
+        assert not reco_send_allowed(WEEK[6], cfg)[0], "일요일이 여전히 발송됨"
+
+    def t_weekday_msg_no_picks():
+        """평일 메시지는 보유 요약만. 신규 추천 종목이 들어가면 안 된다."""
+        p = Position(id=1, ticker="005930", name="삼성전자", track="VALUE",
+                     entry_date="2026-08-20", entry_price=70000.0,
+                     qty=10, remaining=10)
+        msg = render_daily_holdings([p], None, WEEK[0], "2026-08-24",
+                                    scanned=1847, picks=10,
+                                    send_dow_label="일요일")
+        assert "보유 현황" in msg and "삼성전자" in msg, "보유 요약 누락"
+        assert "추천 10건 기록" in msg, "추천 건수 미표시"
+        assert "일요일" in msg, "다음 발송 요일 안내 누락"
+        # 종목을 넘길 경로 자체가 없어야 한다. 개수(int)만 받는다.
+        # renderer 는 `from __future__ import annotations` 라 문자열로 온다.
+        ann = inspect.signature(render_daily_holdings).parameters["picks"].annotation
+        assert ann in (int, "int"), f"picks 가 개수가 아니다 ({ann})"
+
+    def t_weekday_msg_empty_portfolio():
+        """보유가 없어도 메시지는 나가야 한다 (파이프라인 생존 확인용)."""
+        msg = render_daily_holdings([], None, WEEK[1], "2026-08-25",
+                                    scanned=1800, picks=0, send_dow_label="일요일")
+        assert "보유 포지션 없음" in msg
+        assert "추천 0건 기록" in msg
+
+    def _rows():
+        return pd.DataFrame([
+            {"d": "2026-08-28", "rank": 1, "ticker": "005930",
+             "name": "삼성전자", "price": 70000.0, "slot": "SEQ",
+             "grade": "S+", "value_score": 9.1, "trend_score": 8.2,
+             "reason": "청산밴드 진입 후 골든크로스"},
+            {"d": "2026-08-28", "rank": 2, "ticker": "000660",
+             "name": "SK하이닉스", "price": 180000.0, "slot": "VALUE",
+             "grade": "S", "value_score": 8.4, "trend_score": 6.0,
+             "reason": "피보 0.618 이하"},
+        ])
+
+    def t_stored_reco_render():
+        """일요일 메시지는 DB 에 기록된 추천으로 만든다."""
+        msg = render_reco_stored(_rows(), WEEK[6], "일요일")
+        assert "주간 추천 2선" in msg, msg[:120]
+        assert "기준일 2026-08-28" in msg, "기준일 미표시"
+        assert "삼성전자" in msg and "SK하이닉스" in msg
+        assert "70,000원" in msg and "9.1" in msg
+        # 기준일 종가라는 사실을 반드시 밝혀야 한다. 일요일 발송이라
+        # 금요일 종가와 발송 시점 사이에 인식 차이가 생긴다.
+        assert "기준일 종가" in msg, "종가 기준 고지 누락"
+        # 빈 입력에서도 죽지 않아야 한다
+        assert "기록된 추천이 없습니다" in render_reco_stored(
+            pd.DataFrame(), WEEK[6], "일요일")
+        assert "기록된 추천이 없습니다" in render_reco_stored(
+            None, WEEK[6], "일요일")
+
+    class _StubStore:
+        """mode_daily 의 '스캔 생략' 경로가 쓰는 메서드만 가진 스텁.
+
+        실 Store 를 쓰면 last_price_date 의 부분적재 판정과 스캔 스냅샷
+        적재까지 끌려들어와, 검사하려는 분기가 아닌 곳에서 깨진다.
+        """
+
+        def __init__(self, rows):
+            self.rows = rows
+            self.asked = 0
+
+        def last_price_date(self):
+            return "2026-08-28"
+
+        def has_scan(self, d):
+            return True                      # 스냅샷 있음 -> 스캔 생략
+
+        def is_known_non_trading(self, d):
+            return False
+
+        def has_price_date(self, d):
+            return True
+
+        def reco_history(self, days=1):
+            self.asked += 1
+            return self.rows
+
+    def _run_mode_daily(rows, send):
+        """mode_daily 를 생략 경로로 태우고 (rc, 발송문) 을 준다."""
+        import argparse
+        import contextlib
+        import importlib
+        import io
+        mod = importlib.import_module("run_screen")
+
+        st = _StubStore(rows)
+        args = argparse.Namespace(force=False, dry_run=True, with_fib=False,
+                                  top=10, limit=None, min_amount=0.0)
+        saved = dict(mod.SUMMARY)
+        orig = mod.reco_send_allowed
+        mod.reco_send_allowed = lambda *a, **k: send
+        buf = io.StringIO()
+        try:
+            mod.SUMMARY.clear()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.mode_daily(st, args)
+            summary = dict(mod.SUMMARY)
+        finally:
+            mod.reco_send_allowed = orig
+            mod.SUMMARY.clear()
+            mod.SUMMARY.update(saved)
+        return mod, rc, buf.getvalue(), summary, st
+
+    def t_mode_daily_sends_on_send_day():
+        """발송 요일에는 스캔이 생략돼도 추천이 나가야 한다.
+
+        일요일은 휴장이라 daily 의 스캔이 항상 생략된다. 생략과 발송을
+        한 번에 return 하면 주간 발송이 영구히 나가지 않는다 — 이 검사가
+        그 회귀를 막는다.
+        """
+        mod, rc, out, summary, st = _run_mode_daily(_rows(), (True, "send_dow"))
+        assert rc == mod.EXIT_OK, f"rc={rc}"
+        assert st.asked == 1, "기록된 추천을 읽지 않았다"
+        assert "주간 추천 2선" in out, out[:200]
+        assert "삼성전자" in out, "추천 종목이 발송문에 없다"
+        assert summary.get("reco_sent") is True, summary
+        assert summary.get("from_db") is True, summary
+        assert summary.get("picks") == 2, summary
+
+    def t_mode_daily_silent_off_day():
+        """발송 요일이 아니고 스캔도 생략이면 아무것도 보내지 않는다."""
+        mod, rc, out, summary, st = _run_mode_daily(_rows(), (False, "off_dow"))
+        assert rc == mod.EXIT_OK, f"rc={rc}"
+        assert out == "", f"억제일에 발송됨: {out[:200]}"
+        assert st.asked == 0, "발송하지 않는데 추천을 읽었다"
+        assert summary.get("reco_sent") is False, summary
+
+    def t_mode_daily_no_reco_no_send():
+        """발송 요일이지만 기록된 추천이 0건이면 보내지 않는다.
+
+        '추천 없음' 알림은 소음이다. 배치 공백은 --mode runs 가 잡는다.
+        """
+        mod, rc, out, summary, _ = _run_mode_daily(pd.DataFrame(),
+                                                   (True, "send_dow"))
+        assert rc == mod.EXIT_OK, f"rc={rc}"
+        assert out == "", f"추천 0건인데 발송됨: {out[:200]}"
+        assert summary.get("reco_sent") is False, summary
+        assert summary.get("picks") == 0, summary
+
+    check("reco-dow", "RECO_SEND_DOW 앵커 + 달력 픽스처", t_anchor)
+    check("reco-dow", "일요일만 발송 (월~토 억제)", t_only_sunday)
+    check("reco-dow", "--force 요일 우회", t_force_bypass)
+    check("reco-dow", "시각 무관 (16:05 방어)", t_time_of_day_ignored)
+    check("reco-dow", "시간창 로직과 비결합", t_no_window_coupling)
+    check("reco-dow", "발송 요일 config 이관 가능", t_config_override)
+    check("reco-dow", "평일 메시지 = 보유 요약만", t_weekday_msg_no_picks)
+    check("reco-dow", "평일 메시지 (보유 0건)", t_weekday_msg_empty_portfolio)
+    check("reco-dow", "일요일 메시지 = 기록된 추천", t_stored_reco_render)
+    check("reco-dow", "발송일: 스캔 생략에도 발송됨", t_mode_daily_sends_on_send_day)
+    check("reco-dow", "억제일: 무음", t_mode_daily_silent_off_day)
+    check("reco-dow", "발송일 + 추천 0건 = 무음", t_mode_daily_no_reco_no_send)
+
+
 # ══════════════════════════ 8-2b. 거래일 / 휴장일 ══════════════════════════
 def test_trading_day(tmp: Path):
     """주말·공휴일 오작동 방어. 실제로 6건의 버그가 있던 영역이다."""
@@ -3522,6 +3753,7 @@ def main() -> int:
         test_exits()
         test_news()
         test_notify(tmp)
+        test_reco_dow()
         test_trading_day(tmp)
         test_backtest(tmp)
         test_krx_credit()
