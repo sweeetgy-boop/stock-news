@@ -107,6 +107,39 @@ hermes\run.cmd --mode daily --json
 월 15:55  --mode credit
 ```
 
+### 실제로 등록된 것 (2026-09-01 현재)
+
+장 마감 후 체인만 **작업 1개**로 등록돼 있습니다.
+
+```
+작업 이름   stock-news-afterclose
+실행        hermes\afterclose.cmd
+일정        매일 16:00 · 로그온 모드 대화형만
+로그         logs\chain.log  (실행마다 덮어씀. 이력은 DB runs 테이블)
+```
+
+`master → update → flags → daily → exits → runs` 를 **순차로** 돕니다.
+다섯 개를 각각 등록하지 않은 이유는 락입니다. 전부 쓰기 모드라 시계
+기준으로 나눠 걸면 겹칠 수 있고(`flags` 혼자 5~10분), 지는 쪽이 `exit 3`
+으로 끝납니다. 순차 실행이면 그 경합이 아예 없고 3장의 의존 순서도
+자동으로 지켜집니다.
+
+`TELEGRAM_*` 이 아직 없어서 발송 모드에 `--dry-run` 이 붙습니다. 토큰을
+채운 뒤 아래 한 번만 실행하면 실제 발송으로 바뀝니다 (파일 수정 불필요).
+
+```
+setx STOCKNEWS_SEND 1
+```
+
+**등록되지 않은 것**: `news` · `brief-morning` · `brief-evening` ·
+`flash` · `weekly` · `brief-weekly` · `export` · `credit`.
+전부 텔레그램 토큰이 필요하거나 장중 반복 실행이라, 토큰을 채운 뒤
+같은 방식으로 추가하십시오.
+
+절전 대응으로 배터리 제한을 끄고 `StartWhenAvailable` / `WakeToRun` 을
+켜뒀습니다. 다만 `WakeToRun` 은 OS 전원 옵션에서 깨우기 타이머가 허용돼야
+동작합니다(9장).
+
 `flash` 는 4대 시간창(09:00~09:35 / 10:00~10:25 / 14:00~14:25 / 15:20~15:35)
 안에서만 실제로 스캔합니다. 창 밖 호출은 즉시 `{"skipped":true}` 로 끝나므로
 5분 간격으로 걸어도 부담이 없습니다.
