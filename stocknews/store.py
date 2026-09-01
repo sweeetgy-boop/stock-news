@@ -669,6 +669,17 @@ class Store:
                 "SELECT * FROM scans WHERE d>=? ORDER BY d", con,
                 params=(ds["d"].min(),))
 
+    def reco_count(self) -> int:
+        """전체 누적 추천 건수.
+
+        `reco_history` 는 최근 N일만 본다. 종이거래 표시에 쓰는 건
+        '지금까지 몇 건 쌓였나' 이므로 전체를 센다. 표본이 최소치에
+        닿기 전에는 성적을 신뢰하지 않는다는 표시다.
+        """
+        with closing(self._conn()) as con:
+            row = con.execute("SELECT COUNT(*) FROM recos").fetchone()
+        return int(row[0]) if row else 0
+
     def reco_history(self, days: int = 10) -> pd.DataFrame:
         with closing(self._conn()) as con:
             ds = pd.read_sql_query(

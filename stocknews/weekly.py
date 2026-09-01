@@ -30,58 +30,69 @@ from .config import Config, DEFAULT
 
 log = logging.getLogger(__name__)
 
-__all__ = ["audit_recos", "score_momentum", "persistence", "churn",
-           "band_eta", "weekly_events", "sector_concentration", "weekly_report"]
+__all__ = ["audit_recos", "audit_multi", "score_momentum", "persistence",
+           "churn", "band_eta", "weekly_events", "sector_concentration",
+           "weekly_report"]
 
 
 # ────────────────────────── 1. 자기 검증 ──────────────────────────
-def audit_recos(store, horizon: int = 5, lookback: int = 12) -> dict:
-    """과거 추천의 실제 성적. 시장 중위 수익률을 대조군으로 쓴다.
+def _score_horizon(recos: pd.DataFrame, pm: pd.DataFrame,
+                   horizon: int) -> tuple[pd.DataFrame, int, int]:
+    """한 보유기간의 채점. (채점된 행, 미도래 건수, 가격없음 건수).
 
-    horizon : 보유 가정 거래일수 (기본 5 = 1주)
-    대조군을 안 쓰면 하락장 반등을 전략의 실력으로 착각한다.
+    **미도래는 채점에서 뺀다.** 0으로 넣으면 평균이 0쪽으로 끌려가
+    성적이 실제보다 나빠 보이고, 실패로 세면 표본이 조용히 줄어든다.
+    별도로 세서 리포트에 그대로 노출한다.
     """
-    recos = store.reco_history(days=lookback)
-    pm = store.price_matrix(days=lookback + horizon + 5)
-    if recos.empty or pm.empty:
-        return {"n": 0, "note": "누적 데이터 부족"}
-
     dates = list(pm.index.strftime("%Y-%m-%d"))
     pos = {d: i for i, d in enumerate(dates)}
 
-    rows = []
+    rows: list[dict] = []
+    pending = 0
+    no_price = 0
     for _, r in recos.iterrows():
         d0 = str(r["d"])[:10]
         t = str(r["ticker"])
         if d0 not in pos or t not in pm.columns:
+            no_price += 1
             continue
         i0 = pos[d0]
         i1 = i0 + horizon
         if i1 >= len(dates):
+            pending += 1          # 보유기간이 아직 경과하지 않음
             continue
         p0, p1 = pm.iloc[i0][t], pm.iloc[i1][t]
         if not (pd.notna(p0) and pd.notna(p1) and p0 > 0):
+            no_price += 1
             continue
         ret = float(p1 / p0 - 1.0) * 100.0
 
-        # 같은 구간의 시장 중위 수익률
+        # 같은 구간의 시장 중위 수익률 (대조군)
         col0, col1 = pm.iloc[i0], pm.iloc[i1]
         mask = col0.notna() & col1.notna() & (col0 > 0)
-        mkt = float(((col1[mask] / col0[mask]) - 1.0).median() * 100.0) if mask.any() else np.nan
+        mkt = (float(((col1[mask] / col0[mask]) - 1.0).median() * 100.0)
+               if mask.any() else np.nan)
 
         rows.append({"date": d0, "ticker": t, "name": r["name"],
                      "slot": r["slot"], "grade": r["grade"],
                      "ret": ret, "mkt": mkt, "alpha": ret - mkt})
 
-    if not rows:
-        return {"n": 0, "note": f"보유기간 {horizon}일 경과 추천 없음"}
+    return pd.DataFrame(rows), pending, no_price
 
-    df = pd.DataFrame(rows)
-    by_slot = (df.groupby("slot")["alpha"]
-               .agg(["count", "mean"]).round(2).to_dict("index"))
+
+def _summarize(df: pd.DataFrame, horizon: int, pending: int,
+               no_price: int) -> dict:
+    """한 보유기간의 집계. 표본이 0이면 숫자를 만들지 않는다."""
+    if df.empty:
+        return {"horizon": horizon, "n": 0, "pending": pending,
+                "no_price": no_price,
+                "note": (f"보유 {horizon}거래일 미도래 {pending}건"
+                         if pending else f"보유 {horizon}거래일 표본 없음")}
     return {
-        "n": int(len(df)),
         "horizon": horizon,
+        "n": int(len(df)),
+        "pending": pending,
+        "no_price": no_price,
         "win_rate": float((df["ret"] > 0).mean() * 100.0),
         "alpha_win_rate": float((df["alpha"] > 0).mean() * 100.0),
         "mean_ret": float(df["ret"].mean()),
@@ -90,9 +101,71 @@ def audit_recos(store, horizon: int = 5, lookback: int = 12) -> dict:
         "mean_alpha": float(df["alpha"].mean()),
         "best": df.nlargest(3, "ret")[["name", "ret"]].to_dict("records"),
         "worst": df.nsmallest(3, "ret")[["name", "ret"]].to_dict("records"),
-        "by_slot": by_slot,
+        "by_slot": (df.groupby("slot")["alpha"]
+                    .agg(["count", "mean"]).round(2).to_dict("index")),
         "detail": df,
     }
+
+
+def audit_recos(store, horizon: int = 5, lookback: int = 12) -> dict:
+    """과거 추천의 실제 성적 (단일 보유기간).
+
+    horizon : 보유 가정 거래일수 (기본 5 = 1주)
+    대조군을 안 쓰면 하락장 반등을 전략의 실력으로 착각한다.
+
+    여러 기간을 한 번에 보려면 `audit_multi()` 를 쓴다.
+    """
+    recos = store.reco_history(days=lookback)
+    pm = store.price_matrix(days=lookback + horizon + 5)
+    if recos.empty or pm.empty:
+        return {"n": 0, "note": "누적 데이터 부족"}
+    df, pending, no_price = _score_horizon(recos, pm, horizon)
+    return _summarize(df, horizon, pending, no_price)
+
+
+def audit_multi(store, cfg: Config = DEFAULT,
+                horizons: tuple[int, ...] | None = None,
+                lookback: int | None = None) -> dict:
+    """보유기간 5/10/20 을 **병렬로** 채점한다.
+
+    한 기간만 보면 '이 전략이 5일물인지 20일물인지' 를 알 수 없다.
+    5일에 알파가 없어도 20일에 나올 수 있고 그 반대도 가능하다. 어느
+    보유기간에서 알파가 나는지 비교할 수 있게 나란히 낸다.
+
+    가격 행렬은 **가장 긴 기간** 기준으로 한 번만 뽑아 세 기간이 같은
+    구간을 본다. 기간마다 따로 뽑으면 대조군 모집단이 달라져 비교가
+    성립하지 않는다.
+
+    반환에 `total_recos`(전체 누적 추천 건수)와 `min_sample` 을 담는다.
+    표본이 최소치에 닿기 전에는 성적을 신뢰하지 않는다는 표시다.
+    """
+    ac = cfg.audit
+    hs = tuple(horizons) if horizons else ac.horizons
+    lb = int(lookback) if lookback else ac.lookback_dates
+    longest = max(hs) if hs else 0
+
+    out: dict = {
+        "horizons": list(hs),
+        "primary": hs[0] if hs else None,
+        "min_sample": ac.min_sample,
+        "total_recos": store.reco_count(),
+        "by_horizon": {},
+    }
+
+    recos = store.reco_history(days=lb)
+    pm = store.price_matrix(days=lb + longest + 5)
+    if recos.empty or pm.empty:
+        out["note"] = "누적 데이터 부족"
+        out["by_horizon"] = {
+            h: {"horizon": h, "n": 0, "pending": 0, "no_price": 0,
+                "note": "누적 데이터 부족"} for h in hs}
+        return out
+
+    out["sampled_recos"] = int(len(recos))
+    for h in hs:
+        df, pending, no_price = _score_horizon(recos, pm, h)
+        out["by_horizon"][h] = _summarize(df, h, pending, no_price)
+    return out
 
 
 # ────────────────────────── 2. 점수 모멘텀 ──────────────────────────
@@ -274,7 +347,8 @@ def weekly_report(store, cfg: Config = DEFAULT, week_days: int = 5,
         "trade_date": store.last_price_date(),
         "days_covered": len(week_scan_days),
         "universe_size": int(week_scans["ticker"].nunique()) if not week_scans.empty else 0,
-        "audit": audit_recos(store, horizon=horizon),
+        # 보유기간 5/10/20 병렬 채점. 단일 기간만 필요하면 audit_recos().
+        "audit": audit_multi(store, cfg=cfg),
         "momentum": score_momentum(week_scans),
         "persistence": persistence(recos, week_scans),
         "churn": churn(recos, week_days),

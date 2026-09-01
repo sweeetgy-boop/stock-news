@@ -52,6 +52,23 @@ def check(section: str, name: str, fn):
             traceback.print_exc()
 
 
+def _insert_reco(store, d: str, ticker: str, name: str, slot: str,
+                 grade: str, rank: int = 1) -> None:
+    """recos 에 1건 직접 삽입 (검증용).
+
+    `save_recos` 는 ScreenResult 객체를 요구한다. 채점 산술을 검증하는
+    앵커 테스트가 스크리너 객체 생성에 얽히면, 스크리너를 고칠 때
+    무관한 테스트가 깨진다. 그래서 테이블에 직접 넣는다.
+    """
+    import sqlite3
+    with sqlite3.connect(store.path) as con:
+        con.execute(
+            "INSERT INTO recos(d,rank,ticker,name,price,slot,grade,"
+            "value_score,trend_score,reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (d, rank, ticker, name, 100.0, slot, grade, 8.0, 1.0, ""))
+        con.commit()
+
+
 def near(a, b, tol=1e-6, label=""):
     assert abs(float(a) - float(b)) <= tol, \
         f"{label} 기대 {b} 실제 {a} (허용 {tol})"
@@ -717,7 +734,11 @@ def test_store(tmp: Path):
             rule="target:take1", action="TRIM", ratio=0.5, qty=50,
             signal_price=523_000, ret_pct=15.0, net_ret_pct=14.5,
             reason="+15% 도달", urgent=False)
-        log_id = st.record_exit_signal(dec, "2026-08-24")
+        # 신호 날짜를 하드코딩하면 안 된다. pending_exits(days=5) 는
+        # '오늘로부터 5일' 창이라, 고정 날짜는 달력이 지나면 창을 벗어나
+        # 코드 변경 없이 테스트가 깨진다 (2026-09-01 에 실제로 깨졌다).
+        sig_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        log_id = st.record_exit_signal(dec, sig_date)
         assert log_id > 0
 
         # 신호만으로는 잔량이 줄지 않아야 한다
@@ -3164,7 +3185,7 @@ def test_renderer(st):
 
 
 # ══════════════════════════ 10. 일일/주간 배치 ══════════════════════════
-def test_daily_weekly(st):
+def test_daily_weekly(st, tmp: Path):
     from stocknews.config import DEFAULT
     from stocknews.daily import scan_all, select_recommendations
     from stocknews.weekly import (audit_recos, band_eta, churn, persistence,
@@ -3234,12 +3255,130 @@ def test_daily_weekly(st):
         assert len(band_eta(empty)) == 0
         assert weekly_events(empty) == {"fib_breaks": [], "cross": []}
 
+    def t_audit_multi_anchor():
+        """보유기간 5/10/20 채점 앵커. 손으로 계산한 값과 대조한다.
+
+        픽스처를 이렇게 짠다. 거래일 30일, 종목 3개.
+          AAA  추천 종목. 매일 +1% 복리로 오른다.
+          BBB  시장 종목. 변동 없음 (100 고정).
+          CCC  시장 종목. 변동 없음 (100 고정).
+        추천일은 0번째 거래일. 시장 중위 수익률은 BBB/CCC 가 0% 이고
+        AAA 도 후보라 3종목 중위 = 0% 다 (0, 0, +x 의 중위는 0).
+
+        따라서 alpha = ret 이 되어 손계산이 가능하다.
+          5일  1.01^5  - 1 = +5.101%
+          10일 1.01^10 - 1 = +10.462%
+          20일 1.01^20 - 1 = +22.019%
+        """
+        from stocknews.config import AuditConfig, Config
+        from stocknews.store import Store
+        from stocknews.weekly import audit_multi
+
+        sta = Store(tmp / "audit_multi.db")
+        days = 30
+        idx = pd.DatetimeIndex(pd.bdate_range("2026-01-05", periods=days))
+        rise = np.array([100.0 * (1.01 ** i) for i in range(days)])
+        flat = np.full(days, 100.0)
+
+        for code, series in (("AAA000", rise), ("BBB000", flat),
+                             ("CCC000", flat)):
+            sta.upsert_prices(code, pd.DataFrame({
+                "시가": series, "고가": series, "저가": series,
+                "종가": series, "거래량": np.full(days, 1e6),
+            }, index=idx), allow_today=True)
+
+        d0 = idx[0].strftime("%Y-%m-%d")
+        _insert_reco(sta, d0, "AAA000", "상승주", "VALUE", "A")
+
+        cfg = Config(audit=AuditConfig(horizons=(5, 10, 20), min_sample=20,
+                                       lookback_dates=60))
+        rep = audit_multi(sta, cfg=cfg)
+
+        assert rep["horizons"] == [5, 10, 20], rep["horizons"]
+        assert rep["min_sample"] == 20
+        assert rep["total_recos"] == 1, rep["total_recos"]
+
+        by = rep["by_horizon"]
+        for h, want in ((5, 5.101), (10, 10.462), (20, 22.019)):
+            d = by[h]
+            assert d["n"] == 1, f"{h}일 표본 {d['n']}"
+            assert d["pending"] == 0, f"{h}일 미도래 {d['pending']}"
+            near(d["mean_ret"], want, tol=0.01, label=f"{h}일 수익률")
+            near(d["mean_mkt"], 0.0, tol=1e-9, label=f"{h}일 시장 중위")
+            near(d["mean_alpha"], want, tol=0.01, label=f"{h}일 초과수익")
+            near(d["win_rate"], 100.0, tol=1e-9, label=f"{h}일 승률")
+            near(d["alpha_win_rate"], 100.0, tol=1e-9,
+                 label=f"{h}일 초과승률")
+
+    def t_audit_pending_excluded():
+        """미도래는 채점에서 빼야 한다. 0 이나 실패로 처리하면 안 된다.
+
+        거래일 12일만 두고 추천일을 8번째에 둔다.
+          5일  -> 경과 (인덱스 8+5=13 > 11 이라 미도래)  ...가 아니라
+        정확히는 인덱스가 범위를 넘으면 미도래다. 아래에서 셋을 나눈다.
+        """
+        from stocknews.config import AuditConfig, Config
+        from stocknews.store import Store
+        from stocknews.weekly import audit_multi
+
+        stp = Store(tmp / "audit_pending.db")
+        days = 12
+        idx = pd.DatetimeIndex(pd.bdate_range("2026-02-02", periods=days))
+        series = np.full(days, 100.0)
+        for code in ("AAA111", "BBB111"):
+            stp.upsert_prices(code, pd.DataFrame({
+                "시가": series, "고가": series, "저가": series,
+                "종가": series, "거래량": np.full(days, 1e6),
+            }, index=idx), allow_today=True)
+
+        # 추천일 = 5번째 거래일(0-base). 5일 후 = 10 (범위 안),
+        # 10일 후 = 15 (범위 밖), 20일 후 = 25 (범위 밖)
+        d0 = idx[5].strftime("%Y-%m-%d")
+        _insert_reco(stp, d0, "AAA111", "평탄주", "VALUE", "B")
+
+        cfg = Config(audit=AuditConfig(horizons=(5, 10, 20)))
+        by = audit_multi(stp, cfg=cfg)["by_horizon"]
+
+        assert by[5]["n"] == 1 and by[5]["pending"] == 0, by[5]
+        for h in (10, 20):
+            assert by[h]["n"] == 0, f"{h}일이 채점됐다: {by[h]}"
+            assert by[h]["pending"] == 1, f"{h}일 미도래 미집계: {by[h]}"
+            # 0 으로 채워 넣지 않았는지 확인 — 통계 키가 아예 없어야 한다
+            assert "mean_ret" not in by[h], \
+                f"{h}일 미도래인데 수익률을 만들어냈다: {by[h]}"
+            assert "note" in by[h]
+
+    def t_audit_render_table():
+        """리포트에 세 기간이 나란히 나오고 종이거래 문구가 붙어야 한다."""
+        from stocknews.renderer import render_weekly
+        from stocknews.weekly import weekly_report
+
+        rep = weekly_report(st, DEFAULT)
+        txt = render_weekly(rep, datetime(2026, 8, 28, 16, 30), DEFAULT)
+        assert "검증 기간 — 실거래 아님" in txt, "종이거래 문구 누락"
+        assert "최소 20건" in txt, "최소 표본 표시 누락"
+        for h in (5, 10, 20):
+            assert f"{h}일" in txt, f"{h}일 행 누락"
+        assert "미도래" in txt, "미도래 열 누락"
+        # 표 정렬이 깨지지 않도록 pre 로 감쌌는지
+        assert "<pre>" in txt and "</pre>" in txt
+
+    def t_audit_recos_still_single():
+        """기존 단일 기간 API 는 그대로 동작해야 한다 (호출부 보호)."""
+        a = audit_recos(st, horizon=5)
+        assert isinstance(a, dict) and "n" in a
+        assert "by_horizon" not in a, "단일 API 가 다중 형태를 돌려줬다"
+
     check("daily", "플래그 배선 (배제 발동)", t_scan_all_flag_wiring)
     check("daily", "플래그 해제 후 정상 채점", t_scan_all_after_clear)
     check("daily", "추천 선정", t_select)
     check("weekly", "구성 요소", t_weekly_parts)
     check("weekly", "종합 리포트", t_weekly_report)
     check("weekly", "빈 데이터 처리", t_empty_frames)
+    check("audit", "5/10/20 채점 앵커", t_audit_multi_anchor)
+    check("audit", "미도래는 채점 제외", t_audit_pending_excluded)
+    check("audit", "리포트 표 + 종이거래 문구", t_audit_render_table)
+    check("audit", "단일 API 하위호환", t_audit_recos_still_single)
 
 
 # ══════════════════════════ 11. 임포트 / 모듈 무결성 ══════════════════════════
@@ -3395,7 +3534,7 @@ def main() -> int:
         test_agent_contract(tmp)
         if st is not None:
             test_renderer(st)
-            test_daily_weekly(st)
+            test_daily_weekly(st, tmp)
         return report()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

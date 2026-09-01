@@ -271,12 +271,23 @@ def render_top10(picks: list, asof, trade_date: str, scanned: int,
     return "\n".join(head) + "\n\n".join(body) + "\n" + "\n".join(tail)
 
 
-def _audit_block(a: dict) -> list[str]:
+def _paper_banner(a: dict) -> list[str]:
+    """종이거래 고정 문구. 리포트 맨 위에 붙는다.
+
+    검증 표본이 최소치에 닿기 전에 이 숫자를 실거래 판단에 쓰면 안 된다.
+    그 사실을 매번 명시한다 — 문서에만 적어두면 시간이 지나며 잊힌다.
+    """
+    n = int(a.get("total_recos") or 0)
+    need = int(a.get("min_sample") or 0)
+    return [f"📋 검증 기간 — 실거래 아님. alpha_win_rate 확보까지 "
+            f"기록만 누적 중 (현재 {n}건/최소 {need}건)"]
+
+
+def _audit_single(a: dict) -> list[str]:
+    """단일 보유기간 블록 (audit_recos 반환 형태)."""
     if not a or a.get("n", 0) == 0:
-        return ["━━ ① 지난 추천 자기검증 ━━",
-                f"• {a.get('note', '데이터 부족')}"]
+        return [f"• {a.get('note', '데이터 부족')}"]
     lines = [
-        "━━ ① 지난 추천 자기검증 ━━",
         f"• 표본 {a['n']}건 · 보유 {a['horizon']}거래일 가정",
         f"• 승률: <b>{a['win_rate']:.0f}%</b>  "
         f"(시장 대비 초과 승률 {a['alpha_win_rate']:.0f}%)",
@@ -301,15 +312,75 @@ def _audit_block(a: dict) -> list[str]:
     return lines
 
 
+def _audit_table(a: dict) -> list[str]:
+    """보유기간별 성적을 나란히. 어느 기간에서 알파가 나는지 비교용.
+
+    표는 `<pre>` 로 감싼다. 텔레그램 HTML 파스모드에서 등폭이 유지되지
+    않으면 열이 어긋나 비교가 불가능해진다.
+    """
+    by = a.get("by_horizon") or {}
+    hs = a.get("horizons") or sorted(by)
+    if not hs:
+        return ["• 데이터 부족"]
+
+    head = f"{'보유':>4} {'표본':>5} {'미도래':>6} {'승률':>6} {'초과승률':>8} {'평균':>7} {'초과':>8}"
+    rows = [head, "-" * len(head)]
+    scored = 0
+    for h in hs:
+        d = by.get(h) or by.get(str(h)) or {}
+        n = int(d.get("n") or 0)
+        pend = int(d.get("pending") or 0)
+        if n == 0:
+            rows.append(f"{h:>3}일 {'-':>5} {pend:>6} {'-':>6} {'-':>8} "
+                        f"{'-':>7} {'-':>8}")
+            continue
+        scored += 1
+        rows.append(
+            f"{h:>3}일 {n:>5} {pend:>6} {d['win_rate']:>5.0f}% "
+            f"{d['alpha_win_rate']:>7.0f}% {d['mean_ret']:>+6.2f}% "
+            f"{d['mean_alpha']:>+7.2f}%p")
+
+    out = ["<pre>" + "\n".join(rows) + "</pre>"]
+    if scored == 0:
+        pend_total = sum(int((by.get(h) or {}).get("pending") or 0) for h in hs)
+        out.append(f"• 채점 가능한 표본이 없다 (미도래 {pend_total}건). "
+                   "보유기간이 경과해야 성적이 나온다.")
+        return out
+
+    # 가장 짧은 채점 가능 기간의 상세만 덧붙인다. 세 기간 전부 풀어쓰면
+    # 리포트가 표보다 길어져 비교라는 목적을 잃는다.
+    for h in hs:
+        d = by.get(h) or by.get(str(h)) or {}
+        if int(d.get("n") or 0) > 0:
+            out.append(f"• {h}거래일 상세")
+            out += ["  " + ln for ln in _audit_single(d)]
+            break
+    return out
+
+
+def _audit_block(a: dict) -> list[str]:
+    """자기검증 블록. 다중 기간(audit_multi)과 단일(audit_recos) 둘 다 받는다."""
+    head = ["━━ ① 지난 추천 자기검증 ━━"]
+    if not a:
+        return head + ["• 데이터 부족"]
+    if "by_horizon" in a:
+        return head + _audit_table(a)
+    return head + _audit_single(a)
+
+
 def render_weekly(rep: dict, asof, cfg: Config = DEFAULT) -> str:
     """금요일 주간 누적 분석 리포트."""
+    audit = rep.get("audit") or {}
     out: list[str] = [
         f"📅 <b>[주간 누적 분석]</b> {rep.get('trade_date')}",
+    ]
+    out += _paper_banner(audit)
+    out += [
         f"• 집계 {rep.get('days_covered', 0)}거래일 · "
         f"관측 {rep.get('universe_size', 0):,}종목",
         "",
     ]
-    out += _audit_block(rep.get("audit") or {})
+    out += _audit_block(audit)
     out.append("")
 
     mom = rep.get("momentum")

@@ -73,6 +73,24 @@ class CreditConfig:
 
 
 @dataclass(frozen=True)
+class AuditConfig:
+    """자기검증(사후 채점) 파라미터.
+
+    보유기간을 하나로 고정하면 '이 전략이 5일물인지 20일물인지' 를 알 수
+    없다. 5일에서 알파가 없어도 20일에서 나올 수 있고 그 반대도 가능하다.
+    그래서 여러 기간을 **병렬로** 채점해 비교한다.
+
+    아직 기간이 경과하지 않은 추천은 '미도래'로 세고 채점에서 뺀다.
+    0으로 넣으면 평균이 0쪽으로 끌려가 성적이 실제보다 나빠 보이고,
+    실패로 처리하면 표본이 조용히 줄어든다. 둘 다 판단을 흐린다.
+    """
+
+    horizons: tuple[int, ...] = (5, 10, 20)   # 채점 보유기간 (거래일)
+    min_sample: int = 20        # 이 표본에 닿기 전에는 성적을 신뢰하지 않는다
+    lookback_dates: int = 60    # 조회할 추천 일자 수
+
+
+@dataclass(frozen=True)
 class GateConfig:
     """알림 게이트 파라미터."""
 
@@ -150,6 +168,7 @@ class Config:
     credit: CreditConfig = CreditConfig()
     gate: GateConfig = GateConfig()
     exit: ExitConfig = ExitConfig()
+    audit: AuditConfig = AuditConfig()
 
 
 DEFAULT = Config()
