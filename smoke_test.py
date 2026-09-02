@@ -3789,15 +3789,47 @@ def test_dividend_calendar(tmp: Path):
     WON = 1e8
 
     def t_year_end_break():
-        """연말 휴장: 12/31 이 영업일이면 그날, 아니면 직전 영업일."""
-        # 2024-12-31 화요일 -> 그날 휴장 -> 폐장일 12/30(월)
+        """연말 휴장: 12/31 이 영업일이면 그날, 아니면 직전 영업일.
+
+        2024·2025 폐장일은 2026-09-02 에 실제 적재 거래일과 대조해
+        일치를 확인한 값이다(`dividend_calendar` 독스트링의 표).
+        2023 은 시세가 없어 규칙 계산값만 고정한다.
+        """
+        # 2024-12-31 화요일 -> 그날 휴장 -> 폐장일 12/30(월)  [실측 일치]
         assert krx_year_end_break(2024) == date(2024, 12, 31)
         ltd, conf = last_trading_day_of_year(2024)
         assert ltd == date(2024, 12, 30), ltd
         assert conf is False, "실측 없이 확정으로 보고했다"
+        # 2025-12-31 수요일 -> 그날 휴장 -> 폐장일 12/30(화)  [실측 일치]
+        assert krx_year_end_break(2025) == date(2025, 12, 31)
+        assert last_trading_day_of_year(2025)[0] == date(2025, 12, 30)
         # 2023-12-31 일요일 -> 직전 영업일 12/29(금) 휴장 -> 폐장일 12/28(목)
         assert krx_year_end_break(2023) == date(2023, 12, 29)
         assert last_trading_day_of_year(2023)[0] == date(2023, 12, 28)
+
+    def t_year_end_last_buy_real_calendars():
+        """실측 거래일로 검산한 최종 매수일. 달력 모양에 따라 갈린다.
+
+        2024 는 12/28·29 가 주말이라 12/27 이 최종 매수일이고, 2025 는
+        12/29(월)이 최종 매수일이다. 같은 규칙에서 나오는 다른 답이며,
+        둘 다 적재된 실제 거래일로 확인했다.
+        """
+        cases = {
+            2024: ([(12, 24), (12, 26), (12, 27), (12, 30)],
+                   date(2024, 12, 27), date(2024, 12, 30)),
+            2025: ([(12, 24), (12, 26), (12, 29), (12, 30)],
+                   date(2025, 12, 29), date(2025, 12, 30)),
+        }
+        for y, (tds_md, want_buy, want_ex) in cases.items():
+            tds = [date(y, m, d) for m, d in tds_md]
+            bds = business_days(date(y, 12, 1), date(y + 1, 1, 31),
+                                holidays={f"{y + 1}-01-01"})
+            got_buy = last_buy_date(date(y, 12, 31), trading_days=tds,
+                                    business_days_=bds, settle_days=2)
+            got_ex = ex_dividend_date(date(y, 12, 31), trading_days=tds,
+                                      business_days_=bds, settle_days=2)
+            assert got_buy == want_buy, (y, got_buy, want_buy)
+            assert got_ex == want_ex, (y, got_ex, want_ex)
 
     def t_observed_beats_estimate():
         """실측 거래일이 있으면 추정하지 않는다."""
@@ -4043,7 +4075,10 @@ def test_dividend_calendar(tmp: Path):
                     "from .weekly"):
             assert bad not in src, f"dividend_calendar 가 {bad} 를 참조한다"
 
-    check("dividend-cal", "연말 휴장 + 폐장일 (2023/2024)", t_year_end_break)
+    check("dividend-cal", "연말 휴장 + 폐장일 (실측 대조 2024/2025)",
+          t_year_end_break)
+    check("dividend-cal", "연말 최종매수일 (실측 달력 2024/2025)",
+          t_year_end_last_buy_real_calendars)
     check("dividend-cal", "실측 달력이 추정을 이김", t_observed_beats_estimate)
     check("dividend-cal", "영업일 (주말·공휴일 제외)",
           t_business_days_skip_holidays)
