@@ -948,3 +948,106 @@ def render_positions(positions: list, price_map: dict | None = None) -> str:
     out.append("")
     out.append("※ 청산선은 진입 시점 스냅샷으로 고정됩니다 (재계산 안 함).")
     return "\n".join(out)
+
+
+# ══════════════════════════ 월간 배당 리포트 ══════════════════════════
+# 하단 고정 문구. **문자열을 여기 한 곳에만 둔다.**
+# 리포트마다 다시 쓰면 어느 날 한쪽에서 빠지고, 빠진 것을 아무도 모른다.
+DIVIDEND_FOOTER = ("📋 배당 팩트 리포트 — 매수 추천 아님. "
+                   "수치는 과거 공시 기준이며 올해 배당은 확정 전임.")
+
+# 이 표에 금지된 어휘. 스모크 테스트가 부재를 검사한다.
+# '목표 수량'·'매수 계획'·'추천' 이 붙으면 팩트 표가 지시문으로 읽힌다.
+DIVIDEND_BANNED = ("목표 수량", "매수 계획", "추천", "매수하십시오", "비중")
+
+
+def _d10(v) -> str:
+    """날짜를 YYYY-MM-DD 로. 없으면 '-'."""
+    if v is None:
+        return "-"
+    s = str(v)[:10]
+    return s if len(s) == 10 else "-"
+
+
+def _num_or_dash(v, fmt: str) -> str:
+    try:
+        if v is None or v != v:
+            return "-"
+        return format(float(v), fmt)
+    except (TypeError, ValueError):
+        return "-"
+
+
+def render_dividend_report(rep: dict, asof, cfg: Config = DEFAULT) -> str:
+    """월간 배당 팩트 리포트.
+
+    **숫자와 날짜만 낸다.** 해석·권유 문구를 붙이지 않는다. 배당주는
+    '안정적'이라는 말이 가장 쉽게 붙는 자리라, 그 말이 붙으면 표가
+    판단을 대신하기 시작한다.
+
+    기준일·최종 매수일은 **추정**이다. 컬럼명에 그 사실을 박아 넣는다
+    (`dividend_calendar` 독스트링 참조). 확정 날짜처럼 보이면 사람이
+    그 날짜에 주문을 낸다.
+    """
+    rows = rep.get("rows") or []
+    head = [
+        "💰 <b>[월간 배당 팩트]</b>",
+        "",
+        f"• 기준일 {_e(rep.get('trade_date') or '-')} 종가 · "
+        f"사업연도 {_e(rep.get('base_year') or '-')} 확정 배당",
+        f"• 필터 평가 {rep.get('evaluated', 0):,}종목 · "
+        f"통과 {rep.get('passed', 0):,}종목",
+    ]
+    fun = rep.get("funnel") or {}
+    if fun:
+        bits = [f"{k} {v.get('failed', 0)}" for k, v in sorted(fun.items())]
+        head.append("• 탈락 " + " · ".join(bits))
+
+    if not rows:
+        head += ["", "• 전 필터를 통과한 종목이 없습니다.",
+                 f"• {rep.get('reason') or ''}".rstrip(), "", DIVIDEND_FOOTER]
+        return "\n".join(x for x in head if x is not None)
+
+    w = (7, 12, 9, 7, 7, 7, 8, 12, 12)
+    hdr = ("코드", "종목명", "현재가", "DPS", "수익률", "성향",
+           "5yr성장", "기준일(추정)", "최종매수(추정)")
+    table = ["".join(_pad(h, wi) for h, wi in zip(hdr, w))]
+    for r in rows:
+        cells = (
+            r.get("code") or "-",
+            (str(r.get("name") or "")[:6]),
+            _num_or_dash(r.get("price"), ",.0f"),
+            _num_or_dash(r.get("dps"), ",.0f"),
+            _num_or_dash(r.get("div_yield"), ".2f") + "%",
+            _num_or_dash(r.get("payout"), ".1f") + "%",
+            (_num_or_dash(r.get("cagr"), "+.1f") + "%"
+             if r.get("cagr") is not None else "-"),
+            _d10(r.get("record_date")),
+            _d10(r.get("last_buy")),
+        )
+        table.append("".join(_pad(c, wi) for c, wi in zip(cells, w)))
+
+    n_conf = sum(1 for r in rows if r.get("calendar_confirmed"))
+    body = [
+        "",
+        f"━━ 상위 {len(rows)}종목 (배당수익률순) ━━",
+        "<pre>" + "\n".join(table) + "</pre>",
+        "• 연속연수: " + " · ".join(
+            f"{_e(str(r.get('name') or '')[:6])} {r.get('years_paid') or 0}년"
+            for r in rows[:8]),
+        "",
+        "━━ 날짜에 관하여 ━━",
+        "• 기준일·최종매수일은 <b>추정</b>입니다. 공시된 날짜가 아닙니다.",
+        "• 결산기말일을 기준일로 가정하고 결제 T+"
+        f"{int(cfg.dividend.settle_days)}(영업일)로 역산했습니다.",
+        "• 2024년 배당절차 개선 이후 배당액 확정 뒤에 기준일을 잡는 회사가 "
+        "늘었습니다. 그런 종목은 12월이 아니라 이듬해 2~4월입니다.",
+        f"• 달력 실측 확인 {n_conf}/{len(rows)}종목 "
+        "(미확인은 주말·기지정 휴장일만 반영한 추정 달력입니다)",
+        "",
+        f"• 5yr성장 = 최근 {int(cfg.dividend.cagr_years)}개 사업연도 DPS "
+        "연평균 성장률. 시작 연도가 무배당이면 '-' 입니다.",
+        "",
+        DIVIDEND_FOOTER,
+    ]
+    return "\n".join(head + body)

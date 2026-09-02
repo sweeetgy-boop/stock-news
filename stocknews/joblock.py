@@ -48,6 +48,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "credit-kiwoom": 5400,   # 90분 (유량 제한이 걸리면 스스로 느려진다)
     # 전종목 배당 수집. 종목당 DART 2~3회 x 2,500종목.
     "collect-dividends": 7200,
+    # 배당 리포트. 네트워크 없이 로컬 DB 만 읽고 필터 판정을 적재한다.
+    "dividend-report": 600,
     "flags": 3600,        # DART 조회가 종목당 0.25초
     "daily": 1800,        # 30분
     "flash": 1200,

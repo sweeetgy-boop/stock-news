@@ -3761,6 +3761,312 @@ def test_dividend_screen(tmp: Path):
           t_record_only_boundary)
 
 
+def test_dividend_calendar(tmp: Path):
+    """배당락 캘린더 · DPS 성장률 · 월간 리포트.
+
+    캘린더 산술은 합성 달력으로 고정한다. 미래 공휴일은 알 수 없으므로
+    '실측 달력이 있으면 그걸 쓰고 없으면 추정으로 표시한다'는 계약이
+    핵심이고, 그 계약을 테스트가 강제한다.
+    """
+    from datetime import date
+
+    from stocknews.config import DEFAULT, Config, DividendConfig
+    from stocknews.dividend_calendar import (build_dividend_report,
+                                             business_days, dps_cagr,
+                                             ex_dividend_date,
+                                             is_first_saturday,
+                                             krx_year_end_break,
+                                             last_buy_date,
+                                             last_trading_day_of_year,
+                                             next_record_date,
+                                             record_date_plan,
+                                             report_send_allowed)
+    from stocknews.renderer import (DIVIDEND_BANNED, DIVIDEND_FOOTER,
+                                    render_dividend_report)
+    from stocknews.store import Store
+
+    BASE = 2025
+    WON = 1e8
+
+    def t_year_end_break():
+        """연말 휴장: 12/31 이 영업일이면 그날, 아니면 직전 영업일."""
+        # 2024-12-31 화요일 -> 그날 휴장 -> 폐장일 12/30(월)
+        assert krx_year_end_break(2024) == date(2024, 12, 31)
+        ltd, conf = last_trading_day_of_year(2024)
+        assert ltd == date(2024, 12, 30), ltd
+        assert conf is False, "실측 없이 확정으로 보고했다"
+        # 2023-12-31 일요일 -> 직전 영업일 12/29(금) 휴장 -> 폐장일 12/28(목)
+        assert krx_year_end_break(2023) == date(2023, 12, 29)
+        assert last_trading_day_of_year(2023)[0] == date(2023, 12, 28)
+
+    def t_observed_beats_estimate():
+        """실측 거래일이 있으면 추정하지 않는다."""
+        obs = {"2026-12-24", "2026-12-28", "2026-12-29"}
+        ltd, conf = last_trading_day_of_year(2026, observed=obs)
+        assert ltd == date(2026, 12, 29) and conf is True, (ltd, conf)
+
+    def t_business_days_skip_holidays():
+        bd = business_days(date(2026, 1, 1), date(2026, 1, 7),
+                           holidays={"2026-01-01"})
+        assert date(2026, 1, 1) not in bd, "공휴일이 영업일에 남았다"
+        assert date(2026, 1, 3) not in bd, "토요일이 영업일에 남았다"
+        assert date(2026, 1, 2) in bd and date(2026, 1, 5) in bd, bd
+
+    def t_last_buy_two_calendars():
+        """결제는 영업일, 매수는 거래일. 연말에 이 둘이 갈린다.
+
+        기준일 12/31(휴장이지만 결제 영업일). 12/30 에 사면 결제가
+        1/2 이라 명부에 없고, 12/29 에 사면 12/31 결제로 명부에 오른다.
+        거래일만으로 세면 하루 앞당겨져 12/28 이 나온다.
+        """
+        # 2026-12: 28(월) 29(화) 30(수) 31(목) · 31 은 휴장
+        bds = [date(2026, 12, d) for d in (24, 28, 29, 30, 31)]
+        tds = [d for d in bds if d != date(2026, 12, 31)]
+        rec = date(2026, 12, 31)
+        lb = last_buy_date(rec, trading_days=tds, business_days_=bds,
+                           settle_days=2)
+        assert lb == date(2026, 12, 29), lb
+        ex = ex_dividend_date(rec, trading_days=tds, business_days_=bds,
+                              settle_days=2)
+        assert ex == date(2026, 12, 30), ex
+        # 거래일만 썼다면 12/28 이 나온다 — 그 오답을 명시적으로 배제한다
+        wrong = last_buy_date(rec, trading_days=tds, business_days_=tds,
+                              settle_days=2)
+        assert wrong == date(2026, 12, 28), wrong
+        assert lb != wrong, "두 달력을 구분하지 않았다"
+
+    def t_last_buy_when_record_is_trading_day():
+        """기준일이 거래일이면 T+2 만큼 더 앞선다 (3월 결산 등)."""
+        bds = [date(2026, 3, d) for d in (25, 26, 27, 30, 31)]
+        rec = date(2026, 3, 31)
+        lb = last_buy_date(rec, trading_days=bds, business_days_=bds,
+                           settle_days=2)
+        assert lb == date(2026, 3, 27), lb
+
+    def t_next_record_date():
+        """결산기말일의 월/일을 적용. 이미 지났으면 다음 해."""
+        assert next_record_date("2025-12-31", asof="2026-09-02") == \
+            date(2026, 12, 31)
+        # 기준일이 지났으면 다음 해로 넘어간다
+        assert next_record_date("2025-12-31", asof="2027-01-05") == \
+            date(2027, 12, 31)
+        # 3월 결산
+        assert next_record_date("2026-03-31", asof="2026-09-02") == \
+            date(2027, 3, 31)
+        assert next_record_date(None) is None
+        assert next_record_date("") is None
+
+    def t_record_plan_marks_estimate():
+        """실측 달력이 없으면 confirmed=False 로 남아야 한다."""
+        plan = record_date_plan("2025-12-31", asof="2026-09-02")
+        assert plan["record_date"] == date(2026, 12, 31), plan
+        assert plan["confirmed"] is False, "추정을 확정으로 보고했다"
+        assert plan["last_buy"] is not None and plan["ex_date"] is not None
+        assert plan["last_buy"] < plan["ex_date"] <= plan["record_date"], plan
+
+    def t_cagr_anchor():
+        """CAGR = (마지막/처음)^(1/(n-1)) - 1. 5년이면 성장 기간 4번."""
+        # 100 -> 200, 4기간: 2^(1/4)-1 = 18.9207%
+        dps = {2021: 100.0, 2022: 120.0, 2023: 140.0, 2024: 170.0,
+               2025: 200.0}
+        near(dps_cagr(dps, 2025, 5), 18.92, tol=0.005, label="CAGR")
+        # 변화 없음 -> 0%
+        flat = {y: 500.0 for y in range(2021, 2026)}
+        near(dps_cagr(flat, 2025, 5), 0.0, label="정액 CAGR")
+        # 감소도 그대로 음수로 낸다
+        down = {2021: 200.0, 2022: 180.0, 2023: 160.0, 2024: 140.0,
+                2025: 100.0}
+        got = dps_cagr(down, 2025, 5)
+        assert got is not None and got < 0, got
+        near(got, -15.91, tol=0.01, label="감소 CAGR")
+
+    def t_cagr_none_cases():
+        """시작 연도가 무배당/결측이면 None. 0 에서 성장률을 만들지 않는다."""
+        assert dps_cagr({2021: 0.0, 2025: 500.0}, 2025, 5) is None
+        assert dps_cagr({2025: 500.0}, 2025, 5) is None, "시작 결측인데 값을 냈다"
+        assert dps_cagr({2021: 100.0}, 2025, 5) is None
+        assert dps_cagr({2021: 100.0, 2025: 200.0}, 2025, 1) is None
+        assert dps_cagr({}, 2025, 5) is None
+
+    def t_send_gate_first_saturday():
+        """매월 첫 토요일만 발송. --force 는 요일을 무시한다."""
+        # 2026-09: 1일 화요일 -> 첫 토요일 9/5
+        assert is_first_saturday(date(2026, 9, 5)) is True
+        assert is_first_saturday(date(2026, 9, 12)) is False, "둘째 토요일"
+        assert is_first_saturday(date(2026, 9, 4)) is False, "금요일"
+        # 1일이 일요일인 달: 2026-11 -> 첫 토요일 11/7
+        assert is_first_saturday(date(2026, 11, 7)) is True
+        assert is_first_saturday(date(2026, 11, 1)) is False
+        ok, why = report_send_allowed(datetime(2026, 9, 5, 9, 0))
+        assert ok is True and why == "send_day", (ok, why)
+        ok2, why2 = report_send_allowed(datetime(2026, 9, 12, 9, 0))
+        assert ok2 is False and why2 == "off_day", (ok2, why2)
+        ok3, why3 = report_send_allowed(datetime(2026, 9, 12, 9, 0),
+                                        force=True)
+        assert ok3 is True and why3 == "force", (ok3, why3)
+        # 시각과 무관해야 한다
+        for hh in (0, 9, 16, 23):
+            assert report_send_allowed(datetime(2026, 9, 5, hh, 30))[0] is True
+
+    def t_send_gate_decoupled():
+        """추천 발송(일요일)과 **코드가** 얽히지 않아야 한다.
+
+        문서에서 서로를 언급하는 것은 괜찮다 — 규격이 같다는 설명은
+        있어야 한다. 금지되는 것은 호출·임포트 의존이다. 한쪽 게이트를
+        고칠 때 다른 쪽이 조용히 따라 바뀌면 안 된다.
+        """
+        import inspect
+
+        from stocknews import dividend_calendar as dcal
+        from stocknews import notify as ntf
+
+        assert "reco_send_allowed" not in \
+            dcal.report_send_allowed.__code__.co_names, "추천 게이트를 호출한다"
+        assert "report_send_allowed" not in \
+            ntf.reco_send_allowed.__code__.co_names, "추천 게이트가 이걸 호출한다"
+        imports = [ln for ln in inspect.getsource(dcal).splitlines()
+                   if ln.startswith(("import ", "from "))]
+        assert not any("reco_send_allowed" in ln for ln in imports), imports
+        # 요일 상수가 서로 다른 자리에서 온다
+        assert int(DEFAULT.gate.reco_send_dow) != \
+            int(DEFAULT.dividend.report_dow), "두 게이트가 같은 요일을 본다"
+        # 일요일(추천 발송일)은 배당 리포트 발송일이 아니다
+        assert report_send_allowed(datetime(2026, 9, 6, 9, 0))[0] is False
+
+    def _seed(s: Store, n: int = 3):
+        idx = pd.DatetimeIndex([datetime(2026, 8, 31)])
+        rows = []
+        for i in range(n):
+            code = "%05d0" % i
+            rows.append({"ticker": code, "name": f"배당주{i}",
+                         "market": "KOSPI", "sector": "반도체",
+                         "market_cap": 10_000 * WON, "shares": 1e6})
+            s.upsert_dividends([
+                {"code": code, "fiscal_year": y,
+                 "dps": 300.0 + i * 100.0 + (y - (BASE - 4)) * 10.0,
+                 "total_dividend": 100 * WON, "net_income": 1000 * WON,
+                 "payout_ratio": 50.0, "ocf": 600 * WON, "capex": 100 * WON,
+                 "fcf": 500 * WON, "status": "paid",
+                 "settle_dt": f"{y}-12-31"}
+                for y in range(BASE - 4, BASE + 1)])
+            s.upsert_prices(code, pd.DataFrame(
+                {"시가": [10_000.0], "고가": [10_000.0], "저가": [10_000.0],
+                 "종가": [10_000.0], "거래량": [1000.0]}, index=idx),
+                allow_today=True)
+        s.upsert_tickers(rows)
+
+    def t_report_build():
+        s = Store(tmp / "divrep.db")
+        _seed(s)
+        rep = build_dividend_report(s, DEFAULT, asof="2026-09-02",
+                                    trade_date="2026-08-31", base_year=BASE)
+        assert rep["evaluated"] == 3 and rep["passed"] == 3, rep
+        assert len(rep["rows"]) == 3, rep["rows"]
+        r = rep["rows"][0]
+        for key in ("code", "name", "price", "dps", "div_yield", "years_paid",
+                    "payout", "cagr", "record_date", "last_buy", "ex_date"):
+            assert key in r, f"{key} 누락"
+        assert r["record_date"] == date(2026, 12, 31), r["record_date"]
+        assert r["last_buy"] is not None and r["cagr"] is not None
+        # 수익률 내림차순
+        ys = [x["div_yield"] for x in rep["rows"]]
+        assert ys == sorted(ys, reverse=True), ys
+
+    def t_report_render():
+        s = Store(tmp / "divrep2.db")
+        _seed(s)
+        rep = build_dividend_report(s, DEFAULT, asof="2026-09-02",
+                                    trade_date="2026-08-31", base_year=BASE)
+        txt = render_dividend_report(rep, datetime(2026, 9, 5, 9, 0), DEFAULT)
+        assert isinstance(txt, str) and txt, "빈 리포트"
+        assert "{" not in txt and "}" not in txt, "포맷 문자열이 남았다"
+        assert DIVIDEND_FOOTER in txt, "하단 고정 문구 누락"
+        assert "<pre>" in txt and "</pre>" in txt, "등폭 표가 아니다"
+        for col in ("현재가", "DPS", "수익률", "성향", "5yr성장",
+                    "기준일(추정)", "최종매수(추정)"):
+            assert col in txt, f"컬럼 {col} 누락"
+        assert "연속연수" in txt, "연속연수 누락"
+        assert "추정" in txt, "추정 표기 누락"
+
+    def t_report_no_persuasion():
+        """권유·지시 문구가 없어야 한다. 팩트 표는 지시문이 아니다."""
+        s = Store(tmp / "divrep3.db")
+        _seed(s)
+        rep = build_dividend_report(s, DEFAULT, asof="2026-09-02",
+                                    trade_date="2026-08-31", base_year=BASE)
+        txt = render_dividend_report(rep, datetime(2026, 9, 5, 9, 0), DEFAULT)
+        # 고정 문구 안의 '매수 추천 아님' 은 부정문이므로 그 부분만 뺀다
+        body = txt.replace(DIVIDEND_FOOTER, "")
+        for bad in DIVIDEND_BANNED:
+            assert bad not in body, f"금지 문구 '{bad}' 가 있다"
+        for bad in ("안정적", "유망", "매력적", "저평가", "기회"):
+            assert bad not in body, f"해석 문구 '{bad}' 가 있다"
+
+    def t_report_empty():
+        """통과 0건이면 표 대신 사실만. 고정 문구는 그대로 붙는다."""
+        s = Store(tmp / "divrep4.db")
+        rep = build_dividend_report(s, DEFAULT, asof="2026-09-02",
+                                    trade_date="2026-08-31", base_year=BASE)
+        assert rep["rows"] == [], rep
+        txt = render_dividend_report(rep, datetime(2026, 9, 5, 9, 0), DEFAULT)
+        assert DIVIDEND_FOOTER in txt, "빈 리포트에 고정 문구가 없다"
+        assert "통과한 종목이 없습니다" in txt, txt[:200]
+
+    def t_report_top_n():
+        """top_n 을 config 에서 가져와야 한다."""
+        s = Store(tmp / "divrep5.db")
+        _seed(s, n=6)
+        cfg = Config(dividend=DividendConfig(top_n=2))
+        rep = build_dividend_report(s, cfg, asof="2026-09-02",
+                                    trade_date="2026-08-31", base_year=BASE)
+        assert rep["passed"] == 6, rep["passed"]
+        assert len(rep["rows"]) == 2, rep["rows"]
+
+    def t_mode_wiring():
+        """모드가 배선돼 있고 쓰기 락 계약을 지키는지."""
+        import importlib
+        from stocknews.joblock import MODE_TIMEOUTS
+        mod = importlib.import_module("run_screen")
+        assert "dividend-report" in mod.MODES, "MODES 에 없다"
+        assert "dividend-report" in mod._WRITE_MODES, "쓰기 모드가 아니다"
+        assert "dividend-report" in MODE_TIMEOUTS, "락 타임아웃이 없다"
+        # 월 1회라 매일/매주 스케줄 기대치에 들어가면 안 된다
+        assert "dividend-report" not in mod._SCHEDULE_DAILY
+        assert "dividend-report" not in mod._SCHEDULE_WEEKLY
+        assert "collect-dividends" not in mod._SCHEDULE_DAILY
+        assert "collect-dividends" not in mod._SCHEDULE_WEEKLY
+
+    def t_record_only_boundary():
+        src = (Path(__file__).parent / "stocknews" / "dividend_calendar.py"
+               ).read_text(encoding="utf-8")
+        for bad in ("from .screener", "from .liquidation", "from .exits",
+                    "from .weekly"):
+            assert bad not in src, f"dividend_calendar 가 {bad} 를 참조한다"
+
+    check("dividend-cal", "연말 휴장 + 폐장일 (2023/2024)", t_year_end_break)
+    check("dividend-cal", "실측 달력이 추정을 이김", t_observed_beats_estimate)
+    check("dividend-cal", "영업일 (주말·공휴일 제외)",
+          t_business_days_skip_holidays)
+    check("dividend-cal", "최종 매수일 = 두 달력 (연말)",
+          t_last_buy_two_calendars)
+    check("dividend-cal", "기준일이 거래일인 경우 (3월 결산)",
+          t_last_buy_when_record_is_trading_day)
+    check("dividend-cal", "다음 기준일 (결산기말일)", t_next_record_date)
+    check("dividend-cal", "추정은 confirmed=False", t_record_plan_marks_estimate)
+    check("dividend-cal", "DPS CAGR 앵커 (4기간)", t_cagr_anchor)
+    check("dividend-cal", "CAGR None (0 에서 시작 금지)", t_cagr_none_cases)
+    check("dividend-cal", "발송 게이트 (매월 첫 토요일)",
+          t_send_gate_first_saturday)
+    check("dividend-cal", "추천 게이트와 비결합", t_send_gate_decoupled)
+    check("dividend-cal", "리포트 조립", t_report_build)
+    check("dividend-cal", "리포트 렌더 + 고정 문구", t_report_render)
+    check("dividend-cal", "권유·해석 문구 부재", t_report_no_persuasion)
+    check("dividend-cal", "통과 0건 리포트", t_report_empty)
+    check("dividend-cal", "상위 N = config", t_report_top_n)
+    check("dividend-cal", "모드 배선 + 락 계약", t_mode_wiring)
+    check("dividend-cal", "채점 경로 미참조", t_record_only_boundary)
+
+
 def test_docs():
     """라이선스와 면책 조항이 있어야 한다. 금융 코드의 필수 요건이다."""
     root = Path(__file__).parent
@@ -4208,6 +4514,7 @@ def test_agent_contract(tmp: Path):
             ["--mode", "pos-close"],         # exit 64 경로도 마찬가지
             ["--mode", "credit-kiwoom"],     # 자격증명 없음 -> exit 4
             ["--mode", "collect-dividends"],  # 키 없음/마스터 없음 -> exit 4
+            ["--mode", "dividend-report"],    # 데이터 없음 -> exit 0
             ["--mode", "runs"],              # exit 2 경로 (스케줄 공백)
         ]
         for argv in cases:
@@ -6130,6 +6437,7 @@ def main() -> int:
         test_kiwoom_rest(tmp)
         test_dividends(tmp)
         test_dividend_screen(tmp)
+        test_dividend_calendar(tmp)
         test_docs()
         test_env(tmp)
         test_joblock(tmp)

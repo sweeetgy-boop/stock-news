@@ -322,6 +322,23 @@ DIV_TOP_N = 15           # 리포트 상위 N
 # 사실상 자기 자신이라 필터가 의미를 잃는다. 그때는 F6 을 스킵한다.
 DIV_SECTOR_MIN_MEMBERS = 5
 
+# 주식 결제 주기. **영업일 기준 T+2** 다 (거래일이 아니다).
+# 연말이 정확히 이 둘이 갈리는 지점이다 — 12월 31일은 증시는 휴장이지만
+# 결제 영업일이다. 그래서 배당락 캘린더는 달력을 두 개 쓴다.
+DIV_SETTLE_DAYS = 2
+
+# 월간 배당 리포트 발송 요일. `datetime.weekday()` 규격(월=0 … 일=6).
+# 5 = 토요일이고, **매월 첫 토요일**에만 보낸다.
+#
+# 토요일을 고른 이유는 추천 10선을 일요일로 고른 것과 같다(12장). 장이
+# 닫혀 있어 그날 안에 주문을 낼 수 없으므로, 읽고 나서 최소 이틀의 숙려
+# 시간이 구조적으로 강제된다. 월 1회인 이유는 배당 데이터가 사업보고서
+# 시즌에만 바뀌기 때문이다 — 매주 보내면 같은 표를 네 번 보낸다.
+DIV_REPORT_DOW = 5
+
+# DPS 성장률(CAGR) 구간. 사업연도 수다. 구간이 5년이면 성장 기간은 4번이다.
+DIV_CAGR_YEARS = 5
+
 
 @dataclass(frozen=True)
 class DividendConfig:
@@ -338,6 +355,9 @@ class DividendConfig:
     max_payout: float = DIV_MAX_PAYOUT
     top_n: int = DIV_TOP_N
     sector_min_members: int = DIV_SECTOR_MIN_MEMBERS
+    settle_days: int = DIV_SETTLE_DAYS
+    report_dow: int = DIV_REPORT_DOW
+    cagr_years: int = DIV_CAGR_YEARS
 
 
 @dataclass(frozen=True)

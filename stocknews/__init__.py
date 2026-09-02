@@ -22,6 +22,8 @@ from .contracts import (DONE_TAKE1, DONE_TAKE2, CrossEvent, ExitDecision,
 from .daily import run_daily, scan_all, select_recommendations
 from .dividend_data import (collect_dividends, latest_fiscal_year,
                             parse_alot_matter, parse_cashflow, payout_ratio)
+from .dividend_calendar import (build_dividend_report, dps_cagr,
+                                record_date_plan, report_send_allowed)
 from .dividend_screen import (collect_dividend_screen, screen_dividends,
                               screen_one as screen_dividend_one)
 from .env import load_env
@@ -64,6 +66,8 @@ __all__ = [
     "parse_cashflow", "payout_ratio",
     "DividendConfig", "screen_dividends", "screen_dividend_one",
     "collect_dividend_screen",
+    "build_dividend_report", "dps_cagr", "record_date_plan",
+    "report_send_allowed",
     "load_env",
 ]
 

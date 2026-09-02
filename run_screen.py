@@ -55,6 +55,8 @@ import pandas as pd
 
 from stocknews.config import DEFAULT
 from stocknews.daily import run_daily, scan_all, select_recommendations
+from stocknews.dividend_calendar import (build_dividend_report,
+                                         report_send_allowed)
 from stocknews.dividend_data import (collect_dividends, dart_key_present,
                                      latest_fiscal_year)
 from stocknews.env import load_env
@@ -82,6 +84,7 @@ from stocknews.news_sources import collect_all
 from stocknews.notify import (AlertGate, reco_send_allowed,  # noqa: F401
                              reco_send_dow_label, send_telegram)
 from stocknews.renderer import (render_daily_holdings, render_detail,
+                                render_dividend_report,
                                 render_evening_brief, render_exit_alert,
                                 render_exit_digest, render_fib_list,
                                 render_morning_brief, render_news_weekly,
@@ -127,9 +130,9 @@ PARTIAL_FAIL_RATIO = 0.10
 
 # DB 를 쓰는 모드. 락으로 직렬화한다. 읽기 전용 조회는 제외.
 _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
-                "credit-kiwoom", "collect-dividends", "daily", "exits",
-                "news", "brief-morning", "brief-evening", "flash",
-                "pos-open", "fill", "pos-close"}
+                "credit-kiwoom", "collect-dividends", "dividend-report",
+                "daily", "exits", "news", "brief-morning", "brief-evening",
+                "flash", "pos-open", "fill", "pos-close"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -984,6 +987,51 @@ def mode_collect_dividends(store: Store, args) -> int:
     return EXIT_PARTIAL if _partial(res["stored"], res["failed"]) else EXIT_OK
 
 
+def mode_dividend_report(store: Store, args) -> int:
+    """월간 배당 팩트 리포트. **텔레그램 발송은 매월 첫 토요일 1회.**
+
+    발송일이 아니어도 계산은 한다. 필터 판정을 저장해 두면 나중에 '그때
+    무엇이 통과했나'를 되짚을 수 있고, 사람이 아무 날에 명령을 쳐서
+    표를 확인할 수도 있어야 한다. 발송만 요일로 묶는다 (12장과 같은
+    이유다 — 알림 빈도가 판단을 지배하지 않게).
+    """
+    allowed, reason = report_send_allowed(cfg=DEFAULT, force=args.force)
+    rep = build_dividend_report(
+        store, DEFAULT, trade_date=args.date or None,
+        base_year=args.div_year or None, force_screen=args.force)
+
+    scr = rep.get("screen") or {}
+    SUMMARY.update({
+        "trade_date": rep.get("trade_date"), "base_year": rep.get("base_year"),
+        "dow": now_kst().weekday(), "send_reason": reason,
+        "evaluated": rep.get("evaluated", 0), "passed": rep.get("passed", 0),
+        "stored": scr.get("stored", 0), "funnel": rep.get("funnel"),
+        "rows": len(rep.get("rows") or []),
+        "confirmed_calendar": rep.get("confirmed_calendar"),
+    })
+    if rep.get("reason"):
+        SUMMARY["reason"] = rep["reason"]
+
+    text = render_dividend_report(rep, now_kst(), DEFAULT)
+    if allowed:
+        _emit(text, args.dry_run)
+        SUMMARY["report_sent"] = True
+    else:
+        # 발송일이 아니다. 사람이 읽을 수 있게 콘솔로만 낸다.
+        log.info("발송일(매월 첫 토요일)이 아님 — 표만 표시합니다 (%s)", reason)
+        _say("\n" + text + "\n")
+        SUMMARY["report_sent"] = False
+
+    SUMMARY["top"] = [
+        {"rank": i, "ticker": r["code"], "name": r["name"],
+         "price": r["price"], "dps": r["dps"], "yield": r["div_yield"],
+         "payout": r["payout"], "years": r["years_paid"], "cagr": r["cagr"],
+         "record_date": str(r["record_date"]) if r["record_date"] else None,
+         "last_buy": str(r["last_buy"]) if r["last_buy"] else None}
+        for i, r in enumerate(rep.get("rows") or [], 1)]
+    return EXIT_OK
+
+
 def mode_credit(store: Store, args) -> int:
     """신용잔고 주입. 이 시스템 핵심 가설의 데이터 구멍을 메운다.
 
@@ -1514,6 +1562,7 @@ MODES = {
     "credit": mode_credit,
     "credit-kiwoom": mode_credit_kiwoom,
     "collect-dividends": mode_collect_dividends,
+    "dividend-report": mode_dividend_report,
     "credit-probe": mode_credit_probe,
     "kiwoom-plan": mode_kiwoom_plan,
     "backtest": mode_backtest,
