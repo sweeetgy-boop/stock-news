@@ -124,6 +124,23 @@ _CAPEX_IDS = frozenset({
 _CAPEX_NAMES = frozenset({
     "유형자산의취득", "무형자산의취득",
 })
+# 자사주 취득액. 총주주환원율(배당 + 자사주)의 분자다.
+#
+# **주요사항보고서를 파싱하지 않는다.** 현금흐름표 재무활동에 이미 있다
+# (2026-09-01 실측: 삼성전자 2025 `자기주식의 취득` 8,189,263백만 ·
+# KT&G 560,112백만). 같은 응답에 오므로 추가 조회가 없고, 공시 본문
+# 파싱보다 훨씬 안정적이다.
+#
+# 소각(retirement)은 더하지 않는다. 소각은 이미 취득한 주식을 없애는
+# 것이라 추가 현금 유출이 없다. 취득액에 소각을 더하면 같은 돈을 두 번
+# 센다.
+_BUYBACK_IDS = frozenset({
+    "dart_AcquisitionOfTreasuryShares",
+    "ifrs-full_PurchaseOfTreasuryShares",
+})
+_BUYBACK_NAMES = frozenset({
+    "자기주식의취득", "자기주식취득", "자기주식의매입",
+})
 
 
 # ══════════════════════════ 순수 계산 ══════════════════════════
@@ -296,7 +313,8 @@ def parse_cashflow(rows, base_year: int) -> dict[int, dict]:
     `sj_div == "CF"` 행만 본다. CAPEX 는 부호를 믿지 않고 절대값을
     더한다 (모듈 독스트링의 실측 근거 참조).
     """
-    out = {base_year - b: {"ocf": None, "capex": None, "fcf": None}
+    out = {base_year - b: {"ocf": None, "capex": None, "fcf": None,
+                           "buyback": None}
            for b in _CF_TERMS.values()}
     for r in rows or []:
         if str(r.get("sj_div") or "").strip().upper() != "CF":
@@ -307,6 +325,8 @@ def parse_cashflow(rows, base_year: int) -> dict[int, dict]:
             kind = "ocf"
         elif aid in _CAPEX_IDS or nm in _CAPEX_NAMES:
             kind = "capex"
+        elif aid in _BUYBACK_IDS or nm in _BUYBACK_NAMES:
+            kind = "buyback"
         else:
             continue
         for field, back in _CF_TERMS.items():
@@ -317,9 +337,15 @@ def parse_cashflow(rows, base_year: int) -> dict[int, dict]:
             if kind == "ocf":
                 rec["ocf"] = float(val)
             else:
-                rec["capex"] = (rec["capex"] or 0.0) + abs(float(val))
+                # 유출인데 부호가 양수로 오는 필러가 있다(모듈 독스트링).
+                rec[kind] = (rec[kind] or 0.0) + abs(float(val))
     for rec in out.values():
         rec["fcf"] = free_cash_flow(rec["ocf"], rec["capex"])
+        # 현금흐름표를 읽었는데 자사주 취득 행이 없으면 그 해에 매입이
+        # 없었다는 뜻이다. 0 으로 확정한다. CF 자체를 못 읽었으면 NULL 로
+        # 남긴다 — '매입 안 함'과 '모름'을 섞지 않는다.
+        if rec["buyback"] is None and rec["ocf"] is not None:
+            rec["buyback"] = 0.0
     return out
 
 
@@ -349,6 +375,7 @@ def build_rows(code: str, alot: dict, cash: dict, *,
             "ocf": cf.get("ocf"),
             "capex": cf.get("capex"),
             "fcf": cf.get("fcf"),
+            "buyback": cf.get("buyback"),
             "status": resolve_status(rec),
             "settle_dt": rec.get("settle_dt"),
         })

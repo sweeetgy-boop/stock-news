@@ -339,6 +339,11 @@ DIV_REPORT_DOW = 5
 # DPS 성장률(CAGR) 구간. 사업연도 수다. 구간이 5년이면 성장 기간은 4번이다.
 DIV_CAGR_YEARS = 5
 
+# 배당락 회복일수를 볼 과거 연수. **과거 통계이고 예측이 아니다.**
+# 표본이 3건도 안 되고 그 사이 시장 국면이 달랐다. 리포트 컬럼명에
+# '(참고)' 를 붙이는 이유다.
+DIV_RECOVERY_YEARS = 3
+
 
 @dataclass(frozen=True)
 class DividendConfig:
@@ -358,6 +363,7 @@ class DividendConfig:
     settle_days: int = DIV_SETTLE_DAYS
     report_dow: int = DIV_REPORT_DOW
     cagr_years: int = DIV_CAGR_YEARS
+    recovery_years: int = DIV_RECOVERY_YEARS
 
 
 @dataclass(frozen=True)

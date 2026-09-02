@@ -4063,8 +4063,223 @@ def test_dividend_calendar(tmp: Path):
     check("dividend-cal", "권유·해석 문구 부재", t_report_no_persuasion)
     check("dividend-cal", "통과 0건 리포트", t_report_empty)
     check("dividend-cal", "상위 N = config", t_report_top_n)
+    # ── 4단계: 배당락 회복일수 + 총주주환원율 ──
+    from stocknews.dividend_calendar import (past_ex_dates, recovery_days,
+                                             recovery_stats,
+                                             total_return_ratio)
+    from stocknews.renderer import _recovery_cell
+
+    def _closes(pairs):
+        """[(날짜, 종가)] -> Series."""
+        idx = pd.DatetimeIndex([datetime(*p[0]) for p in pairs])
+        return pd.Series([p[1] for p in pairs], index=idx)
+
+    def t_recovery_anchor():
+        """락 전 종가를 회복하기까지의 거래일수. 락일 직전 종가가 기준이다."""
+        # 12/29 종가 10,000 (락 전) · 12/30 배당락 9,500 -> 1/5 에 10,050
+        px = _closes([((2025, 12, 26), 9_900.0),
+                      ((2025, 12, 29), 10_000.0),   # 락 전 종가
+                      ((2025, 12, 30), 9_500.0),    # 배당락일
+                      ((2026, 1, 2), 9_800.0),
+                      ((2026, 1, 5), 10_050.0)])    # 회복
+        got = recovery_days(px, date(2025, 12, 30))
+        assert got["status"] == "ok", got
+        assert got["days"] == 3, got          # 12/30, 1/2, 1/5 -> 3거래일
+        # 락일 종가를 기준으로 삼았다면 12/30 당일(1일)에 회복으로 나온다
+        assert got["days"] != 1, "락일 종가를 기준으로 썼다"
+
+    def t_recovery_same_day():
+        """락일 당일 회복하면 1거래일이다."""
+        px = _closes([((2025, 12, 29), 10_000.0),
+                      ((2025, 12, 30), 10_000.0)])
+        got = recovery_days(px, date(2025, 12, 30))
+        assert got == {"days": 1, "status": "ok"}, got
+
+    def t_recovery_unrecovered():
+        """끝까지 회복 못 하면 '미회복'. 큰 숫자로 채우지 않는다."""
+        px = _closes([((2025, 12, 29), 10_000.0),
+                      ((2025, 12, 30), 9_000.0),
+                      ((2026, 1, 2), 9_100.0)])
+        got = recovery_days(px, date(2025, 12, 30))
+        assert got["status"] == "unrecovered" and got["days"] is None, got
+
+    def t_recovery_no_data():
+        """락일이 시세 범위 밖이면 no_data. 회복/미회복 어느 쪽도 아니다."""
+        px = _closes([((2026, 1, 2), 9_000.0), ((2026, 1, 5), 9_100.0)])
+        assert recovery_days(px, date(2025, 12, 30))["status"] == "no_data"
+        px2 = _closes([((2025, 12, 28), 9_000.0)])
+        assert recovery_days(px2, date(2025, 12, 30))["status"] == "no_data"
+        assert recovery_days(None, date(2025, 12, 30))["status"] == "no_data"
+        assert recovery_days(px, None)["status"] == "no_data"
+
+    def _series(start: datetime, values):
+        """연속 거래일(주말 제외) 종가 Series."""
+        idx, d = [], start
+        while len(idx) < len(values):
+            if d.weekday() < 5:
+                idx.append(d)
+            d += timedelta(days=1)
+        return pd.Series(list(values), index=pd.DatetimeIndex(idx))
+
+    def t_recovery_stats_excludes_unrecovered():
+        """미회복은 평균에서 빼고 건수로만 센다 (분기배당 2회 구간)."""
+        # 0..9 구간: 100 -> 락 95 -> 3봉째 101 회복
+        # 10..19 구간: 락 90 이후 끝까지 회복 못 함
+        vals = [100, 95, 98, 101, 102, 103, 104, 105, 106, 107,
+                90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+        px = _series(datetime(2026, 1, 5), [float(v) for v in vals])
+        ex1, ex2 = px.index[1].date(), px.index[10].date()
+        st = recovery_stats(px, [{"year": 2026, "ex_date": ex1},
+                                 {"year": 2026, "ex_date": ex2}])
+        assert st["samples"] == 1, st
+        near(st["avg"], 3.0, label="평균 회복일")
+        assert st["max"] == 3, st
+        assert st["unrecovered"] == 1, st
+        assert len(st["items"]) == 2, st["items"]
+        empty = recovery_stats(px, [])
+        assert empty["samples"] == 0 and empty["avg"] is None, empty
+
+    def t_recovery_stops_at_next_ex_date():
+        """다음 배당락일을 넘겨 회복을 세면 안 된다.
+
+        시세에 구멍이 있으면 1년 뒤 봉을 회복으로 잡을 수 있다. 상한이
+        그것을 막는다.
+        """
+        # 2024 락 전 8,000 -> 락일 7,000. 회복(9,000)은 다음 락일에 온다.
+        px = _closes([((2024, 12, 27), 8_000.0),
+                      ((2024, 12, 30), 7_000.0),
+                      ((2025, 12, 30), 9_000.0)])
+        # 상한 없이 세면 1년 뒤 봉을 회복으로 잡는다 (2거래일 회복)
+        loose = recovery_days(px, date(2024, 12, 30))
+        assert loose == {"days": 2, "status": "ok"}, loose
+        bounded = recovery_days(px, date(2024, 12, 30),
+                               until=date(2025, 12, 30))
+        assert bounded["status"] == "unrecovered", bounded
+        # 집계는 상한을 자동으로 건다
+        st = recovery_stats(px, [{"year": 2024, "ex_date": date(2024, 12, 30)},
+                                 {"year": 2025, "ex_date": date(2025, 12, 30)}])
+        y2024 = [i for i in st["items"] if i["year"] == 2024][0]
+        assert y2024["status"] == "unrecovered", y2024
+        assert st["unrecovered"] >= 1, st
+
+    def t_recovery_cell_render():
+        assert _recovery_cell(None) == "-"
+        assert _recovery_cell({"samples": 0, "unrecovered": 0}) == "-"
+        assert _recovery_cell({"samples": 0, "unrecovered": 2}) == "미회복"
+        cell = _recovery_cell({"samples": 3, "avg": 12.3, "max": 21,
+                               "unrecovered": 0})
+        assert cell == "12/21일(3)", cell
+        cell2 = _recovery_cell({"samples": 2, "avg": 5.0, "max": 8,
+                                "unrecovered": 1})
+        assert "미회복1" in cell2, cell2
+
+    def t_past_ex_dates():
+        """과거 3년 배당락일. 최근 연도부터."""
+        got = past_ex_dates("2025-12-31", years=3, asof="2026-09-02")
+        assert [g["year"] for g in got] == [2025, 2024, 2023], got
+        for g in got:
+            assert g["record_date"].month == 12, g
+            assert g["ex_date"] is not None and g["ex_date"] < g["record_date"]
+
+    def t_total_return_anchor():
+        """총환원율 = (배당총액 + 자사주) / 시가총액."""
+        # 배당 1,000억 + 자사주 500억 / 시총 30,000억 = 5.00%
+        near(total_return_ratio(1_000 * WON, 500 * WON, 30_000 * WON), 5.0,
+             label="총환원율")
+        # 자사주 0 이면 배당만
+        near(total_return_ratio(1_000 * WON, 0.0, 50_000 * WON), 2.0,
+             label="배당만")
+
+    def t_total_return_none():
+        """자사주가 NULL 이면 None. 0 으로 가정하지 않는다."""
+        assert total_return_ratio(1_000 * WON, None, 30_000 * WON) is None
+        assert total_return_ratio(None, 0.0, 30_000 * WON) is None
+        assert total_return_ratio(1_000 * WON, 0.0, 0.0) is None
+        assert total_return_ratio(1_000 * WON, 0.0, None) is None
+
+    def t_buyback_parsed_from_cashflow():
+        """자사주 취득액은 현금흐름표에서 온다. 주요사항보고서를 파싱하지 않는다."""
+        from stocknews.dividend_data import parse_cashflow
+
+        rows = [
+            {"sj_div": "CF",
+             "account_id": "ifrs-full_CashFlowsFromUsedInOperatingActivities",
+             "account_nm": "영업활동현금흐름",
+             "thstrm_amount": "85315148000000",
+             "frmtrm_amount": "72982621000000",
+             "bfefrmtrm_amount": "44788749000000"},
+            # 유출인데 부호가 양수다 (2026-09-01 실측)
+            {"sj_div": "CF", "account_id": "dart_AcquisitionOfTreasuryShares",
+             "account_nm": "자기주식의 취득",
+             "thstrm_amount": "8189263000000",
+             "frmtrm_amount": "1811775000000",
+             "bfefrmtrm_amount": "0"},
+        ]
+        got = parse_cashflow(rows, 2025)
+        near(got[2025]["buyback"], 8_189_263e6, tol=1.0, label="자사주 취득")
+        near(got[2024]["buyback"], 1_811_775e6, tol=1.0, label="전기 자사주")
+        near(got[2023]["buyback"], 0.0, label="전전기 자사주")
+        # CF 를 읽었는데 자사주 행이 없으면 0 으로 확정한다
+        only = parse_cashflow([rows[0]], 2025)
+        near(only[2025]["buyback"], 0.0, label="행 없으면 0")
+        # CF 자체를 못 읽었으면 NULL — '안 샀다'와 '모른다'를 섞지 않는다
+        none = parse_cashflow([], 2025)
+        assert none[2025]["buyback"] is None, none[2025]
+
+    def t_buyback_stored():
+        """buyback 컬럼이 저장·조회되는지 + 기존 DB 마이그레이션."""
+        s = Store(tmp / "divbb.db")
+        s.upsert_dividends([{
+            "code": "005930", "fiscal_year": BASE, "dps": 1668.0,
+            "total_dividend": 100 * WON, "net_income": 1000 * WON,
+            "payout_ratio": 10.0, "ocf": 600 * WON, "capex": 100 * WON,
+            "fcf": 500 * WON, "buyback": 50 * WON, "status": "paid",
+            "settle_dt": f"{BASE}-12-31"}])
+        df = s.dividends_of("005930")
+        assert "buyback" in df.columns, list(df.columns)
+        near(df.iloc[0]["buyback"], 50 * WON, tol=1.0, label="저장된 자사주")
+        # 마이그레이션 표에 등록돼 있어야 기존 DB 에도 컬럼이 붙는다
+        assert ("dividends", "buyback", "REAL") in Store._MIGRATIONS
+
+    def t_report_has_stage4_columns():
+        s = Store(tmp / "divrep6.db")
+        _seed(s)
+        rep = build_dividend_report(s, DEFAULT, asof="2026-09-02",
+                                    trade_date="2026-08-31", base_year=BASE)
+        r = rep["rows"][0]
+        for key in ("buyback", "market_cap", "total_return", "recovery"):
+            assert key in r, f"{key} 누락"
+        assert set(r["recovery"]) >= {"samples", "avg", "max",
+                                      "unrecovered", "items"}, r["recovery"]
+        txt = render_dividend_report(rep, datetime(2026, 9, 5, 9, 0), DEFAULT)
+        assert "과거회복일수(참고)" in txt, "참고 표기 없는 컬럼명"
+        assert "총환원율" in txt, "총환원율 컬럼 누락"
+        assert "예측이 아닙니다" in txt, "예측 아님 문구 누락"
+        assert "미회복" in txt, "미회복 표기 설명 누락"
+        body = txt.replace(DIVIDEND_FOOTER, "")
+        for bad in DIVIDEND_BANNED:
+            assert bad not in body, f"금지 문구 '{bad}'"
+
     check("dividend-cal", "모드 배선 + 락 계약", t_mode_wiring)
     check("dividend-cal", "채점 경로 미참조", t_record_only_boundary)
+    check("dividend-ret", "회복일수 앵커 (락 전 종가 기준)",
+          t_recovery_anchor)
+    check("dividend-ret", "락일 당일 회복 = 1거래일", t_recovery_same_day)
+    check("dividend-ret", "미회복 (큰 수로 채우지 않음)",
+          t_recovery_unrecovered)
+    check("dividend-ret", "범위 밖 = no_data", t_recovery_no_data)
+    check("dividend-ret", "평균에서 미회복 제외",
+          t_recovery_stats_excludes_unrecovered)
+    check("dividend-ret", "다음 락일에서 탐색 중단",
+          t_recovery_stops_at_next_ex_date)
+    check("dividend-ret", "회복일수 표기", t_recovery_cell_render)
+    check("dividend-ret", "과거 3년 배당락일", t_past_ex_dates)
+    check("dividend-ret", "총환원율 앵커", t_total_return_anchor)
+    check("dividend-ret", "자사주 NULL = 총환원율 None", t_total_return_none)
+    check("dividend-ret", "자사주는 현금흐름표에서",
+          t_buyback_parsed_from_cashflow)
+    check("dividend-ret", "buyback 저장 + 마이그레이션", t_buyback_stored)
+    check("dividend-ret", "리포트 4단계 컬럼", t_report_has_stage4_columns)
 
 
 def test_docs():

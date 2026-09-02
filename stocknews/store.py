@@ -362,6 +362,7 @@ CREATE TABLE IF NOT EXISTS dividends (
   ocf            REAL,      -- 영업활동현금흐름(원)
   capex          REAL,      -- 유형+무형자산 취득(원). 절대값 합.
   fcf            REAL,      -- ocf - capex
+  buyback        REAL,      -- 자사주 취득액(원). CF 를 읽었고 행이 없으면 0.
   status         TEXT,      -- paid / none / no_report
   settle_dt      TEXT,      -- 결산일 YYYY-MM-DD
   collected_at   TEXT,
@@ -439,6 +440,9 @@ class Store:
         ("positions", "stop_price", "REAL"),
         ("flags", "cooldown_from", "TEXT"),
         ("flags", "cooldown_reason", "TEXT"),
+        # 자사주 취득액(총주주환원율). dividends 는 이미 만들어진 DB 가
+        # 있으므로 CREATE TABLE IF NOT EXISTS 로는 컬럼이 붙지 않는다.
+        ("dividends", "buyback", "REAL"),
     )
 
     def _init(self) -> None:
@@ -1303,7 +1307,8 @@ class Store:
 
     # ────────────────────────── 배당 ──────────────────────────
     _DIV_COLS = ("code", "fiscal_year", "dps", "total_dividend", "net_income",
-                 "payout_ratio", "ocf", "capex", "fcf", "status", "settle_dt")
+                 "payout_ratio", "ocf", "capex", "fcf", "buyback", "status",
+                 "settle_dt")
 
     def has_dividends(self, code: str, fiscal_year: int) -> bool:
         with closing(self._conn()) as con:

@@ -54,8 +54,9 @@ log = logging.getLogger(__name__)
 __all__ = [
     "build_dividend_report", "dps_cagr", "ex_dividend_date",
     "is_first_saturday", "krx_year_end_break", "last_buy_date",
-    "last_trading_day_of_year", "next_record_date", "record_date_plan",
-    "report_send_allowed",
+    "last_trading_day_of_year", "next_record_date", "past_ex_dates",
+    "recovery_days", "recovery_stats", "record_date_plan",
+    "report_send_allowed", "total_return_ratio",
 ]
 
 
@@ -317,22 +318,46 @@ def build_dividend_report(store, cfg: Config = DEFAULT, *, asof=None,
 
     holidays = store.known_non_trading_days()
     observed = store.existing_dates()
+    try:
+        meta = store.ticker_meta()
+        caps = {c: r.get("market_cap") for c, r in meta.iterrows()}
+    except Exception as exc:                 # noqa: BLE001
+        log.debug("시가총액 조회 실패: %s", exc)
+        caps = {}
+
+    # 회복일수는 상위 종목만 본다. 전종목이면 2,500번 시계열을 읽는다.
+    lookback = int(dc.recovery_years) * 300
 
     rows = []
     for r in top.to_dict("records"):
         code = str(r["code"])
         hist = store.dividends_of(code)
-        dps_by_year, settle_dt = {}, None
+        dps_by_year, settle_dt, latest = {}, None, {}
         if hist is not None and not hist.empty:
             for h in hist.to_dict("records"):
                 dps_by_year[int(h["fiscal_year"])] = h.get("dps")
-                if h.get("settle_dt") and int(h["fiscal_year"]) == base:
-                    settle_dt = h["settle_dt"]
+                if int(h["fiscal_year"]) == base:
+                    latest = h
+                    if h.get("settle_dt"):
+                        settle_dt = h["settle_dt"]
         plan = record_date_plan(settle_dt, asof=asof, holidays=holidays,
                                 observed=observed,
                                 settle_days=int(dc.settle_days))
         if plan["confirmed"]:
             out["confirmed_calendar"] = True
+
+        # 과거 배당락 회복 통계. 시세 범위를 벗어난 해는 no_data 로 남는다.
+        try:
+            ohlcv = store.load_ohlcv(code, days=lookback)
+            closes = None if ohlcv is None or ohlcv.empty else ohlcv["종가"]
+        except Exception as exc:             # noqa: BLE001
+            log.debug("%s 시세 조회 실패: %s", code, exc)
+            closes = None
+        past = past_ex_dates(settle_dt, years=int(dc.recovery_years),
+                             asof=asof, holidays=holidays, observed=observed,
+                             settle_days=int(dc.settle_days))
+        rec_stats = recovery_stats(closes, past)
+
         rows.append({
             "code": code, "name": r.get("name"), "price": r.get("price"),
             "dps": r.get("dps"), "div_yield": r.get("div_yield"),
@@ -343,6 +368,128 @@ def build_dividend_report(store, cfg: Config = DEFAULT, *, asof=None,
             "ex_date": plan["ex_date"],
             "calendar_confirmed": plan["confirmed"],
             "settle_dt": settle_dt,
+            "buyback": latest.get("buyback"),
+            "market_cap": caps.get(code),
+            "total_return": total_return_ratio(
+                latest.get("total_dividend"), latest.get("buyback"),
+                caps.get(code)),
+            "recovery": rec_stats,
         })
     out["rows"] = rows
+    out["recovery_samples"] = sum(r["recovery"]["samples"] for r in rows)
+    out["buyback_known"] = sum(1 for r in rows if r["buyback"] is not None)
     return out
+
+
+# ══════════════════ 배당락 회복일수 (과거 통계 · 예측 아님) ══════════════════
+# 컬럼명에 '(참고)' 를 붙이는 이유: 과거 몇 번의 회복일수는 표본이 3건도
+# 안 되고, 그 사이 시장 국면이 달랐다. 평균 12거래일이라는 숫자가 '이번에도
+# 12일이면 회복한다'로 읽히면 그건 통계가 아니라 점이다.
+def past_ex_dates(settle_dt, *, years: int = 3, asof=None, holidays=(),
+                  observed=None, settle_days: int = 2) -> list[dict]:
+    """과거 `years` 개 사업연도의 배당락일. 최근 연도부터.
+
+    지나간 해는 `observed`(실제 적재 거래일)로 확정 계산이 된다.
+    """
+    today = as_date(asof) or now_kst().date()
+    out = []
+    for i in range(1, years + 1):
+        y = today.year - i
+        plan = record_date_plan(settle_dt, asof=date(y, 1, 1),
+                               holidays=holidays, observed=observed,
+                               settle_days=settle_days)
+        rec = plan.get("record_date")
+        if rec is None or rec.year != y:
+            continue
+        out.append({"year": y, "record_date": rec,
+                    "ex_date": plan.get("ex_date"),
+                    "confirmed": plan.get("confirmed")})
+    return out
+
+
+def recovery_days(closes, ex_date, until=None) -> dict:
+    """배당락 이후 '락 전 종가' 회복까지 걸린 거래일수.
+
+    락 전 종가 = 배당락일 **직전 거래일**의 종가. 배당락일 종가로 잡으면
+    이미 떨어진 값이 기준이 되어 회복이 실제보다 쉬워 보인다.
+
+    `until` 은 탐색 상한(그 날짜 미만까지만 본다)이다. **다음 배당락일을
+    넘겨서 세면 안 된다.** 넘기면 다음 해의 하락·회복이 섞여 들어가
+    '이번 배당락에서 회복하는 데 걸린 기간'이 아니게 된다. 시세에 구멍이
+    있을 때 1년 뒤 봉을 회복으로 잡는 오류도 이 상한이 막는다.
+
+    반환 `{"days": int|None, "status": "ok"|"unrecovered"|"no_data"}`
+      ok           회복까지 걸린 거래일수 (락일을 1일로 센다)
+      unrecovered  상한까지 회복하지 못했다
+      no_data      락일이 시세 범위 밖이거나 앞·뒤 봉이 없다
+    """
+    ex = as_date(ex_date)
+    if ex is None or closes is None or len(closes) == 0:
+        return {"days": None, "status": "no_data"}
+    end = as_date(until)
+    idx = [as_date(i) for i in closes.index]
+    before = [(d, i) for i, d in enumerate(idx) if d is not None and d < ex]
+    after = [(d, i) for i, d in enumerate(idx)
+             if d is not None and d >= ex and (end is None or d < end)]
+    if not before or not after:
+        return {"days": None, "status": "no_data"}
+    base = float(closes.iloc[before[-1][1]])
+    if base != base or base <= 0:
+        return {"days": None, "status": "no_data"}
+    for n, (_d, i) in enumerate(after, 1):
+        try:
+            c = float(closes.iloc[i])
+        except (TypeError, ValueError):
+            continue
+        if c == c and c >= base:
+            return {"days": n, "status": "ok"}
+    return {"days": None, "status": "unrecovered"}
+
+
+def recovery_stats(closes, ex_dates) -> dict:
+    """여러 해의 회복일수를 묶는다. `{samples, avg, max, unrecovered, items}`.
+
+    미회복은 평균에 넣지 않는다. 임의의 큰 수로 채우면 평균이 그 수에
+    좌우되고, 0 으로 채우면 즉시 회복한 것이 된다. 건수로만 보고한다.
+    """
+    items, days = [], []
+    unrec = 0
+    # 오래된 락일부터 훑고, 각 구간의 상한을 '다음 락일'로 준다.
+    ordered = sorted((e for e in (ex_dates or []) if e.get("ex_date")),
+                     key=lambda e: as_date(e["ex_date"]))
+    for k, e in enumerate(ordered):
+        nxt = (as_date(ordered[k + 1]["ex_date"])
+               if k + 1 < len(ordered) else None)
+        got = recovery_days(closes, e.get("ex_date"), until=nxt)
+        items.append({"year": e.get("year"),
+                      "ex_date": e.get("ex_date"), **got})
+        if got["status"] == "ok":
+            days.append(int(got["days"]))
+        elif got["status"] == "unrecovered":
+            unrec += 1
+    return {"samples": len(days),
+            "avg": (round(sum(days) / len(days), 1) if days else None),
+            "max": (max(days) if days else None),
+            "unrecovered": unrec, "items": items}
+
+
+# ══════════════════════════ 총주주환원율 ══════════════════════════
+def total_return_ratio(total_dividend, buyback, market_cap) -> float | None:
+    """총주주환원율(%) = (현금배당총액 + 자사주 취득액) / 시가총액 x 100.
+
+    자사주 **취득액**만 더한다. 소각은 이미 취득한 주식을 없애는 것이라
+    추가 현금 유출이 없다 — 더하면 같은 돈을 두 번 센다.
+
+    자사주가 NULL 이면 None 이다. 0 으로 가정하면 '자사주를 안 샀다'와
+    '현금흐름표를 못 읽었다'가 같은 값이 된다. 전자는 `dividend_data` 가
+    이미 0 으로 확정해 둔다.
+    """
+    try:
+        td = float(total_dividend)
+        bb = float(buyback)
+        mc = float(market_cap)
+    except (TypeError, ValueError):
+        return None
+    if td != td or bb != bb or mc != mc or mc <= 0:
+        return None
+    return round((td + bb) / mc * 100.0, 2)

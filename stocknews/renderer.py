@@ -978,6 +978,24 @@ def _num_or_dash(v, fmt: str) -> str:
         return "-"
 
 
+def _recovery_cell(rec) -> str:
+    """과거 배당락 회복일수 요약 한 칸. `평균/최대` 또는 '미회복' 또는 '-'.
+
+    미회복을 큰 숫자로 채우지 않는다. 평균이 그 숫자에 좌우된다.
+    """
+    if not rec:
+        return "-"
+    n = int(rec.get("samples") or 0)
+    unrec = int(rec.get("unrecovered") or 0)
+    if n == 0:
+        return "미회복" if unrec else "-"
+    avg, mx = rec.get("avg"), rec.get("max")
+    cell = f"{avg:.0f}/{mx}일({n})"
+    if unrec:
+        cell += f"+미회복{unrec}"
+    return cell
+
+
 def render_dividend_report(rep: dict, asof, cfg: Config = DEFAULT) -> str:
     """월간 배당 팩트 리포트.
 
@@ -1008,9 +1026,10 @@ def render_dividend_report(rep: dict, asof, cfg: Config = DEFAULT) -> str:
                  f"• {rep.get('reason') or ''}".rstrip(), "", DIVIDEND_FOOTER]
         return "\n".join(x for x in head if x is not None)
 
-    w = (7, 12, 9, 7, 7, 7, 8, 12, 12)
+    w = (7, 12, 9, 7, 7, 7, 8, 8, 12, 12, 14)
     hdr = ("코드", "종목명", "현재가", "DPS", "수익률", "성향",
-           "5yr성장", "기준일(추정)", "최종매수(추정)")
+           "5yr성장", "총환원율", "기준일(추정)", "최종매수(추정)",
+           "과거회복일수(참고)")
     table = ["".join(_pad(h, wi) for h, wi in zip(hdr, w))]
     for r in rows:
         cells = (
@@ -1022,8 +1041,11 @@ def render_dividend_report(rep: dict, asof, cfg: Config = DEFAULT) -> str:
             _num_or_dash(r.get("payout"), ".1f") + "%",
             (_num_or_dash(r.get("cagr"), "+.1f") + "%"
              if r.get("cagr") is not None else "-"),
+            (_num_or_dash(r.get("total_return"), ".2f") + "%"
+             if r.get("total_return") is not None else "-"),
             _d10(r.get("record_date")),
             _d10(r.get("last_buy")),
+            _recovery_cell(r.get("recovery")),
         )
         table.append("".join(_pad(c, wi) for c, wi in zip(cells, w)))
 
@@ -1047,6 +1069,17 @@ def render_dividend_report(rep: dict, asof, cfg: Config = DEFAULT) -> str:
         "",
         f"• 5yr성장 = 최근 {int(cfg.dividend.cagr_years)}개 사업연도 DPS "
         "연평균 성장률. 시작 연도가 무배당이면 '-' 입니다.",
+        "• 총환원율 = (현금배당총액 + 자사주 취득액) / 시가총액. "
+        f"자사주 확인 {rep.get('buyback_known', 0)}/{len(rows)}종목.",
+        "",
+        "━━ 과거회복일수(참고) ━━",
+        f"• 표기 `평균/최대일(표본수)`. 과거 {int(cfg.dividend.recovery_years)}"
+        "년 배당락일 이후 락 전 종가를 회복하기까지의 거래일수입니다.",
+        "• <b>과거 통계이고 예측이 아닙니다.</b> 표본이 3건도 되지 않고 "
+        "그 사이 시장 국면이 달랐습니다.",
+        "• 회복하지 못한 사례는 '미회복'으로 셉니다 (평균에 넣지 않습니다).",
+        f"• 표본 합계 {rep.get('recovery_samples', 0)}건 — 시세 적재 범위를 "
+        "벗어난 해는 계산되지 않습니다.",
         "",
         DIVIDEND_FOOTER,
     ]
