@@ -52,6 +52,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
+from stocknews.env import load_env                          # noqa: E402
 from stocknews.joblock import JobLock                      # noqa: E402
 from stocknews.store import Store                          # noqa: E402
 from stocknews.trading_day import (market_status, now_kst,  # noqa: E402
@@ -346,6 +347,19 @@ def main(argv: list[str] | None = None) -> int:
     log(f"nightly 시작 {started:%Y-%m-%d %H:%M:%S} KST "
         f"(발송 {'실제' if not dry else 'dry-run'})")
 
+    # .env 를 환경변수로 올린다. 이게 없으면 _notify 가 토큰을 못 찾아
+    # 조용히 생략된다 — 실패 알림까지 안 나간다.
+    #
+    # 2026-09-07 실측: 20:45 에 파이프라인이 완주했는데도 로그에
+    # "알림 생략 — TELEGRAM_BOT_TOKEN / CHAT_ID 미설정" 이 찍혔다.
+    # .env 에는 토큰이 있었다. run_screen.py 는 자기 main() 에서
+    # load_env 를 부르는데 nightly.py 는 부르지 않아서, 이 드라이버가
+    # 내는 알림만 전부 사라지고 있었다. 자식 단계는 각자 로드하므로
+    # 그쪽 알림은 정상이었고, 그래서 눈에 띄지 않았다.
+    env_rep = load_env()
+    if not env_rep["exists"]:
+        log(f".env 없음 ({env_rep['path']}) — OS 환경변수만 사용")
+
     # ── 이중 실행 방지 ──
     # wait_seconds=0 이라 즉시 판정한다. 요구사항이 '존재하면 즉시 종료'다.
     lock = JobLock("nightly", mode="nightly", lock_dir=args.lock_dir,
@@ -371,6 +385,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"(완료 {done.get('finished')} · exit {done.get('exit')} "
                 f"· {done.get('reason')})")
             log("다시 돌리려면 --force")
+            # 휴장 스킵과 대칭으로 알림을 낸다. 스킵이 조용하면 '오늘 안
+            # 돌았나?' 를 사람이 확인하러 가게 되고, 그 확인이 수동 재실행
+            # 으로 이어진다. 스킵도 결과다 — 결과는 보고한다.
+            _notify(f"🌙 nightly 스킵 {started:%m/%d %H:%M} | "
+                    f"오늘 이미 완주({done.get('reason')})", log, notify_on)
             log(f"nightly 종료 {now_kst():%H:%M:%S} · exit 0")
             return 0
 
