@@ -1,5 +1,26 @@
 @echo off
 rem ==========================================================================
+rem  DEPRECATED - DO NOT REGISTER IN TASK SCHEDULER.
+rem
+rem  Retired 2026-09-07. This was a SECOND entry point for the same write
+rem  pipeline that nightly.py already runs (master -> update -> flags ->
+rem  daily -> exits). Both were registered as scheduled tasks; when the PC
+rem  missed both windows, StartWhenAvailable fired them together and they
+rem  fought over the job lock:
+rem
+rem    09:02:16  afterclose's update takes the lock (pid 14856)
+rem    09:02:17  nightly's update blocks, waits 757s, dies rc=3
+rem    09:25:16  nightly ends exit 2
+rem
+rem  Worse, the catch-up made `update` run during market hours, when pykrx
+rem  has no data yet. That left 2026-08-28 / 09-02 / 09-03 / 09-04 partially
+rem  loaded (13 / 3 / 1546 / 39 tickers), which then poisoned halt_history
+rem  and collapsed the daily snapshot to 37 rows.
+rem
+rem  The single entry point is now:   hermes\nightly.cmd  ->  nightly.py
+rem  Keep this file for manual step-by-step debugging only.
+rem ==========================================================================
+rem
 rem  After-close batch chain (KST). Registered in Windows Task Scheduler.
 rem
 rem  ASCII-only on purpose. cmd.exe reads a batch file with the *current*

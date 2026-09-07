@@ -22,6 +22,12 @@ rem     hermes\run.cmd --mode flash --json
 rem     hermes\run.cmd smoke
 rem     hermes\run.cmd verify
 rem
+rem  There is NO "--mode nightly". The nightly pipeline is a separate
+rem  driver:   hermes\nightly.cmd
+rem  A scheduled task was once registered as `run.cmd --mode nightly
+rem  --json`; argparse rejects the choice and the task dies with exit 64,
+rem  silently skipping the whole night. For the pipeline, call nightly.cmd.
+rem
 rem  Exit codes: 0 ok / 1 fail / 2 partial / 3 locked / 4 precondition
 rem              90 cannot cd to repo / 91 python not found
 rem ==========================================================================

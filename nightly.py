@@ -23,10 +23,19 @@
 
 종료 코드
 --------
-  0   정상 (휴장일 스킵도 0)
+  0   정상 (휴장일 스킵, '오늘 이미 완주' 스킵도 0)
   1   파이프라인 자체 실패 (락 획득 실패는 0 이 아니라 3)
   2   부분 실패 — 한 단계 이상 실패했으나 완주함
   3   이중 실행 (락 점유 중)
+
+이 파일이 유일한 진입점이다
+--------------------------
+2026-09-07 까지는 `hermes/afterclose.cmd` 가 같은 단계들(master -> update
+-> flags -> daily -> exits)을 따로 돌리는 두 번째 진입점이었다. 둘 다
+작업 스케줄러에 등록돼 있어서, catch-up 으로 동시에 뜨면 서로의 락을 물고
+늘어졌다. 그날 아침 update 가 12.6분 대기 끝에 rc=3 으로 죽어 exit 2 가
+났고, 장중에 돌아버린 update 들이 09-02/03/04 시세를 부분 적재로 만들었다.
+afterclose 는 스케줄에서 내렸다. 파이프라인 진입점을 늘리지 마십시오.
 """
 from __future__ import annotations
 
@@ -53,12 +62,36 @@ from stocknews.trading_day import (market_status, now_kst,  # noqa: E402
 # 끼지 않는 한 40분 안쪽이다.
 LOCK_TIMEOUT_SEC = 7200
 
-# 쓰기 모드가 잔류 락에 걸려 exit 3 으로 죽지 않게 대기시킨다.
-LOCK_WAIT = "600"
+# 자식 단계의 락 대기(초). 0 = 기다리지 않고 즉시 exit 3.
+#
+# 예전 값은 600 이었다. 의도는 '잔류 락에 걸려 죽지 말자' 였는데 실제로는
+# 정반대로 작동했다. 2026-09-07 09:02, afterclose 와 nightly 가 catch-up 으로
+# 동시에 뜨면서 update 단계가 12.6분을 기다린 끝에 rc=3 으로 죽었고
+# 파이프라인이 exit 2 가 됐다. 기다려서 얻은 것이 없다.
+#
+# 중복 진입점을 없앤 지금, 락이 잡혀 있다는 건 '다른 잡이 정말로 돌고 있다'는
+# 뜻이다. 그러면 기다릴 게 아니라 즉시 비켜야 한다. 잔류(만료) 락은
+# JobLock.acquire 가 대기 없이도 회수하므로 원래 의도했던 방어는 그대로다.
+LOCK_WAIT = "0"
 
 # 텔레그램을 실제로 보내는 모드. 토큰이 없으면 exit 4 로 끝나므로
-# STOCKNEWS_SEND=1 이 아닐 때는 --dry-run 을 붙인다(afterclose.cmd 와 동일).
+# STOCKNEWS_SEND=1 이 아닐 때는 --dry-run 을 붙인다.
 _SENDING = {"news", "daily", "exits"}
+
+# 오늘 이미 완주했는지 기록하는 마커.
+#
+# 왜 락만으로는 부족한가
+# ---------------------
+# 락은 '지금 돌고 있는가'에만 답한다. Windows 작업 스케줄러의
+# StartWhenAvailable 은 놓친 실행을 PC 가 깨어난 시점에 몰아서 띄우는데,
+# 앞선 실행이 이미 끝나 락을 놓은 뒤면 두 번째가 그대로 통과한다.
+# 2026-09-07 이 그랬다 — 09:02 에 한 번(exit 2), 20:45 에 또 한 번 돌았다.
+#
+# 전종목 스캔을 하루 두 번 도는 건 낭비고, 장중에 도는 쪽은 시세가 아직
+# 없어서 부분 적재를 남긴다(그날 09-02/03/04 가 이렇게 망가졌다). 그래서
+# '오늘 완주했다'를 파일로 남기고 다음 기동을 스킵한다. 다시 돌리려면
+# --force 를 준다.
+DONE_MARKER = "data/nightly_done.json"
 
 
 @dataclass
@@ -128,6 +161,30 @@ class Log:
             self.fh.close()
         except OSError:
             pass
+
+
+def _read_done(path: Path) -> dict:
+    """완주 마커 읽기. 없거나 깨졌으면 빈 dict (= 아직 안 돎)."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _mark_done(path: Path, day: str, rc: int, reason: str) -> None:
+    """오늘 완주 기록. 기록 실패가 파이프라인 결과를 바꾸지는 않는다."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "date": day,
+            "finished": now_kst().replace(
+                tzinfo=None).isoformat(timespec="seconds"),
+            "exit": rc,
+            "reason": reason,
+        }, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        log_fallback = f"완주 마커 기록 실패 (무시): {exc}"
+        print(log_fallback, file=sys.stderr)
 
 
 def _python() -> list[str]:
@@ -272,6 +329,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--step-timeout", type=int, default=5400,
                     help="단계별 시간 상한(초). 기본 90분")
     ap.add_argument("--lock-dir", default="data/locks")
+    ap.add_argument("--done-marker", default=DONE_MARKER,
+                    help="'오늘 완주' 마커 경로. --force 로 무시")
     args = ap.parse_args(argv)
 
     started = now_kst()
@@ -296,7 +355,21 @@ def main(argv: list[str] | None = None) -> int:
     log(f"락 획득 {lock.path} (만료 {LOCK_TIMEOUT_SEC // 3600}시간)")
 
     rc_final = 0
+    day = f"{started:%Y-%m-%d}"
+    marker = REPO / args.done_marker
     try:
+        # ── 오늘 이미 완주했으면 스킵 ──
+        # 반드시 락을 잡은 뒤에 본다. 순서를 뒤집으면 동시에 뜬 두
+        # 프로세스가 같은 마커를 읽고 둘 다 '아직 안 돌았다'로 판정한다.
+        done = _read_done(marker)
+        if done.get("date") == day and not args.force:
+            log(f"오늘({day}) 이미 완주 — 스킵 "
+                f"(완료 {done.get('finished')} · exit {done.get('exit')} "
+                f"· {done.get('reason')})")
+            log("다시 돌리려면 --force")
+            log(f"nightly 종료 {now_kst():%H:%M:%S} · exit 0")
+            return 0
+
         # ── 휴장일 판정 ──
         when = args.check_date or started
         try:
@@ -315,6 +388,9 @@ def main(argv: list[str] | None = None) -> int:
         log(f"거래일 판정 {when_s} -> {status}")
         if status in (CLOSED_WEEKEND, CLOSED_HOLIDAY) and not args.force:
             log(f"휴장 — 스킵 ({status})")
+            # 휴장 판정도 '오늘 할 일을 끝냈다'이다. 기록해 두지 않으면
+            # catch-up 이 뜰 때마다 같은 판정을 반복하고 알림도 반복된다.
+            _mark_done(marker, day, 0, f"휴장({status})")
             log(f"nightly 종료 {now_kst():%H:%M:%S} · exit 0")
             _notify(f"🌙 nightly 스킵 {started:%m/%d %H:%M} | 휴장({status})",
                     log, notify_on)
@@ -336,6 +412,12 @@ def main(argv: list[str] | None = None) -> int:
 
         fails = [r for r in results if r["state"] == "fail"]
         rc_final = 2 if fails else 0
+        # 부분 실패(exit 2)도 '완주'다. nightly.py 의 설계 원칙 1 이
+        # '한 단계가 실패해도 다음 단계는 돈다'이므로, 여기 도달했다는 건
+        # 모든 단계를 한 번씩 시도했다는 뜻이다. 재시도는 사람이 --force 로
+        # 판단한다 — 자동 재시도는 장중 재실행으로 이어져 부분 적재를 만든다.
+        _mark_done(marker, day, rc_final,
+                   "완주" if rc_final == 0 else "부분 실패")
         text = _summary(started, finished, results, dry)
         log(f"nightly 종료 {finished:%H:%M:%S} · exit {rc_final}")
         _notify(text, log, notify_on)
