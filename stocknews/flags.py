@@ -297,7 +297,10 @@ def detect_halt_history(store, tickers: dict, lookback_days: int = 90,
     첫 거래일 이후 구간만 비교한다.
     """
     since = (datetime.now(KST) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    market_days = sorted(store.existing_dates(since=since))
+    # 부분 적재일을 거래일로 세면 안 된다. 그날 데이터가 없는 종목이
+    # 전부 '정지'로 잡힌다 — 2026-09 에 구멍 4일 때문에 2,463종목이
+    # 오탐됐다. 상세는 Store.complete_dates docstring.
+    market_days = sorted(store.complete_dates(since=since))
     if len(market_days) < 20:
         return {}
 
@@ -346,7 +349,10 @@ def scan_local_flags(store, tickers: dict, lookback_days: int = 120,
     """
     since = (datetime.now(KST) - timedelta(days=lookback_days)
              ).strftime("%Y-%m-%d")
-    market_days = set(store.existing_dates(since=since))
+    # 부분 적재일 제외. 이걸 안 하면 구멍난 날짜가 거래일로 취급돼
+    # 그날 데이터가 없는 종목이 전부 거래정지로 오탐된다(2026-09 실측
+    # 2,463종목). 상세는 Store.complete_dates docstring.
+    market_days = set(store.complete_dates(since=since))
     can_check_halt = len(market_days) >= 20
     if not can_check_halt:
         log.warning("DB 거래일 %d일 (<20) — 거래정지 판정 생략", len(market_days))

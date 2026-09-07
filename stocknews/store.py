@@ -623,7 +623,13 @@ class Store:
         return rows[-1][0]
 
     def existing_dates(self, since: str | None = None) -> set[str]:
-        """이미 적재된 거래일 집합. 증분 업데이트에서 중복 요청을 막는다."""
+        """적재 행이 **하나라도** 있는 거래일 집합.
+
+        주의: 이 집합은 '그 날짜를 다 받았는가'에 답하지 않는다. 3종목만
+        들어온 날도 여기 들어온다. 적재 완료 여부를 물어야 하는 자리에서는
+        `complete_dates()` 를 쓰십시오 — 왜 그래야 하는지는 그쪽 docstring
+        에 실측 사고가 적혀 있다.
+        """
         q = "SELECT DISTINCT d FROM prices"
         params: tuple = ()
         if since:
@@ -631,6 +637,70 @@ class Store:
             params = (since,)
         with closing(self._conn()) as con:
             return {d for (d,) in con.execute(q, params).fetchall()}
+
+    def date_counts(self, since: str | None = None) -> dict[str, int]:
+        """날짜별 적재 종목 수."""
+        q = "SELECT d, COUNT(*) FROM prices"
+        params: tuple = ()
+        if since:
+            q += " WHERE d>=?"
+            params = (since,)
+        q += " GROUP BY d"
+        with closing(self._conn()) as con:
+            return dict(con.execute(q, params).fetchall())
+
+    def _split_by_completeness(self, since: str | None = None
+                               ) -> tuple[set[str], dict[str, int]]:
+        """(온전한 날짜, {부분적재 날짜: 종목수}) 로 가른다.
+
+        기준은 `last_price_date()` 와 같은 `PARTIAL_DAY_RATIO` 다. 같은
+        창 안의 종목수 중위값 대비 그 비율에 못 미치면 부분 적재로 본다.
+
+        표본이 3일 미만이면 중위값을 신뢰할 수 없으므로 판정을 보류하고
+        전부 온전한 것으로 돌린다. 백필 초기에 모든 날짜를 '미적재'로
+        만들어 무한 재요청에 빠지는 것을 막는다.
+        """
+        counts = self.date_counts(since=since)
+        if len(counts) < 3:
+            return set(counts), {}
+        ordered = sorted(counts.values())
+        median = ordered[len(ordered) // 2]
+        if median <= 0:
+            return set(counts), {}
+        floor = median * self.PARTIAL_DAY_RATIO
+        full = {d for d, n in counts.items() if n >= floor}
+        part = {d: n for d, n in counts.items() if n < floor}
+        return full, part
+
+    def complete_dates(self, since: str | None = None) -> set[str]:
+        """**온전히** 적재된 거래일 집합. 부분 적재일은 빼고 준다.
+
+        `existing_dates()` 는 행이 1개라도 있으면 그 날짜를 준다. 증분
+        적재(`--mode update`)가 그것을 '적재 완료'로 읽는 바람에, 장중에
+        돌아 3종목만 받아온 날짜가 영구히 그 상태로 굳었다.
+
+        2026-09 실측 — update 가 개장 직후에 돌면서 이렇게 남았다.
+
+            2026-08-28      13종목
+            2026-09-02       3종목   (기준 종목 3개뿐)
+            2026-09-04      39종목
+            2026-09-03   1,546종목
+            (정상일은 2,400종목대)
+
+        이 날짜들이 `existing_dates()` 에 들어 있으니 update 는 두 번 다시
+        요청하지 않았고(`if ds in have: continue`), `flags.scan_local_flags`
+        는 같은 집합을 '시장 거래일'로 믿어서 그날 데이터가 없는 종목
+        2,463개를 거래정지 이력으로 오탐했다. 배제 종목이 2,484개가 되면서
+        daily 스냅샷이 883행에서 37행으로 무너졌다.
+
+        구멍 하나가 늘 때마다 오탐이 커지는 자기증폭 구조였다.
+        실측: 300 -> 323 -> 1,007 -> 2,463 종목.
+        """
+        return self._split_by_completeness(since)[0]
+
+    def partial_dates(self, since: str | None = None) -> dict[str, int]:
+        """{부분 적재 날짜: 적재된 종목 수}. 재적재 대상 보고용."""
+        return self._split_by_completeness(since)[1]
 
     def has_price_date(self, d) -> bool:
         """그 날짜의 시세가 적재돼 있는가. 거래일 확정 판정에 쓴다."""

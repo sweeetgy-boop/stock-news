@@ -586,6 +586,135 @@ def test_store(tmp: Path):
         assert st2.last_price_date() == "2026-08-28", \
             "완성된 날짜를 거부했다"
 
+    def t_partial_day_not_complete():
+        """부분 적재된 날짜는 '적재 완료'로 세면 안 된다.
+
+        2026-09 실측 회귀. `existing_dates()` 는 행이 1개라도 있으면 그
+        날짜를 준다. `mode_update` 가 그걸 `have` 로 받아 `if ds in have:
+        continue` 로 건너뛰는 바람에, 장중에 돌아 3종목만 받아온
+        2026-09-02 가 영구히 3종목인 채로 굳었다. 08-28(13종목),
+        09-04(39종목)도 같다.
+
+        `complete_dates()` 는 이 날짜들을 빼고 줘야 하고, 그래야 update 가
+        다시 요청한다.
+        """
+        from stocknews.store import Store
+        import sqlite3 as _sq
+
+        stc = Store(tmp / "complete.db")
+        rows = []
+        for d in ("2026-08-24", "2026-08-25", "2026-08-26",
+                  "2026-08-27", "2026-08-31"):
+            rows += [(f"{i:06d}", d) for i in range(200)]
+        # 09-02 는 3종목만 — 장중 폴백이 기준 종목만 받아온 그 모양이다
+        rows += [(f"{i:06d}", "2026-09-02") for i in range(3)]
+        with _sq.connect(stc.path) as con:
+            con.executemany(
+                "INSERT INTO prices(ticker,d,o,h,l,c,v) "
+                "VALUES(?,?,100,110,90,105,1000)", rows)
+            con.commit()
+
+        have_raw = stc.existing_dates()
+        full = stc.complete_dates()
+        part = stc.partial_dates()
+
+        # 원래 의미는 보존한다 — existing_dates 는 여전히 준다
+        assert "2026-09-02" in have_raw, \
+            "existing_dates 의 기존 의미가 바뀌었다"
+        # 핵심: 3종목짜리 날짜가 '완료' 집합에 들어가면 안 된다
+        assert "2026-09-02" not in full, \
+            f"3종목뿐인 날짜가 완료로 잡혔다: {sorted(full)}"
+        assert part.get("2026-09-02") == 3, \
+            f"부분 적재 보고가 틀렸다: {part}"
+        # 정상일은 전부 완료여야 한다 (과잉 차단 방지)
+        assert len(full) == 5, f"정상일이 부분으로 잡혔다: {sorted(full)}"
+
+        # mode_update 의 스킵 조건 그대로 재현
+        assert "2026-09-02" not in full, "update 가 또 건너뛴다"
+        assert "2026-08-27" in full, "update 가 정상일을 재요청한다"
+
+        # 다 채우면 완료로 돌아와야 한다
+        with _sq.connect(stc.path) as con:
+            con.executemany(
+                "INSERT INTO prices(ticker,d,o,h,l,c,v) "
+                "VALUES(?,?,100,110,90,105,1000)",
+                [(f"{i:06d}", "2026-09-02") for i in range(3, 200)])
+            con.commit()
+        assert "2026-09-02" in stc.complete_dates(), \
+            "완성된 날짜를 계속 미적재로 본다 — 무한 재요청이 된다"
+
+    def t_partial_guard_holds_on_thin_history():
+        """표본이 적으면 판정을 보류한다.
+
+        백필 초기에는 날짜가 몇 개 없다. 그때 중위값으로 자르면 전 날짜가
+        '미적재'가 되어 update 가 같은 날을 무한히 재요청한다.
+        """
+        from stocknews.store import Store
+        import sqlite3 as _sq
+
+        stt = Store(tmp / "thin.db")
+        with _sq.connect(stt.path) as con:
+            con.executemany(
+                "INSERT INTO prices(ticker,d,o,h,l,c,v) "
+                "VALUES(?,?,100,110,90,105,1000)",
+                [("000001", "2026-08-24"), ("000002", "2026-08-24"),
+                 ("000001", "2026-08-25")])
+            con.commit()
+        assert stt.partial_dates() == {}, \
+            f"표본 2일인데 부분 적재로 판정했다: {stt.partial_dates()}"
+        assert len(stt.complete_dates()) == 2
+
+    def t_partial_day_not_a_market_day():
+        """부분 적재일을 '시장 거래일'로 세면 거래정지가 오탐된다.
+
+        2026-09-07 실측 회귀. `scan_local_flags` 가 `existing_dates()` 를
+        거래일 집합으로 썼다. 구멍난 날짜(08-28/09-02/09-03/09-04)가 그
+        집합에 들어 있으니, 그날 데이터가 없는 종목 = 사실상 전 종목이
+        `missing >= min_missing(3)` 에 걸렸다.
+
+            halt_history: 300 -> 323 -> 1,007 -> 2,463 종목
+            그 결과 daily 스냅샷 883행 -> 37행
+
+        구멍이 3일 있어도 정상 종목은 정지로 잡히면 안 된다.
+        """
+        from datetime import date, timedelta
+        from stocknews.store import Store
+        from stocknews.flags import scan_local_flags
+        import sqlite3 as _sq
+
+        # 날짜를 오늘 기준으로 만든다. 하드코딩하면 lookback(120일) 창을
+        # 벗어나는 날이 와서 검사가 조용히 무력해진다.
+        days, cur = [], date.today() - timedelta(days=1)
+        while len(days) < 28:
+            if cur.weekday() < 5:
+                days.append(cur.isoformat())
+            cur -= timedelta(days=1)
+        days.sort()
+        holes = set(days[12:15])          # 가운데 3일을 구멍으로
+        full_days = [d for d in days if d not in holes]
+
+        stf = Store(tmp / "halt.db")
+        rows = []
+        for d in full_days:                       # 정상일: 60종목
+            rows += [(f"{i:06d}", d) for i in range(60)]
+        for d in sorted(holes):                   # 구멍일: 1종목뿐
+            rows.append(("000999", d))
+        with _sq.connect(stf.path) as con:
+            con.executemany(
+                "INSERT INTO prices(ticker,d,o,h,l,c,v) "
+                "VALUES(?,?,100,110,90,105,1000)", rows)
+            con.commit()
+
+        assert len(stf.complete_dates()) == 25, \
+            f"거래일 집합이 틀렸다: {len(stf.complete_dates())}"
+
+        out = scan_local_flags(stf, {f"{i:06d}": {} for i in range(60)})
+        halts = out["halts"]
+        assert "000001" not in halts, \
+            (f"정상 종목이 거래정지로 오탐됐다 (missing={halts.get('000001')}). "
+             "부분 적재일이 거래일로 세어졌다는 뜻이다.")
+        assert not halts, f"오탐 {len(halts)}종목: {list(halts)[:5]}"
+
     def t_zero_ohlc_rejected():
         """OHLC 가 0 인 행은 거래량이 있어도 버려야 한다.
 
@@ -1004,6 +1133,11 @@ def test_store(tmp: Path):
     check("store", "장중 판정 (마감+20분)", t_in_progress_date)
     check("store", "장중 미완성 봉 거부 (실데이터 버그)", t_intraday_bar_rejected)
     check("store", "부분 적재일은 기준일 제외", t_partial_day_not_trade_date)
+    check("store", "부분 적재일은 적재 완료 아님 (실데이터 버그)",
+          t_partial_day_not_complete)
+    check("store", "표본 부족 시 부분적재 판정 보류", t_partial_guard_holds_on_thin_history)
+    check("flags", "부분 적재일은 거래일 아님 -> 거래정지 오탐 방지",
+          t_partial_day_not_a_market_day)
     check("store", "종목 마스터 COALESCE 보존", t_tickers)
     check("store", "비활성/재등록", t_inactive)
     check("store", "스캔 스냅샷 + 추천 이력", t_scan_reco)

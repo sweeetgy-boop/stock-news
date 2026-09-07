@@ -310,7 +310,15 @@ def mode_update(store: Store, args) -> int:
     """
     started = now_kst()
     since = (started - timedelta(days=args.catchup + 5)).strftime("%Y-%m-%d")
-    have = store.existing_dates(since=since)
+    # 부분 적재일은 '아직 안 받은 날'로 취급해 다시 요청한다. 행이 1개라도
+    # 있으면 완료로 보던 예전 조건이 2026-09 의 구멍 4일을 영구화했다.
+    have = store.complete_dates(since=since)
+    partial = store.partial_dates(since=since)
+    if partial:
+        log.warning("부분 적재 %d일 재요청: %s", len(partial),
+                    ", ".join(f"{d}({n}종목)"
+                              for d, n in sorted(partial.items())))
+    SUMMARY["partial_refetch"] = dict(sorted(partial.items()))
     # 이미 휴장일로 확인된 날짜는 다시 요청하지 않는다. 이게 없으면
     # 공휴일을 catchup 기간 내내 매번 재요청한다(0건이라 have 에 안 들어감).
     holidays = store.known_non_trading_days(since=since)
