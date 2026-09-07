@@ -56,3 +56,15 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# 작업 중 임시 파일 — 확장자 목록에 빠져 있던 것들.
+# 2026-09-07 실측: _c6.cmd / _p.cmd / _q.cmd 등 10개가 추적 대상으로
+# 남아 있었다. `_*` 로 뭉뚱그리면 stocknews/__init__.py 까지 걸리므로
+# 확장자를 명시한다.
+_*.cmd
+_*.bat
+_*.csv
+_*.xml
+
+# 복구 작업 중 만든 DB 백업
+*.db.bak*
