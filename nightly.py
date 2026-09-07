@@ -200,6 +200,10 @@ def _python() -> list[str]:
 def _child_env() -> dict:
     """자식 환경. 한글 출력이 cp949 로 깨지지 않게 UTF-8 을 강제한다."""
     env = dict(os.environ)
+    # 진입점 표시. run_screen.py 가 이걸 보고 '정상 경로로 불렸다'를 안다.
+    # nightly.cmd 에도 같은 값을 넣어두지만, `python nightly.py` 로 직접
+    # 띄우는 경우까지 덮으려면 여기가 필요하다.
+    env["STOCKNEWS_ENTRY"] = "nightly"
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONDONTWRITEBYTECODE"] = "1"

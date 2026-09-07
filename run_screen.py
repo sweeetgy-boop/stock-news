@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import unicodedata
@@ -1734,6 +1735,28 @@ def main(argv=None) -> int:
     SUMMARY["_json"] = bool(args.json)
     SUMMARY["mode"] = args.mode
     SUMMARY["started"] = now_kst().isoformat(timespec="seconds")
+
+    # ── 진입점 추적 ──
+    # nightly.cmd 와 nightly.py 가 자식 환경에 STOCKNEWS_ENTRY=nightly 를
+    # 넣는다. 없다면 누군가 run_screen.py 를 직접 부른 것이다.
+    #
+    # **차단하지 않는다.** 사람이 특정 모드를 지시하는 정당한 경로가 있고
+    # (AGENTS.md 1장의 예외), 여기서 막으면 그 경로까지 죽는다. 기록만
+    # 남겨서 나중에 '누가 직접 불렀나'를 추적할 수 있게 한다.
+    #
+    # 2026-09-07 에 파이프라인 진입점이 둘이라 사고가 났다. 그 뒤에도
+    # 에이전트가 개별 모드를 직접 부르는 경로가 남아 있었는데, 그 사실을
+    # runs 테이블을 뒤져서야 알았다. 이 로그가 있었으면 즉시 보였다.
+    # strip() 은 장식이 아니다. cmd 에서 `set VAR=nightly && ...` 로 쓰면
+    # 값에 후행 공백이 붙어 비교가 조용히 실패한다. 실측으로 겪었다.
+    entry = os.getenv("STOCKNEWS_ENTRY", "").strip()
+    SUMMARY["entry"] = entry or "direct"
+    if entry != "nightly":
+        log.warning(
+            "진입점 표시 없음 — run_screen.py 직접 호출 "
+            "(mode=%s pid=%s ppid=%s). 파이프라인 단계라면 "
+            "hermes\\nightly.cmd 를 쓰십시오 (AGENTS.md 1장).",
+            args.mode, os.getpid(), os.getppid())
 
     # .env 를 환경변수로 올린다. 여기가 아니면 TELEGRAM_* / DART_API_KEY 를
     # 읽는 시점에 이미 늦다. OS 환경변수가 이기므로 주입된 값은 보존된다.

@@ -5,11 +5,61 @@
 
 ---
 
-## 1. 실행 방법 — 반드시 래퍼를 쓰십시오
+## 1. 실행 방법 — 파이프라인은 `nightly.cmd` 하나로만 부르십시오
 
 ```
-hermes\run.cmd --mode <모드> [옵션]
+hermes\nightly.cmd
 ```
+
+**파이프라인 실행은 `hermes\nightly.cmd` 만 호출합니다.
+`run_screen.py --mode ...` 를 직접 호출하지 않습니다** — `hermes\run.cmd
+--mode ...` 로 감싸는 것도 직접 호출입니다.
+
+> **예외는 하나뿐입니다.** 형님이 특정 모드를 명시적으로 지시한 경우.
+> 그때만 `hermes\run.cmd --mode <모드>` 를 쓰십시오. 지시가 없으면
+> 스스로 판단해 개별 모드를 부르지 마십시오.
+
+### 왜 이 규칙이 있는가
+
+2026-09-07 에 진입점이 둘이었습니다. 작업 스케줄러의 `afterclose.cmd` 와
+`nightly.py` 가 같은 쓰기 파이프라인(master -> update -> flags -> daily ->
+exits)을 각자 돌았습니다. PC 가 두 예약 시각을 모두 놓치자
+`StartWhenAvailable` 이 둘을 동시에 띄웠습니다.
+
+```
+09:02:16  afterclose 의 update 가 락을 잡음 (pid 14856)
+09:02:17  nightly 의 update 가 막힘 -> 757초 대기 -> rc=3
+09:25:16  nightly exit 2
+```
+
+피해는 exit 2 로 끝나지 않았습니다. catch-up 때문에 `update` 가 장중에
+돌았고, pykrx 에 아직 없는 당일 시세를 부분 적재로 남겼습니다.
+
+```
+2026-08-28     13종목    (정상일은 2,400종목대)
+2026-09-02      3종목
+2026-09-03  1,546종목
+2026-09-04     39종목
+```
+
+그 구멍이 `flags` 의 거래일 집합을 오염시켜 2,463종목을 거래정지로
+오탐했고, 배제가 2,484종목이 되면서 `daily` 스냅샷이 883행에서 37행으로
+무너졌습니다. **그날 추천 10선은 37종목 풀에서 뽑혔습니다.**
+
+`nightly.py` 는 이 사고를 막는 장치를 갖고 있습니다.
+
+- 잡 단위 락 (`data/locks/nightly.lock`)
+- **완주 마커** (`data/nightly_done.json`) — 오늘 이미 끝났으면 스킵합니다.
+  락은 '지금 돌고 있는가'에만 답하므로, 앞선 실행이 끝난 뒤 뜨는 catch-up
+  은 락으로 못 막습니다.
+- 단계별 종료 코드 집계와 실패 알림
+- 휴장일 판정
+
+**개별 모드를 직접 부르면 이 장치가 전부 우회됩니다.** 마커는
+`nightly.py` 안에서만 읽히므로, `run_screen.py --mode daily` 를 부르면
+마커가 있든 없든 아무 영향이 없습니다.
+
+### 래퍼 자체에 대하여 (예외 경로에서 필요할 때)
 
 `python run_screen.py` 를 직접 호출하면 실패합니다. 이유가 셋입니다.
 
@@ -22,9 +72,10 @@ hermes\run.cmd --mode <모드> [옵션]
 
 **결과는 `--json` 으로 받으십시오.** stdout 에 JSON 한 줄이 나오고 로그는
 stderr 로 분리됩니다. 한글 로그를 스크레이핑하지 마십시오.
+`nightly.cmd` 는 각 단계의 이 JSON 을 그대로 로그에 모읍니다
+(`logs\nightly_YYYYMMDD.log`).
 
 ```
-hermes\run.cmd --mode daily --json
 {"mode":"daily","trade_date":"2026-08-24","scanned":1847,"failed":3,
  "picks":10,"top":[...],"exit_code":0,"elapsed_sec":214.3}
 ```
@@ -87,58 +138,54 @@ hermes\run.cmd --mode daily --json
 
 ---
 
-## 4. 권장 스케줄 (KST)
+## 4. 스케줄 (KST)
+
+### 실행 주체는 Hermes 하나입니다 (2026-09-07 현재)
+
+Windows 작업 스케줄러에 등록된 stock-news 작업은 **0개**입니다. 7개
+전부 삭제했습니다. 정의는 `logs\schtasks_backup_20260907\` 에 XML 로
+백업돼 있습니다.
+
+작업 스케줄러와 Hermes 가 동시에 실행 주체가 되면 1장의 사고(동시 기동
+-> 락 경합 -> 장중 부분 적재)가 그대로 재현됩니다. 그래서 주체를 하나로
+줄였습니다.
 
 ```
-08:20  --mode news
-08:30  --mode brief-morning --no-collect
-09:00~15:35  --mode flash              5분 간격. 창 밖이면 수초에 끝남
-15:30  --mode master
-15:40  --mode update
-15:50  --mode flags --dart-limit 400
-16:05  --mode daily                  매일. 추천 발송은 일요일만 (12장)
-16:20  --mode exits
-16:35  --mode credit-kiwoom          앱키가 있으면. 없으면 exit 4 로 즉시 끝남
-18:20  --mode brief-evening
-18:40  --mode runs                   배치 이력 점검. 공백이 있으면 exit 2
-금 16:30  --mode weekly
-금 16:40  --mode brief-weekly
-금 16:50  --mode export
-월 15:55  --mode credit
+Hermes  ->  hermes\nightly.cmd  ->  nightly.py  ->  각 단계
 ```
 
-### 실제로 등록된 것 (2026-09-01 현재)
+**개별 모드의 시각별 스케줄 표는 이 문서에서 제거했습니다.** 그 표를 보고
+모드를 하나씩 부르는 것이 사고의 경로였습니다. 단계 순서와 시각은
+`nightly.py` 의 `STEPS` 가 정본입니다 — 문서와 코드가 어긋나지 않게
+한쪽만 남깁니다.
 
-장 마감 후 체인만 **작업 1개**로 등록돼 있습니다.
+### nightly.py 가 도는 단계
+
+`STEPS` 상수 그대로입니다. 순서는 3장의 의존 관계를 따릅니다.
 
 ```
-작업 이름   stock-news-afterclose
-실행        hermes\afterclose.cmd
-일정        매일 16:00 · 로그온 모드 대화형만
-로그         logs\chain.log  (실행마다 덮어씀. 이력은 DB runs 테이블)
+master -> update -> flags -> credit-kiwoom -> stock-flow(미구현, 스킵)
+       -> news -> daily -> exits
 ```
 
-`master → update → flags → daily → exits → runs` 를 **순차로** 돕니다.
-다섯 개를 각각 등록하지 않은 이유는 락입니다. 전부 쓰기 모드라 시계
-기준으로 나눠 걸면 겹칠 수 있고(`flags` 혼자 5~10분), 지는 쪽이 `exit 3`
-으로 끝납니다. 순차 실행이면 그 경합이 아예 없고 3장의 의존 순서도
-자동으로 지켜집니다.
+`daily` 는 매일 스캔하지만 추천 발송은 일요일만 합니다(12장).
+`credit-kiwoom` 은 앱키가 없으면 exit 4 로 즉시 끝나고, `nightly.py` 가
+이를 '기대된 스킵'으로 셉니다.
 
-`TELEGRAM_*` 이 아직 없어서 발송 모드에 `--dry-run` 이 붙습니다. 토큰을
-채운 뒤 아래 한 번만 실행하면 실제 발송으로 바뀝니다 (파일 수정 불필요).
+### 파이프라인에 들어있지 않은 모드
+
+`brief-morning` · `brief-evening` · `flash` · `weekly` · `brief-weekly` ·
+`export` · `credit` · `runs` 는 `STEPS` 에 없습니다. **형님의 지시가 있을
+때만** `hermes\run.cmd --mode <모드>` 로 실행하십시오.
+
+### 발송 전환
+
+`TELEGRAM_*` 이 없으면 발송 모드에 `--dry-run` 이 붙습니다. 토큰을 채운 뒤
+아래를 한 번 실행하면 실제 발송으로 바뀝니다 (파일 수정 불필요).
 
 ```
 setx STOCKNEWS_SEND 1
 ```
-
-**등록되지 않은 것**: `news` · `brief-morning` · `brief-evening` ·
-`flash` · `weekly` · `brief-weekly` · `export` · `credit`.
-전부 텔레그램 토큰이 필요하거나 장중 반복 실행이라, 토큰을 채운 뒤
-같은 방식으로 추가하십시오.
-
-절전 대응으로 배터리 제한을 끄고 `StartWhenAvailable` / `WakeToRun` 을
-켜뒀습니다. 다만 `WakeToRun` 은 OS 전원 옵션에서 깨우기 타이머가 허용돼야
-동작합니다(9장).
 
 `flash` 는 4대 시간창(09:00~09:35 / 10:00~10:25 / 14:00~14:25 / 15:20~15:35)
 안에서만 실제로 스캔합니다. 창 밖 호출은 즉시 `{"skipped":true}` 로 끝나므로
@@ -175,6 +222,10 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
 
 ## 6. 절대 하지 말 것
 
+- **파이프라인 단계를 개별 모드로 부르지 마십시오.** `master` · `update` ·
+  `flags` · `credit-kiwoom` · `news` · `daily` · `exits` 는 `nightly.cmd` 가
+  순서대로 돕니다. 하나씩 부르면 완주 마커와 단계 집계가 우회되고, 1장의
+  사고가 그대로 재현됩니다. 형님의 명시적 지시가 있을 때만 예외입니다.
 - `data/quant.db` 를 삭제하지 마십시오. 재구축에 20~40분이 걸립니다.
 - `backfill` 실행 중에 다른 쓰기 잡을 강제로 돌리지 마십시오.
 - `--force-unlock` 을 습관적으로 쓰지 마십시오. 정상 실행 중인 잡의 락을
@@ -188,10 +239,14 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
 
 ```
 hermes\run.cmd verify              환경 검증 (핀 버전 + 런타임 기능)
-hermes\run.cmd smoke               스모크 테스트 263건
+hermes\run.cmd smoke               스모크 테스트
 hermes\run.cmd --mode pos-list     보유 현황 + 미체결 청산 신호
 hermes\run.cmd --mode runs         배치 이력 + 스케줄 공백 점검
 ```
+
+이 넷은 1장의 금지 대상이 **아닙니다.** `pos-list` 와 `runs` 는 읽기 전용
+이라 락을 잡지 않고 DB 를 바꾸지 않습니다(5장). 파이프라인 단계도
+아닙니다. 상태를 확인할 때 언제든 부르십시오.
 
 코드를 수정했다면 **반드시 `smoke` 를 먼저 돌리십시오.** 263건 전부 통과해야
 합니다. 실패가 있으면 커밋하지 마십시오.
@@ -368,9 +423,13 @@ master   종목 목록이 비정상적으로 적으면 갱신하지 않음
 종목별 신용잔고를 실제로 주는 유일한 자동 경로입니다. **REST 를 쓰십시오.**
 
 ```
-권장   REST      --mode credit-kiwoom     에이전트가 직접 실행 가능
+권장   REST      credit-kiwoom 단계       nightly.cmd 가 자동으로 돕니다
 대체   OCX       kiwoom_bridge.py         사람이 실행 (로그인 창)
 ```
+
+`credit-kiwoom` 은 `nightly.py` 의 `STEPS` 에 들어 있습니다. 따로 부르지
+마십시오(1장·6장). 앱키가 없으면 exit 4 로 즉시 끝나고 파이프라인은
+'기대된 스킵'으로 계속 갑니다.
 
 ### 왜 REST 인가
 
@@ -388,8 +447,13 @@ REST 는 앱키/시크릿만 있으면 그 전부가 필요 없습니다.
 1. https://openapi.kiwoom.com 에서 앱 등록 -> 앱키 / 시크릿
 2. .env 에 KIWOOM_APP_KEY / KIWOOM_APP_SECRET 입력
 3. hermes\run.cmd --mode kiwoom-plan          준비 상태 + 대상 계획 확인
-4. hermes\run.cmd --mode credit-kiwoom --json 실측 수집 + DB 적재
+                                              (조회 없음 · 읽기 전용)
+4. 끝. 실측 수집은 nightly.cmd 의 credit-kiwoom 단계가 합니다.
 ```
+
+3번은 설정이 맞는지 보는 용도라 언제든 불러도 됩니다. 4번을
+`--mode credit-kiwoom` 으로 직접 돌리지 마십시오 — 형님의 지시가 있을
+때만입니다.
 
 ```
 --targets-file <파일>   대상 목록 지정 (없으면 계획기가 직접 고름)
@@ -467,8 +531,8 @@ HTTP 429 를 받으면 속도를 **절반으로 줄이고** 백오프합니다. 
 ```
 해도 됨   --mode kiwoom-plan                    환경·계획 확인 (조회 없음)
 해도 됨   --mode kiwoom-plan --write-targets ... 대상 목록 파일 생성
-해도 됨   --mode credit-kiwoom                   REST 실측 수집 + 적재
-해도 됨   --mode credit                          CSV 체인 적재
+하지 말 것 --mode credit-kiwoom                  nightly 의 단계입니다 (1장)
+하지 말 것 --mode credit                         지시가 있을 때만
 하지 말 것 kiwoom_bridge.py 직접 실행            (로그인 창이 뜹니다)
 ```
 
@@ -683,12 +747,12 @@ flags.sync_stop_cooldowns()  exit_log 를 정본으로 재구성 + 만료 해제
 
 **거래일 기준입니다.** 달력일로 세면 주말·연휴에 앞서갑니다.
 
-```
-hermes\run.cmd --mode flags --json
-  ... "cooldown_active": 3, "cooldown_released": 1
+`nightly.cmd` 가 도는 동안 해당 단계의 `--json` 출력에 이렇게 나옵니다.
+확인용이지 호출 예시가 아닙니다.
 
-hermes\run.cmd --mode exits --json
-  ... "cooldown_added": ["005930"]
+```
+flags 단계   ... "cooldown_active": 3, "cooldown_released": 1
+exits 단계   ... "cooldown_added": ["005930"]
 ```
 
 `expire_cooldowns()` 는 **사유 코드가 일치하는 것만** 지웁니다. 자동 청소가

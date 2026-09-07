@@ -34,6 +34,10 @@ if errorlevel 1 (
     exit /b 90
 )
 
+rem Entry marker. run_screen.py logs a warning when this is absent, so we
+rem can tell later who bypassed the pipeline and called a mode directly.
+set "STOCKNEWS_ENTRY=nightly"
+
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONDONTWRITEBYTECODE=1"
