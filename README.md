@@ -119,7 +119,7 @@ capital_impair 전용 TTL 이 로컬 갱신에 덮이지 않는지
 
 ```
 TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
+TELEGRAM_CHAT_ID=...    # 쉼표로 나열하면 여러 명에게 동시 발송한다 (111,222)
 DART_API_KEY=...        # 선택. 없으면 공시 수집만 건너뛴다
 ```
 

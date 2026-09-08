@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
@@ -21,7 +22,7 @@ from .config import Config, DEFAULT
 from .contracts import ScreenResult
 from .trading_day import is_definitely_closed, trading_days_between
 
-__all__ = ["AlertWindow", "WINDOWS", "AlertGate", "send_telegram", "now_kst",
+__all__ = ["AlertWindow", "WINDOWS", "AlertGate", "send_telegram", "parse_chat_ids", "now_kst",
            "TelegramNotConfigured"]
 
 
@@ -237,19 +238,44 @@ def _split(text: str, limit: int = TELEGRAM_MAX - 128) -> list[str]:
     return chunks
 
 
+def parse_chat_ids(raw: str | None) -> list[str]:
+    """쉼표/공백/세미콜론으로 구분된 수신자 목록을 파싱한다. 순서 유지, 중복 제거."""
+    if not raw:
+        return []
+    out: list[str] = []
+    for tok in re.split(r"[,;\s]+", raw.strip()):
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
 def send_telegram(text: str, chat_id: str | None = None,
                   token: str | None = None, retries: int = 3) -> bool:
-    """HTML 모드 발송. 429 재시도 및 4096자 분할 처리."""
+    """HTML 모드 발송. 429 재시도 및 4096자 분할 처리.
+
+    chat_id 는 쉼표로 구분해 여러 명에게 동시 발송할 수 있다.
+    한 명이라도 실패하면 False 를 반환하되, 나머지 수신자 발송은 계속한다.
+    """
     token = token or os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
+    targets = parse_chat_ids(chat_id or os.getenv("TELEGRAM_CHAT_ID"))
+    if not token or not targets:
         raise TelegramNotConfigured(
             "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정 — "
             ".env 를 만드십시오 (.env.example 참조)")
 
+    chunks = _split(text)
+    ok = True
+    for target in targets:
+        if not _send_one(token, target, chunks, retries):
+            ok = False
+    return ok
+
+
+def _send_one(token: str, chat_id: str, chunks: list[str], retries: int) -> bool:
+    """수신자 한 명에게 분할된 청크를 순서대로 보낸다."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok = True
-    for chunk in _split(text):
+    for chunk in chunks:
         for attempt in range(retries):
             res = requests.post(
                 url,
