@@ -5,7 +5,22 @@ pip install 이 성공했다고 핀이 맞는 건 아니다. 다른 패키지의
 해석 과정에서 조용히 다른 버전이 올라가는 경우가 있어서, 실제로 무엇이
 import 되는지를 확인해야 한다.
 
+  hermes\\run.cmd verify        (권장 — 인터프리터를 래퍼가 고른다)
   python verify_env.py
+
+★ 인터프리터가 다르면 아무 검사도 하지 않는다
+---------------------------------------------
+이 스크립트는 **자기를 실행한 인터프리터**의 설치본과 대조한다. 그래서
+엉뚱한 파이썬으로 돌리면 그 환경 기준으로 '전부 일치' 가 나온다. 자기
+자신에 대해서는 항상 참인, 쓸모없는 통과다.
+
+2026-09-07 실측. 에이전트가 Hermes 번들 venv(Python 3.11)로 이걸 돌려
+'핀 일치 34/34 · 환경이 requirements.txt 와 정확히 일치합니다' 를 받고,
+그 결과를 근거로 numpy 핀을 2.5.2 -> 2.4.6 으로 낮췄다. 실제 배치는
+Python 3.12 로 돌고 있었고 numpy 2.5.x 는 3.12 이상을 요구한다. 통과
+문구가 오히려 틀린 판단의 근거가 됐다.
+
+그래서 첫 줄에서 버전을 확인하고, 다르면 즉시 exit 1 로 끝낸다.
 """
 from __future__ import annotations
 
@@ -15,6 +30,15 @@ from importlib import metadata
 from pathlib import Path
 
 REQ = Path(__file__).with_name("requirements.txt")
+
+# 이 프로젝트가 도는 파이썬. (major, minor) 가 정확히 일치해야 한다.
+#
+# 정확히 일치를 요구하는 이유는 requirements.txt 가 그 버전의 휠로
+# 고정돼 있기 때문이다. numpy 2.5.x 는 Requires-Python >=3.12 라
+# 3.11 에서는 설치 자체가 안 되고, 다른 마이너 버전에서는 cp3XX 확장
+# 모듈이 서로 맞지 않는다. 파이썬을 올릴 때는 이 값과 requirements.txt
+# 를 같이 올린다.
+REQUIRED_PY = (3, 12)
 
 # 배포명(distribution name) != import 이름인 것들
 IMPORT_NAME = {
@@ -53,8 +77,37 @@ def normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def check_interpreter() -> bool:
+    """실행 중인 파이썬이 REQUIRED_PY 인가. 아니면 사유를 찍는다."""
+    if sys.version_info[:2] == REQUIRED_PY:
+        return True
+    want = ".".join(str(v) for v in REQUIRED_PY)
+    got = ".".join(str(v) for v in sys.version_info[:2])
+    width = 60
+    print()
+    print("=" * width)
+    print(" 인터프리터가 다릅니다 — 검사를 중단합니다")
+    print("=" * width)
+    print(f"  필요   Python {want}")
+    print(f"  실행   Python {got}   {sys.executable}")
+    print()
+    print("  이 스크립트는 자기를 실행한 인터프리터의 설치본과")
+    print("  requirements.txt 를 대조합니다. 엉뚱한 인터프리터로 돌리면")
+    print("  그 환경 기준으로 '전부 일치' 가 나오고, 그 결과를 믿고 핀을")
+    print("  고치면 진짜 실행 환경이 깨집니다.")
+    print()
+    print("  2026-09-07 실측: Hermes 번들 venv(Python 3.11)로 돌려")
+    print("  '핀 일치 34/34' 를 받고 numpy 핀을 2.5.2 -> 2.4.6 으로")
+    print("  낮췄습니다. 실제 배치는 3.12 로 돌고 있었습니다.")
+    print()
+    print("  올바른 실행:  hermes\\run.cmd verify")
+    return False
+
+
 def main() -> int:
     print(f"Python {sys.version.split()[0]}  ({sys.executable})")
+    if not check_interpreter():
+        return 1
     if not REQ.exists():
         print(f"requirements.txt 를 찾을 수 없습니다: {REQ}")
         return 1

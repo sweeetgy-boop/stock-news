@@ -21,6 +21,7 @@ rem      2  partial -- one or more steps failed but the run completed
 rem      3  already running (lock held)
 rem     90  cannot cd to repo
 rem     91  python not found
+rem     92  wrong Python version (3.12 required)
 rem
 rem  Log: logs\nightly_YYYYMMDD.log  (appended)
 rem ==========================================================================
@@ -63,6 +64,27 @@ if not defined PYEXE (
 if not defined PYEXE (
     echo [nightly] python not found. 1>&2
     exit /b 91
+)
+
+rem --- interpreter version guard: must be Python 3.12 ---
+rem
+rem  On 2026-09-07 an agent ran verify_env.py with the Hermes bundled venv
+rem  (Python 3.11), got "34/34 pins match" against that wrong environment,
+rem  and lowered the numpy pin 2.5.2 -> 2.4.6 to fit it. numpy 2.5.x needs
+rem  Python >= 3.12, so the "passing" check was self-consistent and wrong.
+rem  A wrapper that hands work to the wrong interpreter is worse than one
+rem  that refuses to start. Refuse.
+rem
+rem  Note the resolution order above still prefers 313 then 312. If you
+rem  install another minor version, this guard fires instead of silently
+rem  running on it -- bump REQUIRED_PY in verify_env.py and this check
+rem  together with requirements.txt.
+"%PYEXE%" %PYARG% -c "import sys;raise SystemExit(0 if sys.version_info[:2]==(3,12) else 92)" >nul 2>&1
+if errorlevel 1 (
+    echo [nightly] wrong Python: 3.12 required. 1>&2
+    "%PYEXE%" %PYARG% -c "import sys;print('[nightly] got Python '+sys.version.split()[0]+'  '+sys.executable)" 1>&2
+    echo [nightly] see AGENTS.md 1. 1>&2
+    exit /b 92
 )
 
 "%PYEXE%" %PYARG% nightly.py %*

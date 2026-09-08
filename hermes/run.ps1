@@ -47,6 +47,20 @@ if (-not $py) {
     }
 }
 
+# 인터프리터 버전 가드. run.cmd 와 같은 검사다.
+#
+# 2026-09-07 실측: 에이전트가 Hermes 번들 venv(Python 3.11)로
+# verify_env.py 를 돌려 '핀 일치 34/34' 를 받고 numpy 핀을 2.5.2 ->
+# 2.4.6 으로 낮췄다. numpy 2.5.x 는 3.12 이상을 요구하므로 그 통과는
+# 자기 자신에 대해서만 참인 결과였다. 틀린 인터프리터로 일을 넘기는
+# 래퍼는 아예 시작하지 않는 래퍼보다 나쁘다.
+& $py -c "import sys;raise SystemExit(0 if sys.version_info[:2]==(3,12) else 92)" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    $got = & $py -c "import sys;print(sys.version.split()[0]+'  '+sys.executable)" 2>$null
+    Write-Error "파이썬 버전이 다릅니다. 필요 3.12 / 실행 $got  (AGENTS.md 1장)"
+    exit 92
+}
+
 $rest = @($Args)
 if ($rest.Count -ge 1 -and $rest[0] -eq 'smoke') {
     & $py smoke_test.py @($rest[1..($rest.Count - 1)])

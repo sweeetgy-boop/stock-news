@@ -4977,6 +4977,88 @@ def test_joblock(tmp: Path):
     check("joblock", "강제 해제", t_clear)
 
 
+def test_interpreter_guard(tmp: Path):
+    """인터프리터 가드. 틀린 파이썬으로는 통과 자체가 불가능해야 한다.
+
+    verify_env.py 는 **자기를 실행한 인터프리터**의 설치본과
+    requirements.txt 를 대조한다. 그래서 엉뚱한 파이썬으로 돌리면 그
+    환경 기준으로 '전부 일치' 가 나온다 — 자기 자신에 대해서만 참인,
+    쓸모없는 통과다.
+
+    2026-09-07 실측. 에이전트가 Hermes 번들 venv(Python 3.11)로 돌려
+    '핀 일치 34/34 · 환경이 requirements.txt 와 정확히 일치합니다' 를
+    받고, 그 결과를 근거로 numpy 핀을 2.5.2 -> 2.4.6 으로 낮췄다.
+    numpy 2.5.x 는 Requires-Python >=3.12 라 3.11 에서 설치가 안 되는
+    것이었고, 실제 배치는 3.12 로 돌고 있었다.
+    """
+    import contextlib
+    import importlib
+    import io
+
+    repo = Path(__file__).resolve().parent
+    ve = importlib.import_module("verify_env")
+
+    RUN = "hermes/run.cmd"
+    NIGHT = "hermes/nightly.cmd"
+    DISPATCH = {RUN: '"%PYEXE%" %PYARG% run_screen.py %*',
+                NIGHT: '"%PYEXE%" %PYARG% nightly.py %*'}
+
+    def t_required_py():
+        assert ve.REQUIRED_PY == (3, 12), ve.REQUIRED_PY
+
+    def t_guard_reflects_runtime():
+        assert ve.check_interpreter() == (
+            sys.version_info[:2] == ve.REQUIRED_PY)
+
+    def t_main_stops_before_pin_compare():
+        """가드가 걸리면 핀 대조를 **아예 하지 않아야** 한다.
+
+        여기서 멈추지 않으면 틀린 환경 기준의 '34/34 일치' 가 그대로
+        출력되고, 그 문구가 다음 사람의 판단 근거가 된다.
+        """
+        saved = ve.check_interpreter
+        try:
+            ve.check_interpreter = lambda: False
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = ve.main()
+            out = buf.getvalue()
+            assert rc == 1, rc
+            assert "핀 버전 대조" not in out, "가드 후에도 핀 대조를 수행했다"
+            assert "정확히 일치" not in out, "가드 후에도 통과 문구를 냈다"
+        finally:
+            ve.check_interpreter = saved
+
+    def t_launchers_have_guard():
+        for name in (RUN, NIGHT):
+            src = (repo / name).read_text(encoding="utf-8")
+            assert "version_info[:2]==(3,12)" in src, f"{name}: 가드 없음"
+            assert "exit /b 92" in src, f"{name}: exit 92 없음"
+
+    def t_guard_precedes_handoff():
+        """가드는 인계보다 앞에 있어야 한다. 뒤에 있으면 아무 소용이 없다."""
+        for name in (RUN, NIGHT):
+            src = (repo / name).read_text(encoding="utf-8")
+            assert src.index("version_info[:2]==(3,12)") < src.index(
+                DISPATCH[name]), f"{name}: 가드가 인계 뒤에 있다"
+
+    def t_launchers_ascii_only():
+        """cmd.exe 는 배치를 현재 코드페이지로 읽는다. 비ASCII 바이트가
+        섞이면 파서가 동기를 잃고 주석을 명령으로 실행한다 (AGENTS 1장).
+        가드를 넣으면서 한글 메시지를 넣고 싶어지는 자리라 고정한다."""
+        for name in (RUN, NIGHT):
+            raw = (repo / name).read_bytes()
+            bad = [b for b in raw if b > 0x7F]
+            assert not bad, f"{name}: 비ASCII 바이트 {len(bad)}개"
+
+    check("interpreter", "REQUIRED_PY = 3.12", t_required_py)
+    check("interpreter", "가드 = 실행 중인 버전", t_guard_reflects_runtime)
+    check("interpreter", "가드 시 핀 대조 안 함", t_main_stops_before_pin_compare)
+    check("interpreter", "래퍼 가드 + exit 92", t_launchers_have_guard)
+    check("interpreter", "가드가 인계보다 앞", t_guard_precedes_handoff)
+    check("interpreter", "래퍼는 ASCII 전용", t_launchers_ascii_only)
+
+
 def test_agent_contract(tmp: Path):
     """에이전트 연동 규약. 종료 코드와 쓰기 모드 목록의 정합성."""
     import contextlib
@@ -7027,6 +7109,7 @@ def main() -> int:
         test_docs()
         test_env(tmp)
         test_joblock(tmp)
+        test_interpreter_guard(tmp)
         test_agent_contract(tmp)
         if st is not None:
             test_renderer(st)

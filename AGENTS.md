@@ -95,7 +95,13 @@ stderr 로 분리됩니다. 한글 로그를 스크레이핑하지 마십시오.
 64  인자 오류 (모드 오타 등)              → 종료
 90  저장소 이동 실패 (래퍼)
 91  파이썬 없음 (래퍼)
+92  파이썬 버전이 3.12 가 아님 (래퍼)   → 인계 전에 차단
 ```
+
+**92 는 재시도로 풀리지 않습니다.** 래퍼가 고른 인터프리터가 3.12 가
+아니라는 뜻입니다. 메시지에 실제로 고른 경로가 찍히니 그것부터 보십시오.
+`verify_env.py` 도 같은 검사를 하고, 다르면 핀 대조를 **하지 않고**
+exit 1 로 끝냅니다. 자세한 이유는 8-4장에 있습니다.
 
 **어느 코드로 끝나든 재시도하지 않습니다.** 자동 실행은 하루 한 번,
 21:30 뿐입니다. 실패는 텔레그램으로 알리고 거기서 끝냅니다. 다음 기회는
@@ -472,6 +478,70 @@ cron 이 catch-up 으로 발사했습니다(`lateness 8876.8s`). 그 시점에 D
 **재발 방지.** 8-2 의 판정 규칙을 `OUTAGE` / `PENDING` 을 포함한 5분기로
 바꾸고, 소스 장애를 nightly 가 실패로 집계하도록 고쳤습니다. 회귀
 테스트는 `smoke_test.py` 의 `market_source` 섹션에 있습니다.
+
+## 8-4. 인터프리터 가드 — 3.12 가 아니면 시작하지 않습니다
+
+`verify_env.py` 와 모든 래퍼(`run.cmd` / `nightly.cmd` / `run.ps1`)는
+실행할 파이썬이 **정확히 3.12** 인지 먼저 확인합니다. 아니면 아무 일도
+하지 않고 끝냅니다.
+
+```
+verify_env.py   exit 1    핀 대조를 수행하지 않음
+run.cmd         exit 92   run_screen.py 에 인계하지 않음
+nightly.cmd     exit 92   파이프라인을 시작하지 않음
+run.ps1         exit 92
+```
+
+### 왜 '통과' 가 위험한가
+
+`verify_env.py` 는 **자기를 실행한 인터프리터**의 설치본과
+`requirements.txt` 를 대조합니다. 그래서 엉뚱한 파이썬으로 돌리면 그
+환경 기준으로 '전부 일치' 가 나옵니다. 자기 자신에 대해서만 참인,
+쓸모없는 통과입니다. 그런데 출력 문구는 진짜 통과와 똑같습니다.
+
+2026-09-07 20:13, 에이전트가 `python verify_env.py` 를 돌렸는데 PATH 의
+`python` 이 Hermes 번들 venv 였습니다.
+
+```
+20:13:50  Python 3.11.16  (...\hermes\hermes-agent\venv\Scripts\python.exe)
+          -> "의존성 대부분 미설치"
+20:14:49  pip install -r requirements.txt        (그 3.11 venv 에 설치)
+          ERROR: ... 2.5.2 Requires-Python >=3.12
+          ERROR: No matching distribution found for numpy==2.5.2
+20:15:05  requirements.txt  numpy 2.5.2 -> 2.4.6      ← 핀을 낮춤
+20:18:01  Python 3.11.16 ... 핀 일치 34/34 · "정확히 일치합니다"
+20:19:03  "환경 검증 통과했습니다."
+```
+
+실제 배치는 `%LOCALAPPDATA%\Programs\Python\Python312\python.exe` 로
+돌고 있었고 그 환경의 numpy 는 2.5.2 였습니다. 즉 **통과 문구가 틀린
+판단의 근거가 됐습니다.** 핀 파일만 어긋난 채 2026-09-09 까지 남았습니다.
+
+부작용도 남았습니다. 그 `pip install` 이 프로젝트 의존성 전체를 Hermes
+자기 venv 에 설치했고, Hermes 가 `PYTHONPATH` 로 자기 3.11
+site-packages 를 자식에 흘리면서 3.12 가 cp311 numpy 바이너리를 집는
+`Importing the numpy C-extensions failed` 로 이어졌습니다.
+`hermes/cron_nightly.py` 의 `_LEAKY` 환경변수 제거가 그 방어입니다.
+
+### 왜 정확히 일치를 요구하는가
+
+`requirements.txt` 가 그 버전의 휠로 고정돼 있습니다. numpy 2.5.x 는
+`Requires-Python >=3.12` 라 3.11 에서는 설치 자체가 되지 않고, 다른
+마이너 버전에서는 cp3XX 확장 모듈이 서로 맞지 않습니다.
+
+파이썬을 올릴 때는 세 곳을 **같이** 올리십시오.
+
+```
+verify_env.py     REQUIRED_PY = (3, 12)
+hermes\run.cmd    version_info[:2]==(3,12)
+hermes\nightly.cmd  같은 줄
+hermes\run.ps1      같은 줄
+requirements.txt  그 버전용 휠로 재고정
+```
+
+래퍼의 인터프리터 탐색 순서는 여전히 `venv` -> `313` -> `312` -> `311`
+입니다. 다른 마이너 버전을 설치하면 조용히 그걸 쓰는 대신 **exit 92 로
+막힙니다.** 회귀 테스트는 `smoke_test.py` 의 `interpreter` 섹션입니다.
 
 ## 9. 알려진 제약
 
