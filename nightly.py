@@ -277,10 +277,47 @@ def _run_step(step: Step, dry: bool, log: Log, timeout: int) -> dict:
         if payload.get("reason"):
             note += f" {payload['reason']}"
 
+    # ── 소스 장애는 '성공'이 아니다 ──
+    # 2026-09-08 실측. update 가 rc=0 · 0.8초 · 적재 0건으로 끝났고
+    # 파이프라인은 "실패 없음"으로 보고했다. 그런데 그 거래일의 시세는
+    # 통째로 비어 있었고, 게다가 그날이 휴장일로 박혀 영구 소실될
+    # 뻔했다. rc 만 보면 이 상태가 보이지 않는다.
+    state, note = _health_override(step, state, note, payload)
+
     log(f"---- {step.name} 종료 rc={rc} · {elapsed:.1f}초 · {state}"
         + (f" · {note}" if note else "") + " ----")
     return {"name": step.name, "rc": rc, "state": state, "note": note,
             "elapsed": elapsed, "json": payload}
+
+
+def _health_override(step: Step, state: str, note: str,
+                     payload: dict) -> tuple[str, str]:
+    """종료 코드가 놓치는 '조용한 실패'를 실패로 되돌린다.
+
+    두 가지를 본다.
+
+      1. `source_outage` — 거래일인데 시세를 못 받은 날짜. run_screen 이
+         휴장일로 기록하지 않고 올려보낸다. 다음 실행이 재요청하지만,
+         그 사실은 사람에게 보여야 한다.
+      2. update 가 아무것도 안 했는데 그럴 근거도 없는 경우. 휴장일
+         건너뜀도, 새 휴장일 기록도, 판정 보류도 없이 0건이면 이상하다.
+    """
+    if state not in ("ok", "warn"):
+        return state, note
+
+    outage = payload.get("source_outage") or []
+    if outage:
+        shown = ", ".join(outage[:3]) + ("..." if len(outage) > 3 else "")
+        return "fail", f"소스 장애 {len(outage)}일 ({shown})"
+
+    if step.name == "update" and not payload.get("rows"):
+        grounds = (payload.get("holidays_skipped")
+                   or payload.get("marked_non_trading")
+                   or payload.get("judge_pending"))
+        if not grounds:
+            return "fail", "적재 0건 · 휴장 근거 없음"
+
+    return state, note
 
 
 def _notify(text: str, log: Log, enabled: bool) -> None:
@@ -317,6 +354,18 @@ def _summary(started: datetime, finished: datetime,
             f"{r['name']}({r['note']})" for r in fails)
     else:
         head += " | 실패 없음"
+
+    # 시세 적재량을 항상 노출한다. "실패 없음"만 보고 안심하는 일이
+    # 없도록, 그 밤에 실제로 며칠치가 들어왔는지를 같은 줄에서 본다.
+    upd = next((r for r in results if r["name"] == "update"), None)
+    if upd:
+        j = upd.get("json") or {}
+        head += (f"\n시세 {j.get('rows', '?')}건 · "
+                 f"최신 거래일 {j.get('last_price_date', '?')}")
+        if j.get("marked_non_trading"):
+            head += f" · 휴장 기록 {', '.join(j['marked_non_trading'])}"
+        if j.get("source_outage"):
+            head += f" · 미적재 {', '.join(j['source_outage'])}"
     if dry:
         head += "\n※ --dry-run (STOCKNEWS_SEND=1 로 실발송 전환)"
     return head

@@ -324,6 +324,11 @@ def mode_update(store: Store, args) -> int:
     # 공휴일을 catchup 기간 내내 매번 재요청한다(0건이라 have 에 안 들어감).
     holidays = store.known_non_trading_days(since=since)
     total, skipped = 0, 0
+    # 날짜별 판정 근거. '적재 0건'이 휴장인지 장애인지를 구분해서 위로
+    # 올린다. 이게 없으면 nightly 가 소스 장애를 '실패 없음'으로 보고한다.
+    outages: list[str] = []
+    marked: list[str] = []
+    pending: list[str] = []
     for back in range(args.catchup, -1, -1):
         day = started - timedelta(days=back)
         if day.weekday() >= 5:            # 토/일
@@ -334,19 +339,42 @@ def mode_update(store: Store, args) -> int:
         if ds in holidays:
             skipped += 1
             continue
-        n = fetch_day(store, day.strftime("%Y%m%d"))
+        rep: dict = {}
+        n = fetch_day(store, day.strftime("%Y%m%d"), report=rep)
         total += n
+        verdict = rep.get("verdict")
+        if verdict == "OUTAGE":
+            outages.append(ds)
+        elif verdict == "PENDING":
+            pending.append(ds)
+        elif verdict == "CLOSED" and rep.get("path") == "closed":
+            marked.append(ds)
         if n:
             time.sleep(0.6)
     if skipped:
         log.info("알려진 휴장일 %d일 건너뜀", skipped)
+    if marked:
+        log.info("휴장일로 새로 기록: %s", ", ".join(marked))
+    if pending:
+        log.info("장 마감 전이라 판정 보류: %s", ", ".join(pending))
     SUMMARY["holidays_skipped"] = skipped
     last = store.last_price_date()
     log.info("증분 적재 %d건 · 최신 거래일 %s", total, last)
-    SUMMARY.update({"rows": total, "last_price_date": last})
+    SUMMARY.update({"rows": total, "last_price_date": last,
+                    "source_outage": outages,
+                    "marked_non_trading": marked,
+                    "judge_pending": pending})
     if not total and not have:
         # 시세가 하나도 없다. backfill 이 선행돼야 한다.
         return EXIT_PRECOND
+    if outages:
+        # **성공으로 끝내지 않는다.** 거래일인데 시세를 못 받은 것은
+        # 조용히 넘어가면 안 되는 상태다. 휴장일로 기록하지 않았으니
+        # 다음 실행이 다시 요청하지만, 그 사실이 사람에게 보여야 한다.
+        log.error("소스 장애로 적재하지 못한 거래일 %d일: %s — 휴장일로 "
+                  "기록하지 않았으므로 다음 실행에서 다시 요청합니다.",
+                  len(outages), ", ".join(outages))
+        return EXIT_PARTIAL
     return EXIT_OK
 
 

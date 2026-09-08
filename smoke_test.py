@@ -2331,33 +2331,229 @@ def test_market_source(tmp: Path):
             d.close_on = d_saved
             uni.close_on = saved
 
+    def _status(mapping):
+        """close_on_status 대역. mapping: ticker -> (status, value)."""
+        def _fn(ticker, trade_date, retries=None, backoff=None):
+            return mapping.get(ticker, ("NODATA", None))
+        return _fn
+
     def t_source_outage_is_not_holiday():
         """소스 장애 = 휴장일 아님. 이게 이 테스트의 핵심이다."""
         assert not st.is_known_non_trading(ISO)
-        s_snap, s_close = uni.market_snapshot, uni.close_on
+        s_snap, s_stat = uni.market_snapshot, uni.close_on_status
         try:
             uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
             # 기준 종목은 데이터가 있다 → 거래일이다
-            uni.close_on = lambda t, td: (100.0 if t in uni.REF_TICKERS
-                                          else None)
-            n = uni.fetch_day(st, WED)
+            uni.close_on_status = _status(
+                {t: ("DATA", 100.0) for t in uni.REF_TICKERS})
+            rep = {}
+            n = uni.fetch_day(st, WED, report=rep)
             assert n == 0, n
+            # 기준 종목에 데이터가 있으므로 '거래일'로 확정된다.
+            # 전종목이 0건인 것은 휴장의 근거가 될 수 없다.
+            assert rep["verdict"] == "TRADING", rep
             assert not st.is_known_non_trading(ISO), \
                 "소스 장애를 휴장일로 기록했다 (거래일 영구 소실)"
         finally:
-            uni.market_snapshot, uni.close_on = s_snap, s_close
+            uni.market_snapshot, uni.close_on_status = s_snap, s_stat
 
     def t_real_holiday_is_marked():
-        s_snap, s_close = uni.market_snapshot, uni.close_on
+        s_snap, s_stat = uni.market_snapshot, uni.close_on_status
         try:
             uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
-            uni.close_on = lambda t, td: None      # 기준 종목도 데이터 없음
-            n = uni.fetch_day(st, "20260817")      # 다른 날짜(월)
+            # 기준 종목이 '없다'고 응답한다 (조회는 성공)
+            uni.close_on_status = _status({})
+            rep = {}
+            n = uni.fetch_day(st, "20260817", report=rep)   # 다른 날짜(월)
             assert n == 0, n
+            assert rep["verdict"] == "CLOSED", rep
             assert st.is_known_non_trading("2026-08-17"), \
                 "기준 종목도 데이터가 없으면 휴장일로 기록해야 한다"
         finally:
-            uni.market_snapshot, uni.close_on = s_snap, s_close
+            uni.market_snapshot, uni.close_on_status = s_snap, s_stat
+
+    def t_probe_error_is_not_holiday():
+        """★ 2026-09-08 회귀 앵커.
+
+        기준 종목 조회가 **실패**한 것을 '데이터 없음'으로 접으면
+        정상 거래일이 non_trading_days 에 박히고, 그 테이블은 자기학습
+        캐시라 update 가 그 날짜를 두 번 다시 요청하지 않는다.
+        실측: 화요일 2026-09-08 이 부팅 직후 DNS 장애로 휴장일이 됐다.
+        """
+        THU, ISO_T = "20260820", "2026-08-20"
+        assert not st.is_known_non_trading(ISO_T)
+        s_snap, s_stat = uni.market_snapshot, uni.close_on_status
+        seen = []
+        try:
+            uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
+
+            def _boom(ticker, trade_date, retries=None, backoff=None):
+                seen.append(ticker)
+                return "ERROR", None
+
+            uni.close_on_status = _boom
+            rep = {}
+            n = uni.fetch_day(st, THU, report=rep)
+            assert n == 0, n
+            assert rep["verdict"] == "OUTAGE", rep
+            assert not st.is_known_non_trading(ISO_T), \
+                "조회 실패를 휴장일로 기록했다 (거래일 영구 소실)"
+            assert len(seen) == len(uni.REF_TICKERS), seen
+        finally:
+            uni.market_snapshot, uni.close_on_status = s_snap, s_stat
+
+    def t_mixed_error_is_outage():
+        """하나라도 실패면 나머지가 '없음'이어도 확정하지 않는다."""
+        ISO_M = "2026-08-27"
+        s_snap, s_stat = uni.market_snapshot, uni.close_on_status
+        try:
+            uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
+            uni.close_on_status = _status(
+                {uni.REF_TICKERS[0]: ("ERROR", None)})
+            rep = {}
+            uni.fetch_day(st, "20260827", report=rep)
+            assert rep["verdict"] == "OUTAGE", rep
+            assert not st.is_known_non_trading(ISO_M)
+        finally:
+            uni.market_snapshot, uni.close_on_status = s_snap, s_stat
+
+    def t_today_before_close_is_pending():
+        """장 마감 전의 '오늘'은 휴장으로 단정하지 않는다.
+
+        자정~오전에 도는 catch-up 이 아직 열리지도 않은 장을 휴장일로
+        박는 것을 막는다. 기준 종목은 이 시각에 정상적으로 '데이터 없음'을
+        응답하므로 네트워크가 멀쩡해도 CLOSED 가 나온다.
+        """
+        import datetime as _dt
+        ISO_P, YMD_P = "2026-08-26", "20260826"      # 수요일
+        s_snap, s_stat = uni.market_snapshot, uni.close_on_status
+        s_now = uni._now_kst
+        try:
+            uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
+            uni.close_on_status = _status({})
+            uni._now_kst = lambda: _dt.datetime(2026, 8, 26, 0, 30)
+            rep = {}
+            n = uni.fetch_day(st, YMD_P, report=rep)
+            assert n == 0 and rep["verdict"] == "PENDING", rep
+            assert not st.is_known_non_trading(ISO_P), \
+                "장 마감 전인 오늘을 휴장일로 기록했다"
+            # 마감 후에는 같은 응답으로 휴장일이 확정된다
+            uni._now_kst = lambda: _dt.datetime(2026, 8, 26, 21, 30)
+            rep2 = {}
+            uni.fetch_day(st, YMD_P, report=rep2)
+            assert rep2["verdict"] == "CLOSED", rep2
+            assert st.is_known_non_trading(ISO_P)
+        finally:
+            uni.market_snapshot, uni.close_on_status = s_snap, s_stat
+            uni._now_kst = s_now
+
+    def t_close_on_status_three_way():
+        """close_on_status 는 '없음'과 '못 물어봄'을 가른다."""
+        import types
+        from stocknews import data as d
+        calls = []
+
+        def _fake(ohlcv):
+            fake = types.ModuleType("pykrx")
+            fake.stock = types.SimpleNamespace(get_market_ohlcv=ohlcv)
+            return fake
+
+        saved = sys.modules.get("pykrx")
+        try:
+            # 1) 예외 -> 재시도 -> 성공
+            def _flaky(a, b, tk):
+                calls.append(tk)
+                if len(calls) < 3:
+                    raise ConnectionError("getaddrinfo failed")
+                return _pd.DataFrame({"종가": [1000.0]}, index=[a])
+
+            sys.modules["pykrx"] = _fake(_flaky)
+            got = d.close_on_status("005930", "20260819", retries=2,
+                                    backoff=0.0)
+            assert got == ("DATA", 1000.0), got
+            assert len(calls) == 3, calls
+
+            # 2) 계속 예외 -> 재시도 소진 -> ERROR
+            calls.clear()
+
+            def _always(a, b, tk):
+                calls.append(tk)
+                raise ConnectionError("getaddrinfo failed")
+
+            sys.modules["pykrx"] = _fake(_always)
+            got = d.close_on_status("005930", "20260819", retries=2,
+                                    backoff=0.0)
+            assert got == ("ERROR", None), got
+            assert len(calls) == 3, calls
+
+            # 3) 빈 응답은 답이다 -> 재시도하지 않는다
+            calls.clear()
+
+            def _empty(a, b, tk):
+                calls.append(tk)
+                return _pd.DataFrame()
+
+            sys.modules["pykrx"] = _fake(_empty)
+            got = d.close_on_status("005930", "20260819", retries=2,
+                                    backoff=0.0)
+            assert got == ("NODATA", None), got
+            assert len(calls) == 1, calls
+        finally:
+            if saved is None:
+                sys.modules.pop("pykrx", None)
+            else:
+                sys.modules["pykrx"] = saved
+
+    def t_load_floor():
+        """적재량 하한. refresh_master 의 50%/500 가드와 같은 논리."""
+        import sqlite3
+        st2 = Store(tmp / "floor.db")
+        # 표본이 3일 미만이면 판정을 보류한다(백필 초기 보호)
+        assert uni.load_floor(st2) == 0
+        with sqlite3.connect(st2.path) as con:
+            for day in ("2026-08-17", "2026-08-18", "2026-08-19"):
+                con.executemany(
+                    "INSERT OR REPLACE INTO prices(ticker,d,o,h,l,c,v,amt) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    [(f"{i:06d}", day, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+                     for i in range(2400)])
+            con.commit()
+        # 중위값 2,400 의 50% = 1,200 (절대 하한 500 보다 크다)
+        assert uni.load_floor(st2) == 1200, uni.load_floor(st2)
+
+    def t_nightly_counts_outage_as_failure():
+        """'실패 없음'인데 시세가 없는 상태를 만들지 않는다."""
+        import importlib.util
+        repo = Path(__file__).resolve().parent
+        spec = importlib.util.spec_from_file_location(
+            "_nightly_probe", str(repo / "nightly.py"))
+        mod = importlib.util.module_from_spec(spec)
+        # @dataclass 가 cls.__module__ 로 sys.modules 를 되짚는다.
+        # 등록하지 않고 exec_module 하면 AttributeError 로 죽는다.
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.modules.pop(spec.name, None)
+        upd = mod.Step("update", ["--mode", "update"])
+
+        state, note = mod._health_override(
+            upd, "ok", "", {"rows": 2400, "source_outage": ["2026-09-08"]})
+        assert state == "fail" and "2026-09-08" in note, (state, note)
+
+        # 근거 없는 0건도 실패다
+        state, note = mod._health_override(upd, "ok", "", {"rows": 0})
+        assert state == "fail" and "0건" in note, (state, note)
+
+        # 휴장일로 건너뛴 0건은 정상이다
+        state, _ = mod._health_override(
+            upd, "ok", "", {"rows": 0, "holidays_skipped": 1})
+        assert state == "ok", state
+
+        # 장 마감 전 판정 보류도 정상이다
+        state, _ = mod._health_override(
+            upd, "ok", "", {"rows": 0, "judge_pending": ["2026-09-09"]})
+        assert state == "ok", state
 
     def t_snapshot_path_used():
         """스냅샷이 검증되면 요청 1회로 적재된다."""
@@ -2397,6 +2593,12 @@ def test_market_source(tmp: Path):
     check("market_source", "날짜 대조 (장중가 거부)", t_verify_match)
     check("market_source", "소스 장애를 휴장일로 안 씀", t_source_outage_is_not_holiday)
     check("market_source", "실제 휴장일은 기록", t_real_holiday_is_marked)
+    check("market_source", "조회 실패는 휴장일 아님", t_probe_error_is_not_holiday)
+    check("market_source", "일부 실패도 확정 안 함", t_mixed_error_is_outage)
+    check("market_source", "장 마감 전 판정 보류", t_today_before_close_is_pending)
+    check("market_source", "종가 조회 3분기 + 재시도", t_close_on_status_three_way)
+    check("market_source", "적재량 하한", t_load_floor)
+    check("market_source", "소스 장애를 실패로 집계", t_nightly_counts_outage_as_failure)
     check("market_source", "스냅샷 경로 적재", t_snapshot_path_used)
     check("market_source", "주말 즉시 생략", t_weekend_short_circuits)
 

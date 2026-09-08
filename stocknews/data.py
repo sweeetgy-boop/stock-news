@@ -32,6 +32,8 @@ pykrx OHLCV는 반드시 확보되고, 신용잔고/공매도는 없을 수도 �
 from __future__ import annotations
 
 import logging
+import random
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -42,10 +44,22 @@ log = logging.getLogger(__name__)
 
 __all__ = ["normalize_ohlcv", "load_ohlcv", "load_investor", "load_shorting",
            "make_loader", "market_snapshot", "verify_snapshot_date",
-           "close_on", "load_index", "INDEX_SYMBOLS", "REF_TICKERS"]
+           "close_on", "close_on_status", "net_reachable", "load_index",
+           "INDEX_SYMBOLS", "REF_TICKERS", "REF_PROBE_RETRIES"]
 
 # 날짜 대조용 기준 종목. 거래정지 가능성이 낮은 초대형주만 쓴다.
 REF_TICKERS = ("005930", "000660", "005380")
+
+# 기준 종목 조회 재시도 횟수(최초 1회 + 재시도 N회).
+#
+# 2026-09-08 21:30 회차가 PC 종료로 밀렸고, 부팅 직후 catch-up 이 돌 때
+# DNS 가 아직 올라오지 않아 기준 종목 3개가 전부 실패했다. 그 '실패'를
+# '데이터 없음'과 구분하지 못해서 정상 거래일인 화요일이 휴장일로
+# 기록됐다. 한 번의 실패로 하루를 영구히 버리지 않도록 재시도한다.
+REF_PROBE_RETRIES = 2
+
+# 네트워크 도달 확인용 호스트. 시세/공시 소스가 전부 이 도메인 아래다.
+NET_PROBE_HOST = "data.krx.co.kr"
 
 _COLMAP = {
     "Open": "시가", "High": "고가", "Low": "저가", "Close": "종가",
@@ -149,7 +163,31 @@ def market_snapshot() -> tuple[pd.DataFrame, pd.DataFrame]:
         import FinanceDataReader as fdr
         lst = fdr.StockListing("KRX")
     except Exception as exc:  # noqa: BLE001
-        log.warning("전종목 스냅샷 조회 실패: %s", exc)
+        # 예외 **타입**을 반드시 남긴다. 메시지만 남기면 원인이 사라진다.
+        #
+        # FinanceDataReader 0.9.202 의 krx/listing.py 는 이렇게 돼 있다.
+        #
+        #     try:
+        #         r = requests.get(url, headers=self.headers)
+        #         j = json.loads(r.text)
+        #     except:                 # bare except
+        #         print(r.text)       # requests.get 이 던지면 r 은 미할당
+        #
+        # 네트워크가 끊기면 `requests.get` 이 먼저 예외를 내므로 `r` 이
+        # 바인딩되기 전이고, 핸들러가 `r.text` 를 평가하다 터진다. 그래서
+        # 원래의 ConnectionError 가 UnboundLocalError 로 덮여 나온다.
+        # 2026-09-08 실측 로그가 "cannot access local variable 'r'" 만
+        # 남긴 이유다. 상류 버그라 여기서 고칠 수 없으니, 대신 진짜 원인을
+        # 우리가 덧붙인다.
+        hint = ""
+        if isinstance(exc, UnboundLocalError) and "'r'" in str(exc):
+            hint = (" — FinanceDataReader 내부 버그로 원인이 가려졌습니다"
+                    " (krx/listing.py 의 bare except 가 미할당 r 을 참조)."
+                    " 실제 원인은 대개 네트워크/DNS 장애입니다")
+        if not net_reachable():
+            hint += f" — {NET_PROBE_HOST} DNS 해석 실패 (네트워크 미준비)"
+        log.warning("전종목 스냅샷 조회 실패: %s: %s%s",
+                    type(exc).__name__, exc, hint)
         return pd.DataFrame(), pd.DataFrame()
 
     if lst is None or lst.empty:
@@ -194,25 +232,81 @@ def market_snapshot() -> tuple[pd.DataFrame, pd.DataFrame]:
     return prices, meta
 
 
+def net_reachable(host: str = NET_PROBE_HOST, timeout: float = 3.0) -> bool:
+    """DNS 해석만으로 네트워크 도달 여부를 본다. 요청은 보내지 않는다.
+
+    '조회 실패'의 원인이 우리 쪽 네트워크인지 상대 쪽 장애인지를 로그에
+    남기기 위한 것이다. 판정 로직에 쓰지 않는다 — 도달 가능해도 상대가
+    죽어 있을 수 있으므로, 실패 처리는 어차피 보수적으로 해야 한다.
+    """
+    import socket
+    try:
+        socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        return True
+    except OSError as exc:
+        log.debug("네트워크 도달 확인 실패 %s: %s", host, exc)
+        return False
+
+
+def close_on_status(ticker: str, trade_date: str,
+                    retries: int = REF_PROBE_RETRIES,
+                    backoff: float = 1.0) -> tuple[str, float | None]:
+    """특정 거래일의 종가 1개를 **근거와 함께** 돌려준다.
+
+    trade_date : 'YYYYMMDD'
+    반환 (status, close)
+
+        "DATA"    조회 성공 + 종가 있음        -> 그 날은 거래일이다
+        "NODATA"  조회 성공 + 응답이 비었음    -> 그 날은 휴장일일 수 있다
+        "ERROR"   조회 자체가 실패(예외)       -> 아무것도 알 수 없다
+
+    ★ 왜 셋으로 나누는가
+    -------------------
+    예전 `close_on()` 은 예외를 삼키고 None 을 돌렸다. 그래서 호출부는
+    '데이터가 없다'와 '물어보지 못했다'를 구분할 수 없었고, 네트워크가
+    끊긴 상태를 휴장일로 확정 기록해 거래일을 영구히 잃었다
+    (2026-09-08 실측). 빈 응답은 답이지만 예외는 답이 아니다.
+
+    예외일 때만 재시도한다. 빈 응답은 재시도해도 같은 답이 온다.
+    """
+    from_exc: Exception | None = None
+    for attempt in range(max(0, int(retries)) + 1):
+        try:
+            from pykrx import stock
+            df = stock.get_market_ohlcv(trade_date, trade_date, ticker)
+        except Exception as exc:  # noqa: BLE001
+            from_exc = exc
+            log.debug("종가 조회 실패 %s %s (%d/%d): %s: %s", ticker,
+                      trade_date, attempt + 1, retries + 1,
+                      type(exc).__name__, exc)
+            if attempt < retries:
+                time.sleep(backoff * (2 ** attempt) + random.random() * 0.3)
+            continue
+        if df is None or df.empty or "종가" not in df.columns:
+            return "NODATA", None
+        try:
+            v = float(df["종가"].iloc[-1])
+        except (IndexError, ValueError, TypeError):
+            return "NODATA", None
+        return ("DATA", v) if v > 0 else ("NODATA", None)
+    log.warning("종가 조회 %s %s 재시도 %d회 소진: %s: %s", ticker, trade_date,
+                retries + 1, type(from_exc).__name__, from_exc)
+    return "ERROR", None
+
+
 def close_on(ticker: str, trade_date: str) -> float | None:
     """특정 거래일의 종가 1개. 종목별 시계열 엔드포인트를 쓴다(동작함).
 
     trade_date : 'YYYYMMDD'
-    거래일이 아니거나 조회 실패면 None.
+    거래일이 아니거나 조회 실패면 None. 둘을 구분해야 하면
+    `close_on_status()` 를 쓰십시오.
+
+    **재시도하지 않는다(retries=0).** 이 함수는 종목별 폴백 루프에서
+    2,500회 넘게 불린다. 여기에 백오프를 물리면 소스가 죽었을 때 한 번의
+    적재가 몇 시간씩 늘어난다. 재시도가 값어치를 하는 곳은 하루의 운명을
+    가르는 기준 종목 판정(`probe_refs`)뿐이고, 거기서만 쓴다.
     """
-    try:
-        from pykrx import stock
-        df = stock.get_market_ohlcv(trade_date, trade_date, ticker)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("종가 조회 실패 %s %s: %s", ticker, trade_date, exc)
-        return None
-    if df is None or df.empty or "종가" not in df.columns:
-        return None
-    try:
-        v = float(df["종가"].iloc[-1])
-    except (IndexError, ValueError, TypeError):
-        return None
-    return v if v > 0 else None
+    return close_on_status(ticker, trade_date, retries=0)[1]
 
 
 # 지수 심볼. FDR 규격이다.

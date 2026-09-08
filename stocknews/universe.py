@@ -21,8 +21,8 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from .data import (REF_TICKERS, close_on, market_snapshot,
-                   verify_snapshot_date)
+from .data import (REF_PROBE_RETRIES, REF_TICKERS, close_on,
+                   close_on_status, market_snapshot, verify_snapshot_date)
 from .trading_day import is_definitely_closed
 from .trading_day import now_kst as _now_kst
 
@@ -31,7 +31,25 @@ log = logging.getLogger(__name__)
 __all__ = ["EXCLUDE_KEYWORDS", "is_tradable_name", "refresh_master",
            "fill_sectors", "sector_source", "SECTOR_LISTINGS",
            "fetch_day", "backfill_one", "liquidity_filter",
-           "MARKETS_WANTED"]
+           "MARKETS_WANTED", "probe_refs", "load_floor",
+           "DAY_MIN_EXPECTED", "DAY_SHRINK_TOLERANCE", "JUDGE_AFTER_HOUR"]
+
+# 하루치 적재량 하한. refresh_master 의 (min_expected, shrink_tolerance) 와
+# 같은 논리다 — 직전 수준의 절반, 또는 절대 하한 중 큰 쪽.
+DAY_MIN_EXPECTED = 500
+DAY_SHRINK_TOLERANCE = 0.5
+# 하한을 적용하려면 비교 대상이 있어야 한다. 표본이 이보다 적으면
+# 판정을 보류한다(백필 초기에 모든 날을 '소스 장애'로 만들지 않기 위함).
+DAY_FLOOR_MIN_SAMPLE = 3
+
+# '오늘'을 휴장일로 판정해도 되는 가장 이른 시각(KST). 장 마감은 15:30 이고
+# 시세 반영에 여유를 둔다.
+#
+# 이게 없으면 자정~오전에 도는 catch-up 이 **오늘을 휴장일로 박는다.**
+# 그 시각에는 기준 종목이 정상적으로 '데이터 없음'을 응답하기 때문에
+# 네트워크가 멀쩡해도 CLOSED 판정이 나온다. 아직 열리지도 않은 장을
+# 두고 휴장이라고 단정할 수는 없다.
+JUDGE_AFTER_HOUR = 16
 
 # 스냅샷의 Market 값. KONEX 는 유동성이 없어 제외한다.
 MARKETS_WANTED = {"KOSPI": "KOSPI", "KOSDAQ": "KOSDAQ",
@@ -173,8 +191,61 @@ def _refresh_master_pykrx(ds: str, include_preferred: bool
     return rows, alive
 
 
+def probe_refs(trade_date: str, refs: tuple[str, ...] = REF_TICKERS,
+               retries: int = REF_PROBE_RETRIES) -> tuple[str, str]:
+    """기준 종목으로 그 날이 거래일인지 독립 판정한다.
+
+    반환 (verdict, detail)
+
+        "TRADING"  하나라도 종가가 있다          -> 거래일 확정
+        "CLOSED"   전부 '데이터 없음'으로 응답   -> 휴장일 확정
+        "OUTAGE"   하나라도 조회 자체가 실패     -> 아무것도 확정 못 함
+
+    ★ OUTAGE 를 CLOSED 로 접으면 안 된다
+    ----------------------------------
+    2026-09-08(화) 실측. 21:30 회차가 PC 종료로 밀려 부팅 직후 23:58 에
+    catch-up 으로 돌았는데, DNS 가 아직 올라오지 않아 기준 종목 3개가
+    전부 예외로 죽었다. 예전 코드는 그것을 '데이터 없음'과 같이 취급해
+    정상 거래일을 `non_trading_days` 에 박았고, 그 테이블은 자기학습
+    캐시라 이후 update 가 그 날짜를 두 번 다시 요청하지 않았다.
+    실패는 답이 아니다. 답이 아닌 것으로 하루를 버리지 않는다.
+
+    빈 응답은 재시도하지 않는다. 같은 답이 온다. 예외만 재시도한다
+    (`close_on_status` 가 처리).
+    """
+    statuses = {t: close_on_status(t, trade_date, retries=retries)[0]
+                for t in refs}
+    detail = " ".join(f"{k}={v}" for k, v in statuses.items())
+    seen = set(statuses.values())
+    if "DATA" in seen:
+        return "TRADING", detail
+    if "ERROR" in seen:
+        return "OUTAGE", detail
+    return "CLOSED", detail
+
+
+def load_floor(store, since: str | None = None) -> int:
+    """하루치 적재량 하한. 표본이 모자라면 0(=검사 안 함).
+
+    `refresh_master` 가 종목 목록에 거는 가드와 같은 논리를 시세 적재에
+    건다. 소스가 반쯤 죽어서 몇십 종목만 넘어오는 날이 '적재 완료'로
+    굳으면, flags 가 그 날을 거래일로 믿고 나머지 전 종목을 거래정지로
+    오탐한다(2026-09 실측: 스냅샷 883행 -> 37행).
+    """
+    counts = store.date_counts(since=since)
+    if len(counts) < DAY_FLOOR_MIN_SAMPLE:
+        return 0
+    ordered = sorted(counts.values())
+    median = ordered[len(ordered) // 2]
+    if median <= 0:
+        return 0
+    return max(DAY_MIN_EXPECTED, int(median * DAY_SHRINK_TOLERANCE))
+
+
 def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
-              throttle: float = 0.3) -> int:
+              throttle: float = 0.3,
+              ref_retries: int = REF_PROBE_RETRIES,
+              report: dict | None = None) -> int:
     """'특정 일자 전종목' 시세 1판을 받아 적재. 일일 증분 경로.
 
     trade_date : 'YYYYMMDD'
@@ -189,38 +260,83 @@ def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
     그래서 이렇게 판정한다.
 
         주말/기지정 공휴일        -> 조회하지 않고 생략 (근거 있음)
-        기준 종목도 데이터 없음   -> 휴장일로 기록 (근거 있음)
-        기준 종목은 데이터 있음   -> 소스 장애. 기록하지 않고 실패 반환
-                                     (다음 실행에서 다시 시도)
+        기준 종목이 '없다'고 응답 -> 휴장일로 기록 (근거 있음)
+        기준 종목 조회가 실패     -> 소스 장애. 기록하지 않는다
+        기준 종목은 데이터 있음   -> 거래일. 종목별로 받는다
 
     기준 종목(삼성전자 등)은 종목별 엔드포인트로 조회한다. 전종목이
     막혀도 이쪽은 동작하므로 '거래일인지'를 독립적으로 판정할 수 있다.
+    판정은 `probe_refs()` 에 있다 — '데이터 없음'과 '물어보지 못했음'을
+    가르는 것이 이 함수의 전부다.
+
+    report : 호출부에 판정 근거를 돌려줄 dict. 실행에는 영향이 없다.
+             {"verdict","detail","rows","floor","path"} 가 채워진다.
     """
+    rep = report if report is not None else {}
+    rep.update({"verdict": None, "detail": "", "rows": 0,
+                "floor": 0, "path": None})
     iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
 
     # ── 1) 근거 있는 휴장일이면 네트워크를 쓰지 않는다 ──
     if is_definitely_closed(store, iso):
         log.info("%s 휴장일 → 시세 조회 생략", iso)
         store.mark_non_trading_day(iso, "weekend/known holiday")
+        rep.update({"verdict": "CLOSED", "path": "known",
+                    "detail": "weekend/known holiday"})
         return 0
 
     # ── 2) 전종목 스냅샷 (요청 1회). 날짜를 반드시 대조한다 ──
+    floor = load_floor(store)
+    rep["floor"] = floor
     prices, _ = market_snapshot()
     ok, why = verify_snapshot_date(prices, trade_date)
     if ok:
         total = store.upsert_cross_section(iso, prices)
         log.info("%s 시세 적재 %d건 (스냅샷, %s)", iso, total, why)
-        if total:
+        if floor and 0 < total < floor:
+            # 소스가 반쯤 살아 있는 상태다. 이 날짜를 완료로 굳히지 않고
+            # 종목별 경로로 넘어가 채운다. 부분 적재로 남으면
+            # `store.partial_dates()` 가 다음 실행에서 재요청한다.
+            log.error("%s 스냅샷 적재 %d건 (하한 %d) — 소스 장애로 판단해 "
+                      "종목별 경로로 보완합니다.", iso, total, floor)
+        elif total:
+            rep.update({"verdict": "TRADING", "path": "snapshot",
+                        "rows": total, "detail": why})
             return total
     else:
         log.info("%s 스냅샷 사용 불가: %s", iso, why)
 
     # ── 3) 그 날이 거래일인지 독립 판정 ──
-    ref_close = {t: close_on(t, trade_date) for t in REF_TICKERS}
-    if not any(v for v in ref_close.values()):
-        store.mark_non_trading_day(iso, "reference tickers have no data")
-        log.info("%s 기준 종목 %s 전부 데이터 없음 → 휴장일로 기록",
-                 iso, "/".join(REF_TICKERS))
+    verdict, detail = probe_refs(trade_date, retries=ref_retries)
+    rep.update({"verdict": verdict, "detail": detail})
+    is_weekday = datetime.strptime(trade_date, "%Y%m%d").weekday() < 5
+
+    if verdict == "OUTAGE":
+        # 물어보지 못했다. 기록하지 않는다 — 다음 실행에서 다시 시도한다.
+        log.error("%s 기준 종목 조회가 재시도 %d회까지 실패했습니다 (%s). "
+                  "소스/네트워크 장애로 판단해 휴장일로 기록하지 않습니다. "
+                  "다음 실행에서 다시 요청합니다.",
+                  iso, ref_retries + 1, detail)
+        rep["path"] = "outage"
+        return 0
+
+    if verdict == "CLOSED":
+        now = _now_kst()
+        if iso == now.strftime("%Y-%m-%d") and now.hour < JUDGE_AFTER_HOUR:
+            log.warning("%s 는 아직 장 마감 전입니다 (%02d:%02d, 판정 기준 "
+                        "%02d:00). 휴장 판정을 보류합니다.",
+                        iso, now.hour, now.minute, JUDGE_AFTER_HOUR)
+            rep.update({"verdict": "PENDING", "path": "too_early"})
+            return 0
+        if not is_weekday:
+            # 여기까지 올 수 없다(1단계에서 걸러진다). 방어적으로 남긴다.
+            log.warning("%s 는 주말입니다 — 1단계에서 걸러졌어야 합니다", iso)
+        store.mark_non_trading_day(
+            iso, f"reference tickers report no data ({detail}, "
+                 f"retries={ref_retries + 1})")
+        log.info("%s 기준 종목 %s 전부 '데이터 없음' 응답 → 휴장일로 기록 "
+                 "(%s)", iso, "/".join(REF_TICKERS), detail)
+        rep["path"] = "closed"
         return 0
 
     # ── 4) 거래일이다. 종목별로 받는다 (느리지만 정확) ──
@@ -247,11 +363,18 @@ def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
             log.info("  ... %d/%d 적재 %d 실패 %d",
                      i + 1, min(len(codes), per_ticker_limit), total, failed)
 
+    rep.update({"rows": total, "path": "per_ticker"})
     if total == 0:
         # 기준 종목은 데이터가 있는데 전 종목이 0건이다. 휴장일이 아니라
         # 소스 장애다. 기록하지 않는다.
         log.error("%s 기준 종목은 데이터가 있으나 적재 0건입니다. "
                   "소스 장애로 판단하고 휴장일로 기록하지 않습니다.", iso)
+        rep["verdict"] = "OUTAGE"
+    elif floor and total < floor:
+        log.error("%s 적재 %d건 (하한 %d) — 소스 장애로 판단합니다. "
+                  "부분 적재로 남겨 다음 실행에서 재요청합니다. (실패 %d)",
+                  iso, total, floor, failed)
+        rep["verdict"] = "OUTAGE"
     else:
         log.info("%s 시세 적재 %d건 (종목별 폴백, 실패 %d)",
                  iso, total, failed)
