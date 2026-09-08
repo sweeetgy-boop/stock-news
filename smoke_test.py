@@ -4977,6 +4977,115 @@ def test_joblock(tmp: Path):
     check("joblock", "강제 해제", t_clear)
 
 
+def test_cron_jobs(tmp: Path):
+    """Hermes cron 잡 카탈로그. 드라이버는 하나, 잡만 여러 개다.
+
+    2026-09-08 회차가 PC 종료로 밀려 부팅 직후 catch-up 으로 2h27m 늦게
+    떴다. 락은 '지금 돌고 있는가' 에만 답하므로, 앞 실행이 끝난 뒤 뜬
+    두 번째는 그대로 통과한다. 브리핑이 두 번 나가면 사람에게 그대로
+    보인다 — 그래서 잡마다 '오늘 완주' 마커를 따로 갖는다.
+    """
+    import importlib
+    import importlib.util
+
+    repo = Path(__file__).resolve().parent
+    rs = importlib.import_module("run_screen")
+
+    spec = importlib.util.spec_from_file_location(
+        "_nightly_jobs", str(repo / "nightly.py"))
+    nl_mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = nl_mod
+    try:
+        spec.loader.exec_module(nl_mod)
+    finally:
+        sys.modules.pop(spec.name, None)
+
+    EXPECTED = {"nightly", "news", "brief-morning", "brief-evening",
+                "weekly", "flash"}
+
+    def t_catalog():
+        assert set(nl_mod.JOBS) == EXPECTED, set(nl_mod.JOBS)
+        for name, job in nl_mod.JOBS.items():
+            assert job.name == name, (name, job.name)
+            assert job.steps, f"{name}: 단계가 비었다"
+
+    def t_flash_is_the_only_exception():
+        """flash 만 마커·정상알림이 없다. 5분마다 도는 유일한 잡이다."""
+        for name, job in nl_mod.JOBS.items():
+            if name == "flash":
+                assert not job.once_per_day, "flash 에 마커를 켜면 하루 1회만 돈다"
+                assert job.quiet_ok, "flash 정상 알림은 하루 84건이 된다"
+            else:
+                assert job.once_per_day, f"{name}: 중복 방어가 없다"
+                assert not job.quiet_ok, f"{name}: 결과 보고가 없다"
+
+    def t_markers_are_distinct():
+        """마커가 겹치면 한 잡이 다른 잡을 스킵시킨다."""
+        paths = [j.marker_path for j in nl_mod.JOBS.values()]
+        assert len(set(paths)) == len(paths), paths
+        # nightly 는 기존 경로를 유지해야 한다. 바뀌면 이미 완주한 날에
+        # catch-up 이 한 번 더 돈다.
+        assert nl_mod.JOBS["nightly"].marker_path == "data/nightly_done.json"
+
+    def t_modes_exist():
+        """카탈로그가 부르는 모드가 실제로 있어야 한다. 없으면 exit 64 로
+        조용히 죽고, 스케줄은 '등록됐는데 아무 일도 안 하는' 상태가 된다."""
+        for name, job in nl_mod.JOBS.items():
+            for step in job.steps:
+                if step.optional:
+                    continue
+                args = list(step.args)
+                mode = args[args.index("--mode") + 1]
+                assert mode in rs.MODES, f"{name}: 모드 {mode} 없음"
+
+    def t_sending_modes_are_dry_by_default():
+        """발송 모드는 STOCKNEWS_SEND=1 이 아닐 때 --dry-run 이 붙어야 한다.
+
+        _SENDING 에서 빠지면 토큰만 있으면 조용히 실발송으로 나간다.
+        """
+        for mode in ("brief-morning", "brief-evening", "weekly", "flash",
+                     "daily", "exits"):
+            assert mode in nl_mod._SENDING, mode
+
+    def t_shim_derives_job_from_filename():
+        """사본 5개가 같은 바이트여야 하므로 잡 이름은 파일명에서 나온다."""
+        shim_path = repo / "hermes" / "cron_stocknews.py"
+        sp = importlib.util.spec_from_file_location("_shim", str(shim_path))
+        shim = importlib.util.module_from_spec(sp)
+        sys.modules[sp.name] = shim
+        try:
+            sp.loader.exec_module(shim)
+        finally:
+            sys.modules.pop(sp.name, None)
+
+        saved_file = shim.__file__
+        try:
+            # job_name() 은 모듈 전역 __file__ 을 읽는다. 사본이 어떤
+            # 이름으로 배포되든 같은 바이트로 동작하는지 확인한다.
+            for fname, want in (("stocknews_news.py", "news"),
+                                ("stocknews_brief_morning.py", "brief-morning"),
+                                ("stocknews_brief_evening.py", "brief-evening"),
+                                ("stocknews_weekly.py", "weekly"),
+                                ("stocknews_flash.py", "flash")):
+                shim.__file__ = fname
+                got = shim.job_name()
+                assert got == want, (fname, got, want)
+                assert got in nl_mod.JOBS, got
+            # 정본을 그대로 돌리면 잡을 못 정하고 exit 64 여야 한다.
+            shim.__file__ = "cron_stocknews.py"
+            assert shim.job_name() == "stocknews", shim.job_name()
+            assert shim.main() == 64, "정본 직접 실행이 막히지 않는다"
+        finally:
+            shim.__file__ = saved_file
+
+    check("cron", "잡 카탈로그", t_catalog)
+    check("cron", "flash 만 마커·알림 예외", t_flash_is_the_only_exception)
+    check("cron", "잡별 마커 분리", t_markers_are_distinct)
+    check("cron", "카탈로그 모드 실재", t_modes_exist)
+    check("cron", "발송 모드 기본 dry-run", t_sending_modes_are_dry_by_default)
+    check("cron", "사본은 파일명에서 잡 추출", t_shim_derives_job_from_filename)
+
+
 def test_interpreter_guard(tmp: Path):
     """인터프리터 가드. 틀린 파이썬으로는 통과 자체가 불가능해야 한다.
 
@@ -7109,6 +7218,7 @@ def main() -> int:
         test_docs()
         test_env(tmp)
         test_joblock(tmp)
+        test_cron_jobs(tmp)
         test_interpreter_guard(tmp)
         test_agent_contract(tmp)
         if st is not None:

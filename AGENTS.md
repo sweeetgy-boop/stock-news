@@ -170,20 +170,91 @@ Hermes cron  ->  stocknews_nightly.py  ->  hermes\nightly.cmd
              ->  nightly.py  ->  각 단계
 ```
 
-### 등록된 잡 — 이것 하나뿐입니다
+### 등록된 잡 (2026-09-09 현재 6개)
+
+전부 `--no-agent` · `--deliver local` 입니다. 알림은 `nightly.py` 가
+직접 텔레그램으로 보냅니다.
 
 ```
-잡 ID      d6a7172b3d04
-이름       stock-news-nightly
-일정       30 21 * * *      (매일 21:30 KST)
-스크립트   stocknews_nightly.py     (~/.hermes/scripts/)
-모드       no-agent                 (LLM 을 거치지 않음)
-전달       local                    (알림은 nightly.py 가 직접 보냄)
+잡 이름                     cron              KST         스크립트
+stock-news-news             10 8 * * 1-5      평일 08:10  stocknews_news.py
+stock-news-brief-morning    30 8 * * 1-5      평일 08:30  stocknews_brief_morning.py
+stock-news-flash            */5 9-15 * * 1-5  평일 5분    stocknews_flash.py    [paused]
+stock-news-nightly          30 21 * * *       매일 21:30  stocknews_nightly.py
+stock-news-brief-evening    30 22 * * 1-5     평일 22:30  stocknews_brief_evening.py
+stock-news-weekly           45 22 * * 5       금 22:45    stocknews_weekly.py
 ```
 
-저장소의 정본은 `hermes/cron_nightly.py` 이고, `~/.hermes/scripts/` 의
-사본이 실제로 돕니다. Hermes 는 `~/.hermes/scripts/` 아래만 `--script`
-로 받습니다. 고칠 때는 양쪽을 같이 고치십시오.
+### 왜 이 시각인가
+
+```
+08:10 news        개장 전 수집. 브리핑보다 20분 앞이면 news 가 느려도
+                  (실측 42~53초) 브리핑 시각이 밀리지 않는다.
+08:30 brief-morning  --no-collect. 개장(09:00) 전.
+09:00~15:55 flash    notify.WINDOWS 의 4대 창(09:00~09:35 / 10:00~10:25 /
+                  14:00~14:25 / 15:20~15:35)을 전부 덮는다. 창 밖 호출은
+                  즉시 {"skipped":true} 로 끝난다.
+21:30 nightly     기존. master -> update -> flags -> ... -> daily -> exits
+22:30 brief-evening  ★ nightly 뒤여야 한다. 저녁 브리핑은 '오늘 추천
+                  10선'을 recos 에서 읽는데, 그 행을 만드는 것이
+                  nightly 의 daily 단계다. 앞에 두면 어제 것이 나간다.
+                  구 스케줄(17:20/18:20)은 daily 가 16:05 이던 시절 값이다.
+금 22:45 weekly    같은 이유. 금요일 스캔이 주간 집계에 들어가려면
+                  nightly 뒤여야 한다. days_covered 가 4 가 아니라 5 가 된다.
+```
+
+주말은 cron 에서 `1-5` 로 아예 안 뜹니다. 공휴일은 잡이 떠서 휴장 판정
+후 스킵 한 줄을 보냅니다. nightly 만 `* * *` 인 것은 기존 등록을 그대로
+둔 것입니다 — 휴장이면 스스로 스킵합니다.
+
+### 드라이버는 하나입니다
+
+```
+Hermes cron
+  -> ~/.hermes/scripts/stocknews_<잡>.py     (표준 라이브러리만, PYTHONPATH 격리)
+  -> hermes\nightly.cmd --job <잡>            (인터프리터 해석 + 3.12 가드)
+  -> nightly.py --job <잡>                    (마커 · 락 · 휴장 · 알림)
+  -> run_screen.py --mode <모드> --json
+```
+
+`nightly.py` 의 `JOBS` 카탈로그가 잡마다 '어떤 단계를 도는가'만 다르게
+갖습니다. 마커·락·휴장 판정·조용한 실패 집계는 전부 공유합니다.
+드라이버를 잡마다 새로 쓰지 않습니다.
+
+`stocknews_<잡>.py` 사본 5개는 **바이트가 전부 같습니다.** 잡 이름을
+파일명에서 뽑기 때문입니다(`stocknews_brief_morning.py` -> `brief-morning`).
+파일마다 다른 상수를 박아두면 하나만 고치고 나머지를 잊습니다.
+저장소의 정본은 `hermes/cron_stocknews.py` 이고, nightly 만 예전 전용
+스크립트 `hermes/cron_nightly.py` 를 그대로 씁니다. Hermes 는
+`~/.hermes/scripts/` 아래만 `--script` 로 받으므로, 고칠 때는 정본과
+사본을 같이 고치십시오.
+
+### 중복 방어 — catch-up 이 브리핑을 두 번 보내지 않게
+
+각 잡은 `data/cron_done_<잡>.json` 에 '오늘 완주' 를 기록하고, 같은
+날짜면 스킵합니다. **스킵도 텔레그램 한 줄을 보냅니다** — 조용히 넘어가면
+'오늘 안 돌았나?' 를 확인하러 가게 되고 그 확인이 수동 재실행으로
+이어집니다.
+
+락만으로는 부족합니다. 락은 '지금 돌고 있는가' 에만 답하는데, Hermes 의
+catch-up 은 놓친 회차를 부팅 직후 몰아서 띄우고 그때는 앞 실행이 이미
+끝나 락을 놓은 뒤입니다. 2026-09-08 회차가 실제로 2h27m 늦게 catch-up
+으로 떴습니다.
+
+**flash 는 예외입니다.** 5분마다 돌아야 하므로 마커를 쓰지 않고
+(`once_per_day=False`), 정상/스킵 알림도 보내지 않습니다
+(`quiet_ok=True`). 매번 보내면 하루 84건이 나갑니다. 실패는 보냅니다.
+
+### flash 는 일부러 꺼둔 상태입니다
+
+```
+hermes cron resume stock-news-flash     # 켜기
+hermes cron pause  stock-news-flash     # 끄기
+```
+
+나머지 4개가 하루 깨끗하게 돈 것을 확인한 뒤에 켜십시오. flash 는
+장중에 5분마다 도는 유일한 잡이고 쓰기 모드(fetch_day)라, 문제가 있으면
+장중 부분 적재로 이어집니다 — 1장의 사고가 그 경로였습니다.
 
 **운영 계약**
 
@@ -219,11 +290,19 @@ master -> update -> flags -> credit-kiwoom -> stock-flow(미구현, 스킵)
 `credit-kiwoom` 은 앱키가 없으면 exit 4 로 즉시 끝나고, `nightly.py` 가
 이를 '기대된 스킵'으로 셉니다.
 
-### 파이프라인에 들어있지 않은 모드
+### nightly 의 STEPS 에는 없지만 별도 잡으로 도는 모드
 
-`brief-morning` · `brief-evening` · `flash` · `weekly` · `brief-weekly` ·
-`export` · `credit` · `runs` 는 `STEPS` 에 없습니다. **형님의 지시가 있을
-때만** `hermes\run.cmd --mode <모드>` 로 실행하십시오.
+`brief-morning` · `brief-evening` · `weekly` · `flash` 는 `STEPS` 에
+없습니다. nightly 안에서 돌지 않고 **각자 Hermes cron 잡**으로 돕니다
+(위 표). `news` 는 양쪽에 다 있습니다 — 08:10 잡은 개장 전 수집이고,
+nightly 의 news 단계는 저녁 브리핑용 재수집입니다. 마커가 잡별로
+갈려 있어 서로를 막지 않습니다.
+
+### 어디에도 등록되지 않은 모드
+
+`brief-weekly` · `export` · `credit` · `runs` 는 잡이 없습니다.
+**형님의 지시가 있을 때만** `hermes\run.cmd --mode <모드>` 로
+실행하십시오.
 
 ### 발송 전환
 

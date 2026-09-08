@@ -77,7 +77,8 @@ LOCK_WAIT = "0"
 
 # 텔레그램을 실제로 보내는 모드. 토큰이 없으면 exit 4 로 끝나므로
 # STOCKNEWS_SEND=1 이 아닐 때는 --dry-run 을 붙인다.
-_SENDING = {"news", "daily", "exits"}
+_SENDING = {"news", "daily", "exits", "brief-morning", "brief-evening",
+            "weekly", "brief-weekly", "flash"}
 
 # 오늘 이미 완주했는지 기록하는 마커.
 #
@@ -130,6 +131,61 @@ STEPS: tuple[Step, ...] = (
     Step("daily", ["--mode", "daily"]),    # 스캔 + 추천 + 섹터 지표
     Step("exits", ["--mode", "exits"]),
 )
+
+
+@dataclass(frozen=True)
+class Job:
+    """스케줄 단위 하나. `--job` 으로 고른다.
+
+    Hermes cron 잡이 여러 개가 되면서 필요해졌다. 마커·락·휴장 판정·
+    알림·조용한 실패 집계는 nightly 에서 이미 검증된 것이라 그대로 쓰고,
+    다른 것은 '어떤 단계를 도느냐' 뿐이다. 드라이버를 새로 쓰지 않는다.
+
+    once_per_day
+        '오늘 이미 돌았으면 스킵' 마커를 쓸 것인가. flash 는 5분마다
+        돌아야 하므로 False 다. 마커를 켜면 하루 한 번만 돌고 끝난다.
+    quiet_ok
+        정상/스킵일 때 알림을 보내지 않는다. flash 전용이다 — 5분마다
+        "스킵" 을 보내면 하루 84건이 나간다. 실패는 항상 보낸다.
+    """
+
+    name: str
+    label: str
+    emoji: str
+    steps: tuple[Step, ...]
+    once_per_day: bool = True
+    quiet_ok: bool = False
+    marker: str = ""
+
+    @property
+    def marker_path(self) -> str:
+        return self.marker or f"data/cron_done_{self.name}.json"
+
+
+def _one(name: str, args: list[str], **kw) -> tuple[Step, ...]:
+    return (Step(name, args, **kw),)
+
+
+JOBS: dict[str, Job] = {
+    "nightly": Job("nightly", "nightly", "\U0001f319", STEPS,
+                   marker=DONE_MARKER),
+    # 수집 전용. 발송하지 않으므로 중복이 나가도 사람에게 보이지는
+    # 않지만, 같은 소스를 하루 두 번 긁을 이유가 없다.
+    "news": Job("news", "news", "\U0001f4f0", _one("news", ["--mode", "news"])),
+    # --no-collect: 08:10 news 가 이미 수집했다. 수집과 발송을 분리해야
+    # 한 소스가 느려도 브리핑 시각이 밀리지 않는다.
+    "brief-morning": Job("brief-morning", "아침 브리핑", "\U0001f305",
+                         _one("brief-morning",
+                              ["--mode", "brief-morning", "--no-collect"])),
+    "brief-evening": Job("brief-evening", "저녁 브리핑", "\U0001f303",
+                         _one("brief-evening", ["--mode", "brief-evening"])),
+    "weekly": Job("weekly", "주간 리포트", "\U0001f4c8",
+                  _one("weekly", ["--mode", "weekly"])),
+    # 장중 5분 간격. 마커도 완료 알림도 없다.
+    "flash": Job("flash", "flash", "\u26a1",
+                 _one("flash", ["--mode", "flash"]),
+                 once_per_day=False, quiet_ok=True),
+}
 
 
 class Log:
@@ -320,10 +376,11 @@ def _health_override(step: Step, state: str, note: str,
     return state, note
 
 
-def _notify(text: str, log: Log, enabled: bool) -> None:
+def _notify(text: str, log: Log, enabled: bool,
+            why: str = "--no-telegram") -> None:
     """텔레그램 1건. 실패해도 파이프라인 결과를 바꾸지 않는다."""
     if not enabled:
-        log("알림 생략 (--no-telegram)")
+        log(f"알림 생략 ({why})")
         return
     try:
         from stocknews.notify import TelegramNotConfigured, send_telegram
@@ -337,7 +394,7 @@ def _notify(text: str, log: Log, enabled: bool) -> None:
         log(f"알림 발송 중 오류 (무시): {type(exc).__name__}: {exc}")
 
 
-def _summary(started: datetime, finished: datetime,
+def _summary(job: Job, started: datetime, finished: datetime,
              results: list[dict], dry: bool) -> str:
     """텔레그램 한 줄 요약."""
     ok = [r for r in results if r["state"] in ("ok", "warn")]
@@ -345,7 +402,7 @@ def _summary(started: datetime, finished: datetime,
     skips = [r for r in results if r["state"] == "skip"]
     mins = (finished - started).total_seconds() / 60.0
 
-    head = (f"🌙 nightly 완료 {started:%H:%M}~{finished:%H:%M} "
+    head = (f"{job.emoji} {job.label} 완료 {started:%H:%M}~{finished:%H:%M} "
             f"({mins:.0f}분) | 성공 {len(ok)}/{len(results)}")
     if skips:
         head += f" | 건너뜀 {len(skips)}"
@@ -373,7 +430,9 @@ def _summary(started: datetime, finished: datetime,
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="매일 밤 자동 수집 파이프라인")
+        description="스케줄 잡 드라이버 (기본: 매일 밤 자동 수집 파이프라인)")
+    ap.add_argument("--job", choices=tuple(JOBS), default="nightly",
+                    help="실행할 잡. 마커·락·로그 이름이 여기서 갈린다.")
     ap.add_argument("--db", default="data/quant.db")
     ap.add_argument("--check-date", default=None,
                     help="휴장 판정에 쓸 날짜 (YYYY-MM-DD). 테스트용")
@@ -383,17 +442,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--step-timeout", type=int, default=5400,
                     help="단계별 시간 상한(초). 기본 90분")
     ap.add_argument("--lock-dir", default="data/locks")
-    ap.add_argument("--done-marker", default=DONE_MARKER,
-                    help="'오늘 완주' 마커 경로. --force 로 무시")
+    ap.add_argument("--done-marker", default=None,
+                    help="'오늘 완주' 마커 경로. 기본은 잡별 경로. --force 로 무시")
     args = ap.parse_args(argv)
 
+    job = JOBS[args.job]
     started = now_kst()
-    log = Log(REPO / "logs" / f"nightly_{started:%Y%m%d}.log")
+    log = Log(REPO / "logs" / f"{job.name}_{started:%Y%m%d}.log")
     dry = os.getenv("STOCKNEWS_SEND") != "1"
     notify_on = not args.no_telegram
 
     log("=" * 62)
-    log(f"nightly 시작 {started:%Y-%m-%d %H:%M:%S} KST "
+    log(f"{job.name} 시작 {started:%Y-%m-%d %H:%M:%S} KST "
         f"(발송 {'실제' if not dry else 'dry-run'})")
 
     # .env 를 환경변수로 올린다. 이게 없으면 _notify 가 토큰을 못 찾아
@@ -411,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── 이중 실행 방지 ──
     # wait_seconds=0 이라 즉시 판정한다. 요구사항이 '존재하면 즉시 종료'다.
-    lock = JobLock("nightly", mode="nightly", lock_dir=args.lock_dir,
+    lock = JobLock(job.name, mode=job.name, lock_dir=args.lock_dir,
                    timeout=LOCK_TIMEOUT_SEC, wait_seconds=0)
     if not lock.acquire():
         h = lock.holder
@@ -423,12 +483,17 @@ def main(argv: list[str] | None = None) -> int:
 
     rc_final = 0
     day = f"{started:%Y-%m-%d}"
-    marker = REPO / args.done_marker
+    marker = REPO / (args.done_marker or job.marker_path)
     try:
         # ── 오늘 이미 완주했으면 스킵 ──
         # 반드시 락을 잡은 뒤에 본다. 순서를 뒤집으면 동시에 뜬 두
         # 프로세스가 같은 마커를 읽고 둘 다 '아직 안 돌았다'로 판정한다.
-        done = _read_done(marker)
+        #
+        # Hermes cron 의 catch-up 이 이 방어를 필요하게 만든다. PC 가
+        # 꺼져 있던 동안의 회차를 부팅 직후 몰아서 띄우는데, 앞 실행이
+        # 이미 끝나 락을 놓았으면 두 번째가 그대로 통과한다. 브리핑이
+        # 두 번 나가면 그건 사람에게 그대로 보인다.
+        done = _read_done(marker) if job.once_per_day else {}
         if done.get("date") == day and not args.force:
             log(f"오늘({day}) 이미 완주 — 스킵 "
                 f"(완료 {done.get('finished')} · exit {done.get('exit')} "
@@ -437,9 +502,11 @@ def main(argv: list[str] | None = None) -> int:
             # 휴장 스킵과 대칭으로 알림을 낸다. 스킵이 조용하면 '오늘 안
             # 돌았나?' 를 사람이 확인하러 가게 되고, 그 확인이 수동 재실행
             # 으로 이어진다. 스킵도 결과다 — 결과는 보고한다.
-            _notify(f"🌙 nightly 스킵 {started:%m/%d %H:%M} | "
-                    f"오늘 이미 완주({done.get('reason')})", log, notify_on)
-            log(f"nightly 종료 {now_kst():%H:%M:%S} · exit 0")
+            _notify(f"{job.emoji} {job.label} 스킵 {started:%m/%d %H:%M} | "
+                    f"오늘 이미 완주({done.get('reason')})",
+                    log, notify_on and not job.quiet_ok,
+                    why="--no-telegram" if not notify_on else "quiet_ok 잡")
+            log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit 0")
             return 0
 
         # ── 휴장일 판정 ──
@@ -462,15 +529,17 @@ def main(argv: list[str] | None = None) -> int:
             log(f"휴장 — 스킵 ({status})")
             # 휴장 판정도 '오늘 할 일을 끝냈다'이다. 기록해 두지 않으면
             # catch-up 이 뜰 때마다 같은 판정을 반복하고 알림도 반복된다.
-            _mark_done(marker, day, 0, f"휴장({status})")
-            log(f"nightly 종료 {now_kst():%H:%M:%S} · exit 0")
-            _notify(f"🌙 nightly 스킵 {started:%m/%d %H:%M} | 휴장({status})",
-                    log, notify_on)
+            if job.once_per_day:
+                _mark_done(marker, day, 0, f"휴장({status})")
+            log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit 0")
+            _notify(f"{job.emoji} {job.label} 스킵 {started:%m/%d %H:%M} | "
+                    f"휴장({status})", log, notify_on and not job.quiet_ok,
+                    why="--no-telegram" if not notify_on else "quiet_ok 잡")
             return 0
 
         # ── 단계 실행 ──
         results: list[dict] = []
-        for step in STEPS:
+        for step in job.steps:
             results.append(_run_step(step, dry, log, args.step_timeout))
 
         finished = now_kst()
@@ -488,11 +557,16 @@ def main(argv: list[str] | None = None) -> int:
         # '한 단계가 실패해도 다음 단계는 돈다'이므로, 여기 도달했다는 건
         # 모든 단계를 한 번씩 시도했다는 뜻이다. 재시도는 사람이 --force 로
         # 판단한다 — 자동 재시도는 장중 재실행으로 이어져 부분 적재를 만든다.
-        _mark_done(marker, day, rc_final,
-                   "완주" if rc_final == 0 else "부분 실패")
-        text = _summary(started, finished, results, dry)
-        log(f"nightly 종료 {finished:%H:%M:%S} · exit {rc_final}")
-        _notify(text, log, notify_on)
+        if job.once_per_day:
+            _mark_done(marker, day, rc_final,
+                       "완주" if rc_final == 0 else "부분 실패")
+        text = _summary(job, started, finished, results, dry)
+        log(f"{job.name} 종료 {finished:%H:%M:%S} · exit {rc_final}")
+        # quiet_ok 잡은 실패일 때만 알린다. flash 는 5분마다 돌아서
+        # 정상 보고를 매번 보내면 하루 84건이 나간다.
+        _notify(text, log, notify_on and (bool(fails) or not job.quiet_ok),
+                why="--no-telegram" if not notify_on
+                    else "quiet_ok 잡 · 실패 없음")
         return rc_final
 
     except BaseException as exc:                  # noqa: BLE001
@@ -501,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
         import traceback
         log("파이프라인 실패:")
         log.raw(traceback.format_exc())
-        _notify(f"🚨 nightly 실패 {started:%m/%d %H:%M} | "
+        _notify(f"🚨 {job.label} 실패 {started:%m/%d %H:%M} | "
                 f"{type(exc).__name__}: {str(exc)[:160]}", log, notify_on)
         return 1
     finally:
