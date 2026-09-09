@@ -156,6 +156,15 @@ CREATE TABLE IF NOT EXISTS non_trading_days (
   detected TEXT
 );
 
+-- 공휴일 (한국천문연구원 API). 휴장일 판정의 사전 필터. 비어 있어도 된다 —
+-- 그러면 그냥 기준 종목 프로브로 판정한다. --mode holidays 가 채운다.
+CREATE TABLE IF NOT EXISTS holidays (
+  d          TEXT PRIMARY KEY,
+  name       TEXT,
+  source     TEXT,
+  fetched_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS credit_manual (
   ticker  TEXT PRIMARY KEY,
   ratio   REAL,          -- 신용잔고율(%) = 신용잔고주식수 / 상장주식수 x 100
@@ -725,6 +734,34 @@ class Store:
             row = con.execute(
                 "SELECT 1 FROM non_trading_days WHERE d=?", (ds,)).fetchone()
         return row is not None
+
+    # ────────────────────────── 공휴일 (사전 필터) ──────────────────────────
+    def upsert_holidays(self, rows: list[dict]) -> int:
+        """[{d, name, source}] 적재. 같은 날짜는 덮어쓴다."""
+        if not rows:
+            return 0
+        now = _now_str()
+        with closing(self._conn()) as con:
+            con.executemany(
+                "INSERT INTO holidays(d,name,source,fetched_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(d) DO UPDATE SET name=excluded.name,"
+                "source=excluded.source,fetched_at=excluded.fetched_at",
+                [(_d(r["d"]), r.get("name"), r.get("source"), now) for r in rows])
+            con.commit()
+        return len(rows)
+
+    def holiday_name(self, d) -> str | None:
+        """그 날짜가 공휴일 테이블에 있으면 명칭, 없으면 None."""
+        with closing(self._conn()) as con:
+            row = con.execute("SELECT name FROM holidays WHERE d=?",
+                              (_d(d),)).fetchone()
+        return (row[0] or "공휴일") if row else None
+
+    def holidays_in_year(self, year: int) -> list[tuple[str, str]]:
+        with closing(self._conn()) as con:
+            return con.execute(
+                "SELECT d,name FROM holidays WHERE d LIKE ? ORDER BY d",
+                (f"{int(year):04d}-%",)).fetchall()
 
     def known_non_trading_days(self, since: str | None = None) -> set[str]:
         q = "SELECT d FROM non_trading_days"

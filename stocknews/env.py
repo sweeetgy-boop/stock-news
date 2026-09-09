@@ -43,6 +43,7 @@ KNOWN_KEYS: tuple[str, ...] = (
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
     "DART_API_KEY",
+    "DATA_GO_KR_KEY",
     "KRX_CREDIT_BLD",
     "KIWOOM_APP_KEY",
     "KIWOOM_APP_SECRET",
@@ -56,7 +57,7 @@ KNOWN_KEYS: tuple[str, ...] = (
 
 # 값을 절대 출력하면 안 되는 키. 부분 마스킹조차 하지 않는다.
 SECRET_KEYS: frozenset[str] = frozenset({
-    "TELEGRAM_BOT_TOKEN", "DART_API_KEY",
+    "TELEGRAM_BOT_TOKEN", "DART_API_KEY", "DATA_GO_KR_KEY",
     "KIWOOM_APP_KEY", "KIWOOM_APP_SECRET",
 })
 

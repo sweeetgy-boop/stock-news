@@ -53,6 +53,7 @@ MODE_TIMEOUTS: dict[str, int] = {
     "flags": 3600,        # DART 조회가 종목당 0.25초
     "daily": 1800,        # 30분
     "flash": 1200,
+    "holidays": 120,
     "master": 900,
     "update": 900,
     "exits": 900,

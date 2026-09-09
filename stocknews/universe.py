@@ -23,7 +23,8 @@ import pandas as pd
 
 from .data import (REF_PROBE_RETRIES, REF_TICKERS, close_on,
                    close_on_status, market_snapshot, verify_snapshot_date)
-from .trading_day import is_definitely_closed
+from .holidays import holiday_name
+from .trading_day import is_definitely_closed, market_status_reason
 from .trading_day import now_kst as _now_kst
 
 log = logging.getLogger(__name__)
@@ -278,11 +279,13 @@ def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
     iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
 
     # ── 1) 근거 있는 휴장일이면 네트워크를 쓰지 않는다 ──
+    #    주말 · 공휴일(천문연구원 API / 증시 전용 보완) · non_trading_days.
+    #    공휴일 사전 필터가 여기서 프로브를 건너뛰게 한다.
     if is_definitely_closed(store, iso):
-        log.info("%s 휴장일 → 시세 조회 생략", iso)
-        store.mark_non_trading_day(iso, "weekend/known holiday")
-        rep.update({"verdict": "CLOSED", "path": "known",
-                    "detail": "weekend/known holiday"})
+        _, why = market_status_reason(store, iso)
+        log.info("%s 휴장일 (%s) → 시세 조회·프로브 생략", iso, why)
+        store.mark_non_trading_day(iso, why)
+        rep.update({"verdict": "CLOSED", "path": "known", "detail": why})
         return 0
 
     # ── 2) 전종목 스냅샷 (요청 1회). 날짜를 반드시 대조한다 ──
@@ -331,6 +334,15 @@ def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
         if not is_weekday:
             # 여기까지 올 수 없다(1단계에서 걸러진다). 방어적으로 남긴다.
             log.warning("%s 는 주말입니다 — 1단계에서 걸러졌어야 합니다", iso)
+        if is_weekday and not holiday_name(store, iso):
+            # 공휴일 테이블에 없는 평일인데 기준 종목이 '데이터 없음'이다.
+            # 임시휴장일 수도 있지만 소스 장애일 가능성이 크다. 판정(CLOSED
+            # 기록)은 종전 그대로 두고 — 프로브 로직을 약화하지 않는다 —
+            # 근거를 남겨 사람이 non_trading_days 를 의심할 수 있게 한다.
+            log.warning("%s 공휴일 아님 + 기준 종목 데이터 없음 = 소스 장애 의심. "
+                        "임시휴장이 아니라면 non_trading_days 에서 지우고 "
+                        "재요청하십시오 (%s)", iso, detail)
+            rep["suspect_outage"] = True
         store.mark_non_trading_day(
             iso, f"reference tickers report no data ({detail}, "
                  f"retries={ref_retries + 1})")

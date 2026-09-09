@@ -722,11 +722,35 @@ PC 가 절전/최대 절전으로 들어가면 cron 이 돌지 않는다. 전원
 매년 바뀌고 임시 휴장도 있다. 세 단계로 판정한다.
 
 ```
-주말            요일로 확정                    CLOSED_WEEKEND
-알려진 휴장일   DB 캐시(non_trading_days)      CLOSED_HOLIDAY
-시세가 있는 날  거래일 확정                    TRADING
-그 외 평일      미확인                         UNKNOWN
+주말            요일로 확정                                   CLOSED_WEEKEND
+공휴일          holidays 테이블(천문연구원 API) 또는           CLOSED_HOLIDAY
+                config.EXTRA_MARKET_HOLIDAYS → 프로브 생략
+알려진 휴장일   DB 캐시(non_trading_days)                     CLOSED_HOLIDAY
+시세가 있는 날  거래일 확정                                   TRADING
+그 외 평일      미확인                                        UNKNOWN
 ```
+
+### 공휴일 사전 필터 (2026-09-09 추가)
+
+한국천문연구원 특일정보 API(`getRestDeInfo`, `isHoliday == "Y"` 만)로
+1년치 공휴일을 `holidays` 테이블에 넣어 두고, 공휴일이면 기준 종목 프로브를
+부르지 않는다. **거래일을 확정하는 데는 쓰지 않는다** — 임시휴장·조기폐장은
+API 에 없으므로 그 판정은 종전대로 프로브가 한다. 테이블이 비어 있거나 API 가
+죽어도 판정은 막히지 않고 그냥 프로브로 간다.
+
+```bash
+python run_screen.py --mode holidays          # 올해 + 내년, 분기 1회 수동
+python run_screen.py --mode holidays --year 2027
+```
+
+키는 `.env` 의 `DATA_GO_KR_KEY`. nightly 에 넣지 않는다. 공휴일 API 가 못
+잡는 증시 휴장(근로자의 날 5/1, 12/31 폐장)은 `config.EXTRA_MARKET_HOLIDAYS`
+로 보완한다. `getHoliDeInfo`(국경일)는 제헌절이 `isHoliday=N` 으로 섞여
+쓰지 않는다.
+
+평일인데 공휴일 테이블에 없고 기준 종목이 '데이터 없음'이면 로그에
+`소스 장애 의심` 을 남긴다. 판정(휴장 기록)은 종전 그대로지만, 그 줄이
+보이면 `non_trading_days` 를 의심하고 재요청하라는 뜻이다.
 
 `UNKNOWN` 은 차단하지 않는다. 장중에는 아직 시세가 적재되지 않았을 수
 있으므로, 확실히 휴장인 경우만 막아야 한다. 이걸 반대로 하면 매일 아침

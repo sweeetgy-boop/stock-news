@@ -2138,6 +2138,189 @@ def test_watchlist(st):
     check("watchlist", "점수·스크리닝·청산 경로 미참조", t_no_leak_into_scoring)
 
 
+# ═══════════════ 8-1d. 공휴일 사전 필터 (천문연구원 API) ═══════════════
+def test_holidays(tmp: Path):
+    """공휴일이면 프로브 생략, 아니면 종전 프로브 그대로. 네트워크 없음."""
+    import logging as _logging
+    import pandas as _pd
+
+    from stocknews import holidays as H
+    from stocknews import universe as uni
+    from stocknews.store import Store
+    from stocknews.trading_day import (CLOSED_HOLIDAY, TRADING, UNKNOWN,
+                                       market_status, market_status_reason)
+
+    st = Store(tmp / "hol.db")
+    # 2026-08-17(월) 광복절 대체공휴일 · 2026-08-19(수) 평일
+    HOL, HOL_YMD = "2026-08-17", "20260817"
+    WED, WED_YMD = "2026-08-19", "20260819"
+
+    SAMPLE = {"response": {"header": {"resultCode": "00", "resultMsg": "NORMAL SERVICE."},
+              "body": {"items": {"item": [
+                  {"dateKind": "01", "dateName": "광복절", "isHoliday": "Y", "locdate": 20260815, "seq": 1},
+                  {"dateKind": "01", "dateName": "대체공휴일", "isHoliday": "Y", "locdate": 20260817, "seq": 1},
+                  {"dateKind": "01", "dateName": "제헌절", "isHoliday": "N", "locdate": 20260717, "seq": 1},
+              ]}, "numOfRows": 100, "pageNo": 1, "totalCount": 3}}}
+
+    def _status(mapping):
+        def _fn(ticker, trade_date, retries=None, backoff=None):
+            return mapping.get(ticker, ("NODATA", None))
+        return _fn
+
+    class _Probe:
+        """프로브가 불렸는지 세는 대역."""
+        def __init__(self, mapping): self.mapping, self.calls = mapping, 0
+        def __call__(self, ticker, trade_date, retries=None, backoff=None):
+            self.calls += 1
+            return self.mapping.get(ticker, ("NODATA", None))
+
+    def t_parse_keeps_only_Y():
+        rows, meta = H.parse_response(SAMPLE)
+        assert [r["d"] for r in rows] == ["2026-08-15", "2026-08-17"], rows
+        assert all(r["source"] == H.SOURCE for r in rows)
+        assert meta["kept"] == 2 and meta["total"] == 3
+        assert not meta.get("truncated")
+        # 1건이면 item 이 dict 로 온다
+        one = {"response": {"header": {"resultCode": "00"}, "body": {
+            "items": {"item": {"dateName": "설날", "isHoliday": "Y", "locdate": "20260217"}},
+            "totalCount": 1}}}
+        assert [r["d"] for r in H.parse_response(one)[0]] == ["2026-02-17"]
+        # 0건이면 items 가 "" 다
+        empty = {"response": {"header": {"resultCode": "00"}, "body": {"items": "", "totalCount": 0}}}
+        assert H.parse_response(empty) == ([], H.parse_response(empty)[1])
+
+    def t_truncation_warns():
+        big = {"response": {"header": {"resultCode": "00"}, "body": {
+            "items": {"item": [{"dateName": "x", "isHoliday": "Y", "locdate": "20260101"}]},
+            "totalCount": 150}}}
+        rows, meta = H.parse_response(big, num_of_rows=100)
+        assert meta.get("truncated") is True, "totalCount > numOfRows 경고가 없다"
+
+    def t_holiday_skips_probe():
+        """공휴일 → 프로브 생략. 프로브가 한 번이라도 불리면 실패."""
+        st.upsert_holidays(H.parse_response(SAMPLE)[0])
+        status, why = market_status_reason(st, HOL)
+        assert status == CLOSED_HOLIDAY and "대체공휴일" in why, (status, why)
+        probe = _Probe({t: ("DATA", 100.0) for t in uni.REF_TICKERS})
+        s_snap, s_stat = uni.market_snapshot, uni.close_on_status
+        try:
+            uni.market_snapshot = lambda: (_ for _ in ()).throw(AssertionError("스냅샷 호출됨"))
+            uni.close_on_status = probe
+            rep = {}
+            n = uni.fetch_day(st, HOL_YMD, report=rep)
+        finally:
+            uni.market_snapshot, uni.close_on_status = s_snap, s_stat
+        assert n == 0 and rep["verdict"] == "CLOSED" and rep["path"] == "known", rep
+        assert "대체공휴일" in rep["detail"], rep
+        assert probe.calls == 0, "공휴일인데 기준 종목 프로브를 불렀다"
+
+    def t_extra_market_holiday():
+        """근로자의 날(5/1)은 API 에 없지만 증시 휴장 — config 보완표가 잡는다."""
+        assert st.holiday_name("2026-05-01") is None, "테이블에 넣지 않았는데 있다"
+        status, why = market_status_reason(st, "2026-05-01")   # 2026-05-01 은 금요일
+        assert status == CLOSED_HOLIDAY and "근로자" in why, (status, why)
+        status, why = market_status_reason(st, "2026-12-31")   # 목요일
+        assert status == CLOSED_HOLIDAY and "폐장" in why, (status, why)
+
+    def t_weekday_nodata_flags_outage_suspect():
+        """평일 + 공휴일 테이블에 없음 + 프로브 '데이터 없음' → 장애 의심 로그.
+        판정(CLOSED 기록)은 종전 그대로다 — 프로브 로직을 약화하지 않는다."""
+        THU, THU_YMD = "2026-08-20", "20260820"           # 평일. 다른 검사와 날짜를 안 겹친다
+        assert st.holiday_name(THU) is None
+        logger = _logging.getLogger("stocknews.universe")
+        lines: list = []
+        h = _logging.Handler(); h.emit = lambda rec: lines.append(rec.getMessage())
+        # 스모크는 logging.disable 로 출력을 막아 둔다. 이 검사만 잠시 푼다.
+        disabled = _logging.root.manager.disable
+        s_snap, s_stat = uni.market_snapshot, uni.close_on_status
+        try:
+            _logging.disable(_logging.NOTSET)
+            logger.addHandler(h)
+            uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
+            uni.close_on_status = _status({})
+            rep = {}
+            uni.fetch_day(st, THU_YMD, report=rep)
+        finally:
+            logger.removeHandler(h)
+            _logging.disable(disabled)
+            uni.market_snapshot, uni.close_on_status = s_snap, s_stat
+            with __import__("contextlib").closing(st._conn()) as con:
+                con.execute("DELETE FROM non_trading_days WHERE d=?", (THU,)); con.commit()
+        assert rep["verdict"] == "CLOSED", rep            # 종전 판정 유지
+        assert rep.get("suspect_outage") is True, rep
+        assert any("소스 장애 의심" in ln for ln in lines), lines[-3:]
+
+    def t_empty_table_falls_through_to_probe():
+        """테이블이 비어도 판정은 막히지 않는다 — 그냥 프로브로 간다."""
+        st2 = Store(tmp / "hol_empty.db")
+        assert st2.holiday_name(WED) is None
+        assert market_status(st2, WED) == UNKNOWN
+        probe = _Probe({t: ("DATA", 100.0) for t in uni.REF_TICKERS})
+        s_snap, s_stat = uni.market_snapshot, uni.close_on_status
+        try:
+            uni.market_snapshot = lambda: (_pd.DataFrame(), _pd.DataFrame())
+            uni.close_on_status = probe
+            rep = {}
+            uni.fetch_day(st2, WED_YMD, report=rep)
+        finally:
+            uni.market_snapshot, uni.close_on_status = s_snap, s_stat
+        assert rep["verdict"] == "TRADING", rep
+        assert probe.calls >= 1, "테이블이 비었는데 프로브가 안 불렸다"
+
+    def t_api_failure_does_not_block():
+        """API 가 죽어도 refresh 는 예외를 올리지 않고, 판정도 그대로다."""
+        s_get = H.requests.get
+        try:
+            H.requests.get = lambda *a, **k: (_ for _ in ()).throw(ConnectionError("dns down"))
+            res = H.refresh_holidays(st, (2026, 2027), key="dummy")
+        finally:
+            H.requests.get = s_get
+        assert res["failed"] == [2026, 2027] and res["stored"] == 0, res
+        assert "error" in res["years"][2026], res
+        assert market_status(st, HOL) == CLOSED_HOLIDAY, "기존 공휴일 행이 사라졌다"
+        assert market_status(st, WED) == UNKNOWN, market_status_reason(st, WED)
+
+    def t_params_not_url():
+        """키는 requests params 로 간다. URL 에 이어 붙이면 401."""
+        seen = {}
+        class _R:
+            status_code = 200
+            def json(self): return SAMPLE
+        s_get = H.requests.get
+        try:
+            H.requests.get = lambda url, params=None, timeout=None: (seen.update(url=url, params=params), _R())[1]
+            rows, meta = H.fetch_holidays(2026, key="k+e/y=")
+        finally:
+            H.requests.get = s_get
+        assert seen["url"] == H.API_URL and "?" not in seen["url"]
+        assert seen["params"]["ServiceKey"] == "k+e/y=" and seen["params"]["solYear"] == "2026"
+        assert seen["params"]["_type"] == "json" and "solMonth" not in seen["params"]
+        assert len(rows) == 2
+
+    def t_no_key_is_precond():
+        import os
+        saved = os.environ.pop(H.ENV_KEY, None)
+        try:
+            try:
+                H.fetch_holidays(2026)
+                raise AssertionError("키 없이 호출이 통과했다")
+            except ValueError:
+                pass
+        finally:
+            if saved is not None:
+                os.environ[H.ENV_KEY] = saved
+
+    check("holidays", "isHoliday=Y 만 · locdate 변환 · 단건/0건", t_parse_keeps_only_Y)
+    check("holidays", "totalCount > numOfRows 경고", t_truncation_warns)
+    check("holidays", "공휴일 → 프로브 생략", t_holiday_skips_probe)
+    check("holidays", "증시 전용 보완 (근로자의 날·폐장일)", t_extra_market_holiday)
+    check("holidays", "평일+데이터 없음 → 장애 의심 로그", t_weekday_nodata_flags_outage_suspect)
+    check("holidays", "테이블 비어도 프로브 정상", t_empty_table_falls_through_to_probe)
+    check("holidays", "API 실패가 판정을 막지 않음", t_api_failure_does_not_block)
+    check("holidays", "키는 params 로 (URL 조립 금지)", t_params_not_url)
+    check("holidays", "키 없으면 ValueError", t_no_key_is_precond)
+
+
 # ══════════════════════════ 8-2. 알림 시간창 ══════════════════════════
 def test_notify(tmp: Path):
     """4대 시간창 · 창별 트랙 분리 · 창별 예산 독립 · KST 고정.
@@ -7804,6 +7987,7 @@ def main() -> int:
         test_news()
         test_news_dedup_fixture()
         test_dart_markets()
+        test_holidays(tmp)
         test_watchlist(st)
         test_notify(tmp)
         test_reco_dow()

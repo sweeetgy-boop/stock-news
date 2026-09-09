@@ -133,7 +133,7 @@ PARTIAL_FAIL_RATIO = 0.10
 _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "credit-kiwoom", "collect-dividends", "dividend-report",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
-                "flash", "pos-open", "fill", "pos-close"}
+                "flash", "pos-open", "fill", "pos-close", "holidays"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -1069,6 +1069,39 @@ def mode_dividend_report(store: Store, args) -> int:
     return EXIT_OK
 
 
+def mode_holidays(store: Store, args) -> int:
+    """공휴일 적재 (한국천문연구원 API). 휴장일 판정의 사전 필터.
+
+    올해 + 내년 2회 호출. nightly 에 넣지 않는다 — 공휴일은 분기에 한 번
+    갱신하면 충분하고, API 가 죽은 날 nightly 까지 흔들 이유가 없다.
+    한 해가 실패해도 나머지는 적재하고 exit 2 로 알린다.
+    """
+    from stocknews.holidays import ENV_KEY, refresh_holidays
+
+    if not os.getenv(ENV_KEY):
+        log.error("%s 가 없습니다. .env 에 넣으십시오 (data.go.kr 특일정보).", ENV_KEY)
+        SUMMARY.update({"skipped": True, "reason": f"no_{ENV_KEY.lower()}"})
+        return EXIT_PRECOND
+
+    base = int(args.year) if args.year else now_kst().year
+    years = (base, base + 1)
+    res = refresh_holidays(store, years)
+    SUMMARY.update({"years": res["years"], "stored": res["stored"],
+                    "failed": res["failed"]})
+    for y in years:
+        got = res["years"].get(y, {})
+        if "error" in got:
+            _say(f"{y}: 실패 — {got['error']}")
+            continue
+        rows = store.holidays_in_year(y)
+        _say(f"{y}: {len(rows)}건" + (" ⚠ totalCount 초과(잘림)" if got.get("truncated") else ""))
+        for d, name in rows:
+            _say(f"   {d}  {name}")
+    if len(res["failed"]) == len(years):
+        return EXIT_FAIL
+    return EXIT_PARTIAL if res["failed"] else EXIT_OK
+
+
 def mode_credit(store: Store, args) -> int:
     """신용잔고 주입. 이 시스템 핵심 가설의 데이터 구멍을 메운다.
 
@@ -1597,6 +1630,7 @@ MODES = {
     "brief-weekly": mode_brief_weekly,
     "flags": mode_flags,
     "credit": mode_credit,
+    "holidays": mode_holidays,
     "credit-kiwoom": mode_credit_kiwoom,
     "collect-dividends": mode_collect_dividends,
     "dividend-report": mode_dividend_report,
@@ -1657,6 +1691,8 @@ def main(argv=None) -> int:
     ap.add_argument("--price", type=float,
                     help="pos-open 진입가 (생략 시 최근 종가)")
     ap.add_argument("--date", help="pos-open 진입일 YYYY-MM-DD")
+    ap.add_argument("--year", type=int, default=None,
+                    help="holidays: 기준 연도 (그 해 + 다음 해 조회). 기본 올해")
     ap.add_argument("--track", choices=("VALUE", "TREND"),
                     help="pos-open 트랙 지정 (생략 시 점수로 자동 판정)")
     ap.add_argument("--note", help="포지션 메모")
