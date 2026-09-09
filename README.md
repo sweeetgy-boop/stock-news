@@ -235,6 +235,8 @@ Windows 작업 스케줄러를 쓴다면 같은 시각에 동일 명령을 등�
                   └─ news / news_tickers 테이블
 [06:20] brief-morning  밤사이 해외 + 매크로 + 내 종목 + 주요 공시
 [18:20] brief-evening  국내 공시·수급·테마·시황 + 추천 10선 교차
+                       + 📌 관심종목 현황 (config.WATCHLIST · 표시·뉴스태깅 전용,
+                         점수·추천·청산 어디에도 안 쓰임. 보유 아님)
 [금 18:40] brief-weekly 이번 주 vs 지난 주 테마 건수 변화
 ```
 

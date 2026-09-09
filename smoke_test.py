@@ -2060,6 +2060,84 @@ def test_dart_markets():
     check("dart", "news: collect_dart 순회 규칙 동일", t_news_collect_dart_markets)
 
 
+# ═══════════════ 8-1c. 관심종목 (표시·태깅 전용) ═══════════════
+def test_watchlist(st):
+    """WATCHLIST 는 표시와 뉴스 태깅에만 쓰인다. 점수 경로에 새면 여기서 잡는다."""
+    import re
+    from stocknews.config import WATCHLIST, watchlist_codes
+
+    def t_shape():
+        codes = watchlist_codes()
+        assert codes, "관심종목이 비어 있다"
+        seen: list = []
+        for sector, items in WATCHLIST.items():
+            assert sector and items, f"빈 섹터: {sector!r}"
+            for code, name in items:
+                assert re.fullmatch(r"\d{6}", code), f"코드 형식: {code!r}"
+                assert name.strip(), f"이름 없음: {code}"
+                assert code.endswith("0") or code in ("005935",), \
+                    f"우선주 의심 코드(끝자리≠0): {code} {name}"
+                seen.append(code)
+        assert len(seen) == len(set(seen)), "중복 코드"
+        bad = [n for _, (n, _) in codes.items()
+               if re.search(r"ETF|ETN|레버리지|인버스|KODEX|TIGER|우$|우B$", n)]
+        assert not bad, f"ETF/ETN/우선주는 넣지 않는다: {bad}"
+
+    def t_news_held_includes_watchlist():
+        """중요도의 '내 종목' 집합에 관심종목이 들어간다. 보유가 아니어도."""
+        from stocknews.news import held_codes
+
+        class _NoPositions:      # positions 테이블이 없는 저장소
+            pass
+
+        held = held_codes(_NoPositions())
+        assert set(watchlist_codes()) <= held, "관심종목이 '내 종목'에 없다"
+
+    def t_not_in_positions():
+        """관심종목은 보유가 아니다 — positions 에 자동으로 들어가면 안 된다."""
+        pos = st.list_positions() if hasattr(st, "list_positions") else []
+        assert not ({p.ticker for p in pos} & set(watchlist_codes())), \
+            "관심종목이 positions 에 들어가 있다"
+
+    def t_render_section():
+        from stocknews.renderer import render_watchlist
+        text = render_watchlist(st)
+        assert "📌 관심종목 현황" in text
+        for sector in WATCHLIST:
+            assert f"[{sector}]" in text, f"섹터 누락: {sector}"
+        # 스모크 저장소에는 관심종목 시세·스캔이 없다 → 전부 '스캔 제외'
+        assert text.count("스캔 제외") == len(watchlist_codes()), \
+            "스캔 스냅샷에 없는 종목은 '스캔 제외'로 표시돼야 한다"
+        assert "{" not in text and "}" not in text
+
+    def t_evening_brief_has_section():
+        from datetime import datetime as dt
+        from stocknews.renderer import render_evening_brief
+        text = render_evening_brief(st, dt(2026, 8, 24, 18, 5), hours=24 * 365)
+        assert "📌 관심종목 현황" in text, "저녁 브리핑에 관심종목 섹션이 없다"
+
+    def t_no_leak_into_scoring():
+        """점수·스크리닝·추천·청산·게이트 어디에도 WATCHLIST 가 없어야 한다."""
+        root = Path(__file__).parent / "stocknews"
+        forbidden = ("screener.py", "liquidation.py", "fibonacci.py",
+                     "indicators.py", "cost_basis.py", "daily.py", "exits.py",
+                     "notify.py", "weekly.py", "backtest.py", "universe.py",
+                     "flags.py")
+        leaks = []
+        for f in forbidden:
+            src = (root / f).read_text(encoding="utf-8", errors="replace")
+            if re.search(r"WATCHLIST|watchlist_codes|held_codes", src):
+                leaks.append(f)
+        assert not leaks, f"WATCHLIST 가 점수 경로에 새어 들어갔다: {leaks}"
+
+    check("watchlist", "형식·중복·ETF/우선주 배제", t_shape)
+    check("watchlist", "뉴스 '내 종목' 태깅 연결", t_news_held_includes_watchlist)
+    check("watchlist", "positions 미포함", t_not_in_positions)
+    check("watchlist", "섹션 렌더 (스캔 제외 표시)", t_render_section)
+    check("watchlist", "저녁 브리핑에 섹션 포함", t_evening_brief_has_section)
+    check("watchlist", "점수·스크리닝·청산 경로 미참조", t_no_leak_into_scoring)
+
+
 # ══════════════════════════ 8-2. 알림 시간창 ══════════════════════════
 def test_notify(tmp: Path):
     """4대 시간창 · 창별 트랙 분리 · 창별 예산 독립 · KST 고정.
@@ -7679,6 +7757,7 @@ def main() -> int:
         test_news()
         test_news_dedup_fixture()
         test_dart_markets()
+        test_watchlist(st)
         test_notify(tmp)
         test_reco_dow()
         test_trading_day(tmp)

@@ -9,12 +9,13 @@ from __future__ import annotations
 import html
 import unicodedata
 
-from .config import Config, DEFAULT
+from .config import Config, DEFAULT, WATCHLIST
 from .contracts import RULE_NAME, ScreenResult
 from .news import (canonical_source, cluster_items, normalize_url,
                    representative_rank)
 
-__all__ = ["bar", "render_detail", "render_digest", "render_fib_list"]
+__all__ = ["bar", "render_detail", "render_digest", "render_fib_list",
+           "render_watchlist"]
 
 
 def _e(s) -> str:
@@ -906,7 +907,76 @@ def render_evening_brief(store, asof, picks: list | None = None,
             out.append("• 추천 종목 관련 뉴스 없음 (조용한 바닥일 수 있음)")
         out.append("")
 
+    out.append(render_watchlist(store))
+    out.append("")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
+    return "\n".join(out)
+
+
+# 배제 플래그 표시명. store.load_flags 의 한글 키 그대로 쓴다.
+_WATCH_FLAG_KEYS = ("관리종목", "투자주의환기", "감사의견거절", "자본잠식",
+                    "대규모증자", "거래정지이력", "동전주위험", "재진입금지")
+
+
+def render_watchlist(store) -> str:
+    """📌 관심종목 현황 — 섹터별 · 당일 등락률 · 스캔 등급 · 배제 플래그.
+
+    **팩트만 찍는다. 해석은 없다.** 점수·추천 로직은 읽기만 하고 건드리지
+    않는다 — 이 함수는 scans/flags/prices 를 조회할 뿐 어디에도 쓰지 않는다.
+
+    '스캔 제외' 는 최근 스캔일 스냅샷에 그 종목이 없다는 뜻이다(유동성
+    필터 탈락, 데이터 부족 등). 이유는 여기서 판단하지 않는다.
+    """
+    out = ["━━ 📌 관심종목 현황 ━━"]
+    if not WATCHLIST:
+        out.append("• 등록된 관심종목 없음")
+        return "\n".join(out)
+
+    # 스냅샷·플래그는 한 번만 읽는다. 종목마다 쿼리하면 43회가 된다.
+    grade: dict = {}
+    scan_d = None
+    try:
+        sc = store.scan_history(days=1)
+        if sc is not None and not sc.empty:
+            scan_d = str(sc["d"].max())
+            last = sc[sc["d"] == scan_d]
+            grade = dict(zip(last["ticker"].astype(str), last["grade"].astype(str)))
+    except Exception:  # noqa: BLE001 - 스캔 이력이 없어도 섹션은 나가야 한다
+        grade = {}
+    try:
+        flags = store.load_flags()
+    except Exception:  # noqa: BLE001
+        flags = {}
+
+    def _chg(code: str) -> str:
+        try:
+            df = store.load_ohlcv(code, days=5)
+        except Exception:  # noqa: BLE001
+            df = None
+        if df is None or len(df) < 2:
+            return "시세 없음"
+        c = df["종가"].astype(float)
+        prev, last = float(c.iloc[-2]), float(c.iloc[-1])
+        if prev <= 0:
+            return "시세 없음"
+        return _pct((last / prev - 1.0) * 100.0)
+
+    for sector, items in WATCHLIST.items():
+        out.append(f"[{_e(sector)}]")
+        for code, name in items:
+            bits = [_chg(code)]
+            if code in grade:
+                g = grade[code]
+                bits.append(f"등급 {_e(g) if g and g != 'NONE' else '—'}")
+            else:
+                bits.append("스캔 제외")
+            f = flags.get(code) or {}
+            hit = [k for k in _WATCH_FLAG_KEYS if f.get(k)]
+            if hit:
+                bits.append("⚑ " + "·".join(hit))
+            out.append(f"• <b>{_e(name)}</b>  " + "  ".join(bits))
+    if scan_d:
+        out.append(f"(스캔 기준일 {scan_d} · 등락률은 마지막 두 봉 종가 기준)")
     return "\n".join(out)
 
 

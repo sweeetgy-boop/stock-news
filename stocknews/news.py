@@ -33,7 +33,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 import pandas as pd
 
 from .config import (DEFAULT, MAJOR_MEDIA, MEDIA_ALIASES,
-                     Config, NewsDedupConfig)
+                     Config, NewsDedupConfig, watchlist_codes)
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +42,8 @@ KST = timezone(timedelta(hours=9))
 __all__ = ["normalize_title", "make_id", "normalize_url", "canonical_source",
            "event_tokens", "same_event", "representative_rank", "classify",
            "cluster_items", "build_alias_index", "map_tickers",
-           "score_importance", "process_and_store", "theme_shift"]
+           "score_importance", "held_codes", "process_and_store",
+           "theme_shift"]
 
 
 def _to_kst(dt: datetime | None) -> datetime | None:
@@ -517,6 +518,22 @@ def score_importance(item: dict, held: set[str], recommended: set[str],
     return float(max(0.0, min(10.0, round(score, 2))))
 
 
+def held_codes(store) -> set[str]:
+    """중요도의 '내 종목' 집합 = 보유 종목 ∪ 관심종목.
+
+    관심종목은 보유가 아니다(positions 에 없다). 하지만 브리핑에서 먼저
+    읽고 싶은 종목이라는 점은 같으므로, 중요도 규칙 '몇 개 매체 + 내 종목'
+    의 '내 종목' 자리에 함께 넣는다. 중요도 공식 자체는 그대로다.
+    """
+    held: set[str] = set()
+    try:
+        pos = store.list_positions() if hasattr(store, "list_positions") else []
+        held = {p.ticker for p in pos}
+    except Exception:  # noqa: BLE001 - positions 테이블 미도입 상태 허용
+        held = set()
+    return held | set(watchlist_codes())
+
+
 # ══════════════════════════ 6. 파이프라인 ══════════════════════════
 def process_and_store(store, raw_items: list[dict],
                       summarize_hook=None,
@@ -535,12 +552,7 @@ def process_and_store(store, raw_items: list[dict],
     alias_idx = build_alias_index(tickers)
     universe = set(tickers)
 
-    held: set[str] = set()
-    try:
-        pos = store.list_positions() if hasattr(store, "list_positions") else []
-        held = {p.ticker for p in pos}
-    except Exception:  # noqa: BLE001 - positions 테이블 미도입 상태 허용
-        held = set()
+    held = held_codes(store)
 
     recommended: set[str] = set()
     try:
