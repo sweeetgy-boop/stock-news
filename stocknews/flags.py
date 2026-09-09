@@ -40,7 +40,7 @@ from xml.etree import ElementTree
 import pandas as pd
 import requests
 
-from .config import COOLDOWN_DAYS
+from .config import COOLDOWN_DAYS, DART_LIST_MAX_PAGES, DART_MARKETS
 from .contracts import COOLDOWN_REASON, STOP_RULE_PREFIX
 
 log = logging.getLogger(__name__)
@@ -238,30 +238,74 @@ _OFFERING_RE = re.compile(r"유상증자|전환사채|신주인수권부사채|�
 _AUDIT_RE = re.compile(r"의견거절|한정의견|감사범위제한|부적정")
 
 
+def _pages_for(market: str, max_pages) -> int:
+    """시장별 페이지 상한. int 를 주면 전 시장 공통, dict 면 시장별."""
+    if isinstance(max_pages, dict):
+        return int(max_pages.get(market, 20))
+    return int(max_pages)
+
+
 def dart_disclosure_events(days: int = 60, page_count: int = 100,
-                           max_pages: int = 20) -> tuple[dict, bool]:
+                           max_pages=None,
+                           markets: tuple[str, ...] | None = None
+                           ) -> tuple[dict, bool]:
     """최근 공시에서 증자/감자·감사의견 이슈 종목을 추출.
 
+    markets
+      corp_cls 튜플. 기본은 config.DART_MARKETS. **순서대로** 돈다.
+      코넥스("N")는 유니버스에 없으므로 들어와도 건너뛴다.
+    max_pages
+      int(전 시장 공통) 또는 {시장: 상한} dict. 기본은 config.DART_LIST_MAX_PAGES.
+      상한에 닿으면 경고를 남긴다 — 그 시장의 뒷 페이지를 못 본 것이다.
+
     반환: ({종목코드: {"offering": bool, "audit": bool, "titles": [...]}}, 성공여부)
+    성공여부는 '한 시장이라도 응답을 받았는가'다. 한 시장이 실패하면
+    그 시장의 플래그가 빠진 채 갱신되므로 로그로 남긴다.
     """
     if not os.getenv("DART_API_KEY"):
         log.info("DART_API_KEY 미설정 → 증자/감사의견 플래그 건너뜀")
         return {}, False
 
+    markets = tuple(markets) if markets is not None else tuple(DART_MARKETS)
+    max_pages = DART_LIST_MAX_PAGES if max_pages is None else max_pages
     end = datetime.now(KST)
     start = end - timedelta(days=days)
     out: dict[str, dict] = {}
     ok = False
+    for market in markets:
+        if market == "N":
+            log.warning("DART corp_cls N(코넥스)은 유니버스 밖 — 건너뜀")
+            continue
+        m_ok, m_items = _scan_market(market, start, end, page_count,
+                                     _pages_for(market, max_pages), out)
+        ok = ok or m_ok
+        log.info("DART 공시 스캔 corp_cls=%s: %d건 %s", market, m_items,
+                 "" if m_ok else "(조회 실패)")
+
+    hits = {k: v for k, v in out.items() if v["offering"] or v["audit"]}
+    log.info("DART 공시 스캔: 증자/감사의견 이슈 %d종목 (시장 %s)",
+             len(hits), ",".join(markets))
+    return hits, ok
+
+
+def _scan_market(market: str, start, end, page_count: int, max_pages: int,
+                 out: dict) -> tuple[bool, int]:
+    """한 시장의 list.json 을 페이지 끝까지 읽어 out 에 누적한다.
+
+    반환: (응답을 한 번이라도 받았는가, 훑은 공시 건수)
+    """
+    ok, seen = False, 0
     for page in range(1, max_pages + 1):
         data = _dart_get("list.json", {
             "bgn_de": start.strftime("%Y%m%d"),
             "end_de": end.strftime("%Y%m%d"),
-            "page_no": page, "page_count": page_count, "corp_cls": "Y",
+            "page_no": page, "page_count": page_count, "corp_cls": market,
         })
         if data is None:
             break
         ok = True
         items = data.get("list") or []
+        seen += len(items)
         for it in items:
             code = (it.get("stock_code") or "").strip()
             if not code:
@@ -281,11 +325,11 @@ def dart_disclosure_events(days: int = 60, page_count: int = 100,
                 rec["titles"].append(title[:60])
         if len(items) < page_count:
             break
+        if page == max_pages:
+            log.warning("DART corp_cls=%s 페이지 상한 %d 도달 — 뒷 페이지 미조회. "
+                        "config.DART_LIST_MAX_PAGES 를 올리십시오", market, max_pages)
         time.sleep(0.3 + random.random() * 0.2)
-
-    hits = {k: v for k, v in out.items() if v["offering"] or v["audit"]}
-    log.info("DART 공시 스캔: 증자/감사의견 이슈 %d종목", len(hits))
-    return hits, ok
+    return ok, seen
 
 
 # ══════════════════════════ ③ 로컬 시세 기반 ══════════════════════════

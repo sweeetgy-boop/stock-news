@@ -30,6 +30,8 @@ from urllib.parse import quote_plus, urljoin
 import requests
 from bs4 import BeautifulSoup
 
+from .config import DART_MARKETS, DART_NEWS_MAX_PAGES
+
 log = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
@@ -288,19 +290,40 @@ _DART_KEEP = re.compile(
 
 
 def collect_dart(days: int = 1, page_count: int = 100,
-                 max_pages: int = 5) -> list[dict]:
+                 max_pages=None,
+                 markets: tuple[str, ...] | None = None) -> list[dict]:
     """Open DART 공시 목록. DART_API_KEY 없으면 건너뛴다.
 
     전체 공시는 하루 수백 건이라 다 보내면 소음이다. 주가에 직접
     영향을 주는 유형만 정규식으로 걸러낸다.
+
+    markets 는 corp_cls 튜플(기본 config.DART_MARKETS)이고 순서대로 돈다.
+    코넥스("N")는 유니버스 밖이라 건너뛴다. max_pages 는 int 또는
+    {시장: 상한} dict (기본 config.DART_NEWS_MAX_PAGES).
     """
     key = os.getenv("DART_API_KEY")
     if not key:
         log.info("DART_API_KEY 미설정 → 공시 수집 건너뜀")
         return []
 
+    markets = tuple(markets) if markets is not None else tuple(DART_MARKETS)
+    max_pages = DART_NEWS_MAX_PAGES if max_pages is None else max_pages
     end = datetime.now(KST)
     start = end - timedelta(days=days)
+    out: list[dict] = []
+    for market in markets:
+        if market == "N":
+            continue
+        limit = (int(max_pages.get(market, 5)) if isinstance(max_pages, dict)
+                 else int(max_pages))
+        out.extend(_collect_dart_market(key, market, start, end,
+                                        page_count, limit))
+    log.info("DART 공시 %d건 (필터 통과 · 시장 %s)", len(out), ",".join(markets))
+    return out
+
+
+def _collect_dart_market(key: str, market: str, start, end,
+                         page_count: int, max_pages: int) -> list[dict]:
     out: list[dict] = []
     for page in range(1, max_pages + 1):
         res = _get("https://opendart.fss.or.kr/api/list.json",
@@ -308,7 +331,7 @@ def collect_dart(days: int = 1, page_count: int = 100,
                            "bgn_de": start.strftime("%Y%m%d"),
                            "end_de": end.strftime("%Y%m%d"),
                            "page_no": page, "page_count": page_count,
-                           "corp_cls": "Y"})
+                           "corp_cls": market})
         if res is None:
             break
         try:
@@ -316,8 +339,8 @@ def collect_dart(days: int = 1, page_count: int = 100,
         except ValueError:
             break
         if data.get("status") != "000":
-            log.warning("DART 응답 코드 %s: %s",
-                        data.get("status"), data.get("message"))
+            log.warning("DART 응답 코드 %s (corp_cls=%s): %s",
+                        data.get("status"), market, data.get("message"))
             break
         items = data.get("list") or []
         for it in items:
@@ -347,7 +370,6 @@ def collect_dart(days: int = 1, page_count: int = 100,
         if len(items) < page_count:
             break
         time.sleep(0.4)
-    log.info("DART 공시 %d건 (필터 통과)", len(out))
     return out
 
 

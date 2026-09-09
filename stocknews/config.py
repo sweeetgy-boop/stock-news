@@ -481,6 +481,39 @@ MAJOR_MEDIA: frozenset[str] = frozenset({
 })
 
 
+# ══════════════════════════ DART 조회 시장 ══════════════════════════
+# Open DART list.json 의 corp_cls.  Y=유가(코스피)  K=코스닥  N=코넥스  E=기타
+#
+# 기본은 코스피만이다. 코스닥을 켜려면 ("Y", "K") 로 바꾼다. 코넥스(N)는
+# 유니버스에 없으므로 어떤 경우에도 넣지 않는다 — flags.dart_disclosure_events
+# 와 news_sources.collect_dart 가 이 튜플을 **순서대로** 돈다.
+#
+# 켜는 절차 (한 줄): 아래 두 값을 바꾸고 커밋하면 다음 nightly(21:30)부터
+# 적용된다. 켠 날짜는 채점 데이터를 나누는 기준일이 되므로 반드시 적는다 —
+# 그날 이전 스냅샷은 코스닥 DART 플래그(증자·감사의견)가 비어 있는 상태로
+# 채점된 것이다.
+DART_MARKETS: tuple[str, ...] = ("Y",)
+DART_KOSDAQ_ENABLED_ON: str | None = None    # 예: "2026-09-10". 켜는 날 기록.
+
+# 시장별 list.json 최대 페이지 (page_count=100 기준). flags 가 60일을 소급한다.
+#
+# 2026-09-09 실측 (60일 소급, 100건/페이지):
+#     corp_cls=Y  total_count 10,474  -> 105페이지   1.2초/호출
+#     corp_cls=K  total_count 11,266  -> 113페이지   0.9초/호출
+#
+# ★ Y 의 20 은 실측 필요량(105)의 1/5 이다. 이 값으로는 최근 약 11일치
+#   공시만 읽고 나머지 49일은 조용히 버려진다 — 코스닥 확장 작업 중에
+#   발견한 **기존 결함**이다. 오늘 nightly 를 종전대로 돌리기 위해 손대지
+#   않았다. 코스닥을 켤 때 Y 도 160 으로 같이 올리는 것을 권한다.
+#   상한에 닿으면 flags 로그에 '페이지 상한 도달' 경고가 남는다.
+# K 는 실측 113 의 1.5배로 뒀다. 3월(사업보고서)·8월(반기)에는 경고를 보고
+# 올린다.
+DART_LIST_MAX_PAGES: dict[str, int] = {"Y": 20, "K": 170}
+# 뉴스 수집(news_sources.collect_dart)은 하루치만 본다.
+# 2026-09-09 실측(1일): Y 127건=2페이지, K 215건=3페이지. 5 면 충분하다.
+DART_NEWS_MAX_PAGES: dict[str, int] = {"Y": 5, "K": 5}
+
+
 @dataclass(frozen=True)
 class NewsDedupConfig:
     """뉴스 중복 제거 3층 파라미터.

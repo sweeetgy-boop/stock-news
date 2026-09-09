@@ -138,6 +138,9 @@ exit 4 는 순서가 틀렸거나 설정이 빠졌다는 뜻이고, exit 64 는 
   master     전종목 마스터 + 업종            2~3분
   backfill   시세 히스토리 적재              20~40분  ★ 재실행하면 이어서 받음
   flags      배제 플래그 초기 구축            5~10분
+             DART 증자·감사의견은 기본 코스피만. 코스닥 ON 은
+             config.DART_MARKETS=("Y","K") + DART_KOSDAQ_ENABLED_ON 날짜 기록
+             (README '코스닥 확장' 절). 켠 날짜 = 채점 데이터 구분 기준일.
   credit-kiwoom  신용잔고 REST 실측 (선택)   3~10분   ★ 앱키 필요
   credit     신용잔고 CSV 적재 (선택)         수초
 

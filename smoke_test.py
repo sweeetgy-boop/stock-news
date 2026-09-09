@@ -1936,6 +1936,123 @@ def test_news_dedup_fixture():
     check("dedup", "종목 교차 오병합 없음", t_no_ticker_crossing)
 
 
+# ═══════════════ 8-1b. DART 조회 시장 (코스닥 확장, 기본 OFF) ═══════════════
+def test_dart_markets():
+    """corp_cls 순회. 네트워크는 쓰지 않는다 — 호출 함수를 가로채 기록한다."""
+    import os
+    from stocknews import config as C
+    from stocknews import flags as F
+    from stocknews import news_sources as NS
+
+    def t_default_off():
+        """기본값은 코스피만. 코넥스는 어떤 설정에도 없다."""
+        assert C.DART_MARKETS == ("Y",), \
+            f"기본 OFF 여야 한다 (오늘 nightly 종전대로): {C.DART_MARKETS}"
+        assert "N" not in C.DART_MARKETS
+        assert C.DART_KOSDAQ_ENABLED_ON is None, \
+            "켜지 않았는데 ON 날짜가 적혀 있다"
+        assert set(C.DART_LIST_MAX_PAGES) >= {"Y", "K"}
+        assert set(C.DART_NEWS_MAX_PAGES) >= {"Y", "K"}
+
+    def _fake_pages(seen: list, per_market: dict):
+        """corp_cls 별로 per_market[시장] 페이지를 흘려주는 가짜 _dart_get."""
+        def fake(path, params):
+            m, p = params["corp_cls"], params["page_no"]
+            seen.append((m, p))
+            n_pages = per_market.get(m, 0)
+            if p > n_pages:
+                return {"status": "013", "list": []}
+            full = p < n_pages
+            items = [{"stock_code": f"{m}{p:05d}"[:6],
+                      "report_nm": "유상증자결정" if m == "K" else "기타공시"}]
+            items += [{"stock_code": "", "report_nm": "x"}] * (99 if full else 0)
+            return {"status": "000", "list": items}
+        return fake
+
+    def t_flags_iterates_y_then_k():
+        os.environ.setdefault("DART_API_KEY", "smoke-dummy")
+        seen: list = []
+        orig = F._dart_get
+        F._dart_get = _fake_pages(seen, {"Y": 2, "K": 3})
+        try:
+            hits, ok = F.dart_disclosure_events(
+                days=60, markets=("Y", "K"), max_pages={"Y": 20, "K": 170})
+        finally:
+            F._dart_get = orig
+        markets_in_order = [m for m, _ in seen]
+        assert ok
+        assert markets_in_order[:2] == ["Y", "Y"] and "K" in markets_in_order, \
+            f"Y 를 다 돌고 K 로 넘어가야 한다: {markets_in_order}"
+        assert markets_in_order.index("K") > markets_in_order.index("Y")
+        assert seen.count(("Y", 1)) == 1 and seen.count(("K", 3)) == 1
+        assert not any(m == "N" for m, _ in seen), "코넥스를 조회했다"
+        assert "K00001" in hits and hits["K00001"]["offering"], \
+            "코스닥 증자 공시가 플래그로 안 잡혔다"
+
+    def t_flags_skips_konex_and_respects_pages():
+        os.environ.setdefault("DART_API_KEY", "smoke-dummy")
+        seen: list = []
+        orig = F._dart_get
+        F._dart_get = _fake_pages(seen, {"Y": 5, "K": 5, "N": 5})
+        try:
+            F.dart_disclosure_events(days=60, markets=("Y", "N", "K"),
+                                     max_pages={"Y": 2, "K": 1})
+        finally:
+            F._dart_get = orig
+        assert not any(m == "N" for m, _ in seen), "N(코넥스)은 건너뛰어야 한다"
+        assert max(p for m, p in seen if m == "Y") == 2, "Y 페이지 상한 무시"
+        assert max(p for m, p in seen if m == "K") == 1, "K 페이지 상한 무시"
+
+    def t_flags_default_uses_config():
+        """markets 를 안 주면 config.DART_MARKETS 를 쓴다 (지금은 Y 만)."""
+        os.environ.setdefault("DART_API_KEY", "smoke-dummy")
+        seen: list = []
+        orig = F._dart_get
+        F._dart_get = _fake_pages(seen, {"Y": 1, "K": 1})
+        try:
+            F.dart_disclosure_events(days=60)
+        finally:
+            F._dart_get = orig
+        assert {m for m, _ in seen} == set(C.DART_MARKETS), \
+            f"config 기본값과 다르게 돌았다: {seen}"
+
+    def t_news_collect_dart_markets():
+        """news_sources.collect_dart 도 같은 순회 규칙을 따른다."""
+        os.environ.setdefault("DART_API_KEY", "smoke-dummy")
+        seen: list = []
+
+        class _Res:
+            def __init__(self, m, p):
+                self.m, self.p = m, p
+            def json(self):
+                if self.p > 1:
+                    return {"status": "013", "list": []}
+                return {"status": "000", "list": [{
+                    "report_nm": "유상증자결정", "rcept_no": "1", "rcept_dt": "20260909",
+                    "corp_name": f"회사{self.m}", "stock_code": f"{self.m}00001"[:6]}]}
+
+        orig_get, orig_sleep = NS._get, NS.time.sleep
+        NS._get = lambda url, **kw: (seen.append((kw["params"]["corp_cls"],
+                                                  kw["params"]["page_no"])),
+                                     _Res(kw["params"]["corp_cls"],
+                                          kw["params"]["page_no"]))[1]
+        NS.time.sleep = lambda *_a, **_k: None
+        try:
+            out = NS.collect_dart(days=1, markets=("Y", "N", "K"))
+        finally:
+            NS._get, NS.time.sleep = orig_get, orig_sleep
+        ms = [m for m, _ in seen]
+        assert "N" not in ms, "코넥스를 조회했다"
+        assert ms.index("K") > ms.index("Y"), f"순서가 틀렸다: {ms}"
+        assert {o["stock_code"] for o in out} == {"Y00001", "K00001"}, out
+
+    check("dart", "기본 OFF (Y만) · 코넥스 없음 · ON 날짜 비어 있음", t_default_off)
+    check("dart", "flags: Y 다음 K 순회 + 코스닥 증자 적중", t_flags_iterates_y_then_k)
+    check("dart", "flags: N 건너뜀 + 시장별 페이지 상한", t_flags_skips_konex_and_respects_pages)
+    check("dart", "flags: 기본 인자는 config 를 따름", t_flags_default_uses_config)
+    check("dart", "news: collect_dart 순회 규칙 동일", t_news_collect_dart_markets)
+
+
 # ══════════════════════════ 8-2. 알림 시간창 ══════════════════════════
 def test_notify(tmp: Path):
     """4대 시간창 · 창별 트랙 분리 · 창별 예산 독립 · KST 고정.
@@ -7554,6 +7671,7 @@ def main() -> int:
         test_exits()
         test_news()
         test_news_dedup_fixture()
+        test_dart_markets()
         test_notify(tmp)
         test_reco_dow()
         test_trading_day(tmp)
