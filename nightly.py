@@ -45,7 +45,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -80,6 +80,25 @@ LOCK_WAIT = "0"
 _SENDING = {"news", "daily", "exits", "brief-morning", "brief-evening",
             "weekly", "brief-weekly", "flash"}
 
+# 잡별 dry-run. STOCKNEWS_SEND=1 이어도 여기 적힌 잡은 --dry-run 으로 돈다.
+#
+#   setx STOCKNEWS_DRY_JOBS flash          (콤마 구분: "flash,weekly")
+#
+# 왜 필요한가: STOCKNEWS_SEND 는 전역이라 flash 를 첫날 로그만 보고 싶어도
+# 그날 nightly·저녁 브리핑까지 같이 dry-run 이 된다. 잡 하나만 끄는 스위치가
+# 없어서 flash 를 켜지 못하고 있었다 (2026-09-09).
+DRY_JOBS_ENV = "STOCKNEWS_DRY_JOBS"
+
+# flash 에 추가로 넘길 인자. 켤 때 결정한다 — 기본은 아무것도 안 넘긴다.
+#
+#   ("--no-update",)   당일 시세 적재를 건너뛰고 전일 봉으로 스캔한다.
+#                      KRX 전종목 스냅샷이 404 인 동안 fetch_day 가 종목별
+#                      폴백(2,400종목 x 0.3s ≈ 12~22분)으로 떨어져 cron
+#                      타임아웃 900초를 넘긴다. 이걸 끄면 회차당 30초 안팎.
+#                      대신 '장중 즉시 속보'가 전일 종가 기준이 된다.
+# 이 값을 바꾸면 smoke 의 [hermes-jobs] 검사가 인자를 그대로 대조한다.
+FLASH_EXTRA_ARGS: tuple[str, ...] = ()
+
 # 오늘 이미 완주했는지 기록하는 마커.
 #
 # 왜 락만으로는 부족한가
@@ -107,6 +126,9 @@ class Step:
     soft: frozenset = field(default_factory=frozenset)
     # 모드가 아직 없을 수 있는 단계. exit 64(인자 오류)면 미구현으로 본다.
     optional: bool = False
+    # STOCKNEWS_DRY_JOBS 로 이 잡이 지목됐다. STOCKNEWS_SEND 와 무관하게
+    # --dry-run 을 붙인다. main() 이 apply_dry_jobs() 로 세운다.
+    force_dry: bool = False
 
 
 # 순서는 AGENTS 3장의 의존 관계를 따른다.
@@ -183,9 +205,25 @@ JOBS: dict[str, Job] = {
                   _one("weekly", ["--mode", "weekly"])),
     # 장중 5분 간격. 마커도 완료 알림도 없다.
     "flash": Job("flash", "flash", "\u26a1",
-                 _one("flash", ["--mode", "flash"]),
+                 _one("flash", ["--mode", "flash", *FLASH_EXTRA_ARGS]),
                  once_per_day=False, quiet_ok=True),
 }
+
+
+def dry_jobs_from_env(value: str | None) -> set[str]:
+    """STOCKNEWS_DRY_JOBS 파싱. 콤마/세미콜론 구분, 대소문자·공백 무시."""
+    if not value:
+        return set()
+    return {tok.strip().lower() for tok in value.replace(";", ",").split(",")
+            if tok.strip()}
+
+
+def apply_dry_jobs(job: Job, dry_jobs: set[str]) -> Job:
+    """지목된 잡이면 모든 단계에 force_dry 를 세운 **사본**을 돌려준다."""
+    if job.name.lower() not in dry_jobs:
+        return job
+    steps = tuple(replace(s, force_dry=True) for s in job.steps)
+    return replace(job, steps=steps)
 
 
 class Log:
@@ -269,7 +307,7 @@ def _child_env() -> dict:
 
 def _build_args(step: Step, dry: bool) -> list[str]:
     args = list(step.args)
-    if step.name in _SENDING and dry:
+    if step.name in _SENDING and (dry or step.force_dry):
         args.append("--dry-run")
     if step.name != "stock-flow":
         args += ["--lock-wait", LOCK_WAIT]
@@ -424,7 +462,8 @@ def _summary(job: Job, started: datetime, finished: datetime,
         if j.get("source_outage"):
             head += f" · 미적재 {', '.join(j['source_outage'])}"
     if dry:
-        head += "\n※ --dry-run (STOCKNEWS_SEND=1 로 실발송 전환)"
+        head += ("\n※ --dry-run (STOCKNEWS_SEND=1 로 실발송 전환 · "
+                 f"잡별 예외는 {DRY_JOBS_ENV})")
     return head
 
 
@@ -450,11 +489,16 @@ def main(argv: list[str] | None = None) -> int:
     started = now_kst()
     log = Log(REPO / "logs" / f"{job.name}_{started:%Y%m%d}.log")
     dry = os.getenv("STOCKNEWS_SEND") != "1"
+    dry_jobs = dry_jobs_from_env(os.getenv(DRY_JOBS_ENV))
+    job = apply_dry_jobs(job, dry_jobs)
+    job_dry = dry or job.name.lower() in dry_jobs
     notify_on = not args.no_telegram
 
     log("=" * 62)
     log(f"{job.name} 시작 {started:%Y-%m-%d %H:%M:%S} KST "
-        f"(발송 {'실제' if not dry else 'dry-run'})")
+        f"(발송 {'실제' if not job_dry else 'dry-run'}"
+        + (f" · {DRY_JOBS_ENV}={','.join(sorted(dry_jobs))}" if dry_jobs else "")
+        + ")")
 
     # .env 를 환경변수로 올린다. 이게 없으면 _notify 가 토큰을 못 찾아
     # 조용히 생략된다 — 실패 알림까지 안 나간다.
@@ -560,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
         if job.once_per_day:
             _mark_done(marker, day, rc_final,
                        "완주" if rc_final == 0 else "부분 실패")
-        text = _summary(job, started, finished, results, dry)
+        text = _summary(job, started, finished, results, job_dry)
         log(f"{job.name} 종료 {finished:%H:%M:%S} · exit {rc_final}")
         # quiet_ok 잡은 실패일 때만 알린다. flash 는 5분마다 돌아서
         # 정상 보고를 매번 보내면 하루 84건이 나간다.

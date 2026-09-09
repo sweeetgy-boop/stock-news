@@ -5521,6 +5521,49 @@ def test_cron_jobs(tmp: Path):
                      "daily", "exits"):
             assert mode in nl_mod._SENDING, mode
 
+    def t_dry_jobs_env_parse():
+        f = nl_mod.dry_jobs_from_env
+        assert f(None) == set() and f("") == set() and f("  ") == set()
+        assert f("flash") == {"flash"}
+        assert f("Flash, weekly ;news") == {"flash", "weekly", "news"}
+
+    def t_dry_jobs_force_dry_run():
+        """지목된 잡은 STOCKNEWS_SEND=1(dry=False)이어도 --dry-run 이 붙는다."""
+        flash = nl_mod.apply_dry_jobs(nl_mod.JOBS["flash"], {"flash"})
+        for step in flash.steps:
+            assert step.force_dry
+            assert "--dry-run" in nl_mod._build_args(step, dry=False), \
+                "STOCKNEWS_DRY_JOBS 로 지목했는데 --dry-run 이 안 붙는다"
+        # 원본 JOBS 는 변형되지 않는다 (사본 반환).
+        assert not any(s.force_dry for s in nl_mod.JOBS["flash"].steps), "원본 JOBS 가 변형됐다"
+        # 지목 안 된 잡은 그대로다.
+        night = nl_mod.apply_dry_jobs(nl_mod.JOBS["nightly"], {"flash"})
+        for step in night.steps:
+            assert not step.force_dry
+            if step.name in nl_mod._SENDING:
+                assert "--dry-run" not in nl_mod._build_args(step, dry=False)
+        # 전역 dry(STOCKNEWS_SEND 미설정)는 여전히 전부 dry-run.
+        for step in nl_mod.JOBS["flash"].steps:
+            assert "--dry-run" in nl_mod._build_args(step, dry=True)
+
+    def t_flash_extra_args_path():
+        """flash 인자 경로. 기본은 비어 있고, 채우면 그대로 붙는다."""
+        assert isinstance(nl_mod.FLASH_EXTRA_ARGS, tuple)
+        step = nl_mod.JOBS["flash"].steps[0]
+        assert step.args[:2] == ["--mode", "flash"]
+        assert step.args[2:] == list(nl_mod.FLASH_EXTRA_ARGS), step.args
+        if nl_mod.FLASH_EXTRA_ARGS:
+            assert set(nl_mod.FLASH_EXTRA_ARGS) <= {"--no-update", "--ignore-window"}, \
+                nl_mod.FLASH_EXTRA_ARGS
+
+    def t_daily_cap_is_window_sum():
+        """일일 상한은 창별 예산 합이다. 죽은 daily_budget 은 없어야 한다."""
+        from stocknews.config import DEFAULT
+        from stocknews.notify import WINDOWS
+        assert not hasattr(DEFAULT.gate, "daily_budget"), \
+            "daily_budget 은 어디서도 읽지 않는 죽은 설정이었다 — 되살리지 마라"
+        assert sum(w.budget for w in WINDOWS) == 9, [w.budget for w in WINDOWS]
+
     def t_shim_derives_job_from_filename():
         """사본 5개가 같은 바이트여야 하므로 잡 이름은 파일명에서 나온다."""
         shim_path = repo / "hermes" / "cron_stocknews.py"
@@ -5557,6 +5600,10 @@ def test_cron_jobs(tmp: Path):
     check("cron", "잡별 마커 분리", t_markers_are_distinct)
     check("cron", "카탈로그 모드 실재", t_modes_exist)
     check("cron", "발송 모드 기본 dry-run", t_sending_modes_are_dry_by_default)
+    check("cron", "STOCKNEWS_DRY_JOBS 파싱", t_dry_jobs_env_parse)
+    check("cron", "STOCKNEWS_DRY_JOBS 잡별 dry-run", t_dry_jobs_force_dry_run)
+    check("cron", "flash 추가 인자 경로 (기본 없음)", t_flash_extra_args_path)
+    check("cron", "일일 상한 = 창별 예산 합 9", t_daily_cap_is_window_sum)
     check("cron", "사본은 파일명에서 잡 추출", t_shim_derives_job_from_filename)
 
 

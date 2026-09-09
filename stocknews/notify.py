@@ -108,6 +108,7 @@ class AlertWindow:
 #   14:00~14:25  단타 실망 매물로 멀쩡한 주가가 인위적으로 눌리는 구간.
 #                스위칭 매수 준비이므로 매집 트랙.
 #   15:20~15:35  종가 확정. 익일 갭을 노린 오버나이트 판단용으로 전 트랙.
+# 일일 상한 = 아래 budget 의 합 (2+3+2+2 = 9). 별도의 전역 일일 예산은 없다.
 WINDOWS: tuple[AlertWindow, ...] = (
     AlertWindow("반대매매", dtime(9, 0), dtime(9, 35),
                 ("VALUE", "BOTH"), 2, "D+2 하한가 투매 진행 중"),
@@ -121,7 +122,7 @@ WINDOWS: tuple[AlertWindow, ...] = (
 
 
 class AlertGate:
-    """G1 점수 · G2 시간창 · G3 종목 쿨다운 · G4 일일 예산."""
+    """G1 점수 · G2 시간창 · G3 종목 쿨다운 · G4 창별 예산 (합 = 일일 상한 9건)."""
 
     def __init__(self, state_path: str | Path = "data/alert_state.json",
                  cfg: Config = DEFAULT, store=None):

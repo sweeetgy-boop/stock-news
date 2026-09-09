@@ -119,7 +119,10 @@ class GateConfig:
 
     value_threshold: float = 8.0   # 매집 트랙 발송 하한
     trend_threshold: float = 8.0   # 추세 트랙 발송 하한
-    daily_budget: int = 3          # 즉시 속보 1일 최대 건수
+    # 일일 상한은 여기 없다. **창별 예산의 합이 일일 상한이다** —
+    # notify.WINDOWS 의 budget 2+3+2+2 = 9건. 예전에 daily_budget=3 이
+    # 있었지만 어디서도 읽지 않는 죽은 값이라 2026-09-09 에 지웠다.
+    # "하루 3건"이라고 믿고 있었다면 실제는 9건이었다.
     cooldown_days: int = 5         # 동일 종목 재발송 금지 기간
     rescore_delta: float = 1.0     # 점수가 이만큼 오르면 쿨다운 예외
     sequence_window: int = 20      # 매집 신호 -> 골든크로스 결합 허용 기간

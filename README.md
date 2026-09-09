@@ -207,6 +207,11 @@ python run_screen.py --mode pos-close --id 1   # 수동 종료
 40  18  * * 5    ... run_screen.py --mode brief-weekly
 ```
 
+잡 하나만 dry-run 으로 돌리려면 `STOCKNEWS_DRY_JOBS=flash` (콤마 구분) 를
+설정한다. `STOCKNEWS_SEND=1` 이어도 지목된 잡만 `--dry-run` 이 붙는다 —
+flash 를 첫날 로그만 보고 켜는 용도다. flash 에 `--no-update` 등을 넘기려면
+`nightly.py` 의 `FLASH_EXTRA_ARGS` 를 바꾼다 (기본 비어 있음).
+
 `brief-morning`에 `--no-collect`를 붙인 이유는 06:00 수집 배치가 이미 돌았기
 때문이다. 수집과 발송을 분리하면 한 소스가 느려도 브리핑 시각이 밀리지 않는다.
 
@@ -502,6 +507,7 @@ DELETE FROM prices WHERE ticker='123456';
 10:00~10:25  방향확정    전 트랙 허용       예산 3   ★ 최우선 · 휩쏘 종료 후
 14:00~14:25  오후눌림    매집(V)·시퀀스만   예산 2   실망매물 스위칭 준비
 15:20~15:35  종가확정    전 트랙 허용       예산 2   오버나이트 판단
+                                    합 9 = 일일 상한 (별도 전역 예산 없음)
 ```
 
 **09시와 10시를 나눈 이유가 핵심이다.** 09:00은 반대매매가 동시호가에
