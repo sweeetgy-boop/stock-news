@@ -1654,8 +1654,82 @@ def test_news():
         for s in (s0, s_multi, s_held, s_kw):
             assert 0.0 <= s <= 10.0, f"중요도 범위 이탈: {s}"
 
+    def t_normalize_url():
+        """중복 판정용 URL 키. oc=5 / www / utm 로 갈리면 안 된다."""
+        from stocknews.news import normalize_url
+        g = "https://news.google.com/rss/articles/CBMiXYZ"
+        assert normalize_url(g + "?oc=5") == normalize_url(g), \
+            "Google 의 oc=5 유무로 키가 갈린다"
+        assert (normalize_url("https://WWW.A.com/x/?utm_source=k")
+                == normalize_url("https://a.com/x")), "www/utm 정규화 실패"
+        assert normalize_url(None) == "" and normalize_url("") == ""
+        assert normalize_url("https://x/1") != normalize_url("https://x/2")
+
+    def t_cluster_crosses_batch():
+        """수집 배치가 달라도 같은 사건이면 같은 클러스터여야 한다.
+
+        2026-09-09 실사고. 아침 브리핑은 최근 16시간을 읽는데 그 창에는
+        수집 실행이 두세 번 들어간다. 클러스터링이 배치 안에서만 돌면
+        같은 기사가 실행마다 다른 cluster_id 를 받아 중복 제거를 통과한다.
+        """
+        tn = "대양금속 제22회 전환사채 전환가액 하향 조정"
+        seeds = [{"id": "old1", "title_norm": tn, "cluster_id": "old1",
+                  "source": "digitaltoday.co.kr"}]
+        out = cluster_items([{"id": "new1", "title_norm": tn,
+                              "source": "디지털투데이"}], seeds=seeds)
+        assert out[0]["cluster_id"] == "old1", \
+            f"배치 경계를 넘지 못했다: {out[0]['cluster_id']}"
+        # 씨앗을 안 주면 옛 동작 그대로 새 클러스터가 생긴다.
+        solo = cluster_items([{"id": "new1", "title_norm": tn, "source": "X"}])
+        assert solo[0]["cluster_id"] == "new1"
+
+    def t_cluster_seed_not_double_counted():
+        """씨앗과 배치에 같은 id 가 있어도 매체 수를 두 번 세지 않는다."""
+        tn = "삼성전자 hbm4 양산 착수"
+        out = cluster_items(
+            [{"id": "a", "title_norm": tn, "source": "매체A"}],
+            seeds=[{"id": "a", "title_norm": tn, "cluster_id": "a",
+                    "source": "매체A"}])
+        assert out[0]["cluster_n"] == 1, \
+            f"같은 행을 두 번 세 매체 수가 부풀었다: {out[0]['cluster_n']}"
+
+    def t_google_strips_media_tail():
+        """Google 제목의 ' - 매체명' 을 뗀다. 네트워크는 쓰지 않는다.
+
+        예전 판은 <source> 가 없을 때만 뗐고, Google 은 거의 항상 <source>
+        를 주므로 사실상 한 번도 떼지 않았다. 그래서 브리핑 제목에
+        'digitaltoday.co.kr' 같은 도메인이 그대로 찍혔다.
+        """
+        from stocknews import news_sources as ns
+
+        class _Res:
+            text = ('<?xml version="1.0"?><rss><channel><item>'
+                    '<title>대양금속, 전환사채 전환가액 하향 조정'
+                    ' - digitaltoday.co.kr</title>'
+                    '<link>https://news.google.com/rss/articles/AAA?oc=5</link>'
+                    '<source url="https://digitaltoday.co.kr">'
+                    'digitaltoday.co.kr</source>'
+                    '</item></channel></rss>')
+
+        orig_get, orig_sleep = ns._get, ns.time.sleep
+        ns._get = lambda url, **kw: _Res()
+        ns.time.sleep = lambda *_a, **_k: None
+        try:
+            out = ns.collect_google(queries=(("q", "KR", "공시"),), per_query=5)
+        finally:
+            ns._get, ns.time.sleep = orig_get, orig_sleep
+        assert out, "수집 결과가 비었다"
+        title = out[0]["title"]
+        assert "digitaltoday.co.kr" not in title, f"꼬리표가 남았다: {title}"
+        assert title.endswith("하향 조정"), title
+        assert out[0]["source"] == "digitaltoday.co.kr", out[0]["source"]
+
     check("news", "제목 정규화", t_normalize)
     check("news", "id 안정성 + 매체 구분", t_make_id)
+    check("news", "URL 정규화 (중복 판정 키)", t_normalize_url)
+    check("news", "클러스터가 수집 배치를 넘음", t_cluster_crosses_batch)
+    check("news", "씨앗 매체 수 중복 집계 방지", t_cluster_seed_not_double_counted)
+    check("news", "Google 제목 매체 꼬리표 제거", t_google_strips_media_tail)
     check("news", "카테고리 분류", t_classify)
     check("news", "사건 클러스터 + 매체 수", t_cluster)
     check("news", "별칭 인덱스 (우선주/모호 배제)", t_alias_index)
@@ -5532,7 +5606,56 @@ def test_renderer(st):
     check("renderer", "주간 리포트", t_weekly)
     check("renderer", "아침/저녁 브리핑", t_briefs)
     check("renderer", "주간 뉴스 테마", t_news_weekly)
+    def t_news_cross_section_dedup():
+        """섹션 필터가 겹쳐도 같은 기사는 브리핑에 한 번만 나온다.
+
+        2026-09-09 아침 브리핑 실측: '매크로·정책' 5건 중 4건이 '밤사이
+        해외' 와 같은 URL 이었다. 섹션마다 seen 집합을 새로 만든 탓이다.
+        """
+        import pandas as pd
+        from stocknews.renderer import _dedup_clusters
+        rows = pd.DataFrame([
+            {"id": "a", "cluster_id": "a", "url": "https://x/1?oc=5",
+             "title_norm": "미 cpi 예상보다 높으면 fomc 금리 오를 것"},
+            {"id": "b", "cluster_id": "b", "url": "https://x/1",
+             "title_norm": "미 cpi 예상보다 높으면 fomc 금리 오를 것"},
+        ])
+        seen: set = set()
+        first = _dedup_clusters(rows, 5, seen=seen)
+        assert len(first) == 1, \
+            f"cluster_id 가 갈린 같은 URL 두 건이 다 남았다: {len(first)}"
+        assert _dedup_clusters(rows, 5, seen=seen) == [], \
+            "다음 섹션에서 같은 기사가 또 나왔다"
+        assert len(_dedup_clusters(rows, 5)) == 1, \
+            "seen 을 안 줘도 섹션 안에서는 막혀야 한다"
+
+    def t_news_title_media_tail():
+        """제목 끝의 매체명만 뗀다. 매체명이 아닌 꼬리는 건드리지 않는다."""
+        from stocknews.renderer import _display_title
+        cut = {"title": "대양금속, 전환사채 조정 - digitaltoday.co.kr",
+               "source": "digitaltoday.co.kr"}
+        assert _display_title(cut) == "대양금속, 전환사채 조정", _display_title(cut)
+        keep = {"title": "코스피 상승 - 종합", "source": "연합뉴스"}
+        assert _display_title(keep) == "코스피 상승 - 종합", \
+            "매체명이 아닌 꼬리를 잘랐다"
+
+    def t_news_line_links_title():
+        """URL 은 제목에 <a href> 로 감는다. 본문에 주소를 찍지 않는다."""
+        from stocknews.renderer import _news_line
+        row = {"id": "a", "category": "공시", "cluster_n": 1,
+               "title": "대양금속, 전환사채 조정 - 디지털투데이",
+               "url": "https://news.google.com/rss/articles/AAA?oc=5",
+               "source": "디지털투데이"}
+        line = _news_line(row, {})
+        assert line.count("https://news.google.com") == 1, line
+        assert '<a href="https://news.google.com/rss/articles/AAA?oc=5">' in line
+        head = line.split("</a>")[0]
+        assert "디지털투데이</a>" not in head, f"제목에 매체 꼬리표: {head}"
+
     check("renderer", "청산 알림/요약", t_exit_render)
+    check("renderer", "브리핑 섹션 간 중복 제거", t_news_cross_section_dedup)
+    check("renderer", "뉴스 제목 매체 꼬리표 제거", t_news_title_media_tail)
+    check("renderer", "뉴스 URL 은 제목 링크로", t_news_line_links_title)
     check("renderer", "보유 현황", t_positions_render)
 
 

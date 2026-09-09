@@ -1316,6 +1316,25 @@ class Store:
         with closing(self._conn()) as con:
             return pd.read_sql_query(q, con, params=params)
 
+    def recent_news_for_cluster(self, hours: int = 48) -> list[dict]:
+        """최근 항목의 `[id, title_norm, cluster_id, source]`.
+
+        `news.cluster_items` 의 씨앗이다. 클러스터링이 수집 배치 안에서만
+        일어나면 같은 기사가 실행마다 다른 cluster_id 를 받고, 최근
+        16시간을 읽는 아침 브리핑에서 중복으로 그대로 노출된다.
+
+        정리에 필요한 네 열만 읽는다. DataFrame 을 만들지 않는 것도
+        같은 이유다 — 이 결과는 파이썬 루프에서만 쓰인다.
+        """
+        cutoff = (_now_kst() - timedelta(hours=int(hours))).isoformat(
+            timespec="seconds")
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT id,title_norm,cluster_id,source FROM news "
+                "WHERE COALESCE(published,collected)>=?", (cutoff,)).fetchall()
+        return [{"id": i, "title_norm": tn, "cluster_id": cid, "source": src}
+                for i, tn, cid, src in rows]
+
     def news_ticker_map(self, news_ids: list[str]) -> pd.DataFrame:
         if not news_ids:
             return pd.DataFrame(columns=["news_id", "ticker", "name"])

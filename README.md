@@ -188,8 +188,8 @@ python run_screen.py --mode pos-close --id 1   # 수동 종료
 배치 등록 (Linux cron)
 
 ```
-20  8   * * 1-5  ... run_screen.py --mode news            # 수집 선행
-30  8   * * 1-5  ... run_screen.py --mode brief-morning --no-collect
+0   6   * * 1-5  ... run_screen.py --mode news            # 수집 선행
+20  6   * * 1-5  ... run_screen.py --mode brief-morning --no-collect
 */5 9,10,14,15 * * 1-5  ... run_screen.py --mode flash   # 4대 시간창
 #   창 밖에서 돌아도 즉시 빈손으로 끝난다. 5분 간격이면 창을 놓치지 않는다.
 0   12  * * 1-5  ... run_screen.py --mode news            # 장중 1회 보강
@@ -207,7 +207,7 @@ python run_screen.py --mode pos-close --id 1   # 수동 종료
 40  18  * * 5    ... run_screen.py --mode brief-weekly
 ```
 
-`brief-morning`에 `--no-collect`를 붙인 이유는 08:20 수집 배치가 이미 돌았기
+`brief-morning`에 `--no-collect`를 붙인 이유는 06:00 수집 배치가 이미 돌았기
 때문이다. 수집과 발송을 분리하면 한 소스가 느려도 브리핑 시각이 밀리지 않는다.
 
 Windows 작업 스케줄러를 쓴다면 같은 시각에 동일 명령을 등록하면 된다.
@@ -233,7 +233,7 @@ Windows 작업 스케줄러를 쓴다면 같은 시각에 동일 명령을 등�
 ```
 [하루 2~3회] news → 수집 → 정규화 → 사건 클러스터 → 종목태깅 → 중요도
                   └─ news / news_tickers 테이블
-[08:30] brief-morning  밤사이 해외 + 매크로 + 내 종목 + 주요 공시
+[06:20] brief-morning  밤사이 해외 + 매크로 + 내 종목 + 주요 공시
 [18:20] brief-evening  국내 공시·수급·테마·시황 + 추천 10선 교차
 [금 18:40] brief-weekly 이번 주 vs 지난 주 테마 건수 변화
 ```
@@ -670,7 +670,7 @@ PC 가 절전/최대 절전으로 들어가면 cron 이 돌지 않는다. 전원
 
 **4. 월요일 아침 브리핑이 주말 뉴스를 놓쳤다**
 
-`hours=16` 이면 월요일 08:30 에 일요일 16:30 이후만 본다. 금요일 장 마감
+`hours=16` 이면 월요일 06:20 에 일요일 14:20 이후만 본다. 금요일 장 마감
 이후 뉴스가 통째로 빠진다. 마지막 거래일 마감 이후를 전부 덮도록 자동
 확장한다(상한 120시간).
 

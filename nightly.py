@@ -172,7 +172,7 @@ JOBS: dict[str, Job] = {
     # 수집 전용. 발송하지 않으므로 중복이 나가도 사람에게 보이지는
     # 않지만, 같은 소스를 하루 두 번 긁을 이유가 없다.
     "news": Job("news", "news", "\U0001f4f0", _one("news", ["--mode", "news"])),
-    # --no-collect: 08:10 news 가 이미 수집했다. 수집과 발송을 분리해야
+    # --no-collect: 06:00 news 가 이미 수집했다. 수집과 발송을 분리해야
     # 한 소스가 느려도 브리핑 시각이 밀리지 않는다.
     "brief-morning": Job("brief-morning", "아침 브리핑", "\U0001f305",
                          _one("brief-morning",

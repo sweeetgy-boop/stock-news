@@ -28,6 +28,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import pandas as pd
 
@@ -35,9 +36,9 @@ log = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 
-__all__ = ["normalize_title", "make_id", "classify", "cluster_items",
-           "build_alias_index", "map_tickers", "score_importance",
-           "process_and_store", "theme_shift"]
+__all__ = ["normalize_title", "make_id", "normalize_url", "classify",
+           "cluster_items", "build_alias_index", "map_tickers",
+           "score_importance", "process_and_store", "theme_shift"]
 
 
 def _to_kst(dt: datetime | None) -> datetime | None:
@@ -84,6 +85,42 @@ def make_id(title_norm: str, source: str) -> str:
     """
     raw = f"{title_norm}|{(source or '').strip().lower()}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+# ─────────────── URL 정규화 (중복 판정 전용) ───────────────
+# 같은 기사가 매체 표기만 달리해 두 건으로 남는다. 2026-09-09 실측:
+# 'digitaltoday.co.kr' 과 '디지털투데이' 가 **같은 Google URL** 로 각각
+# 저장돼 아침 브리핑 '주요 공시' 5칸 중 4칸을 기사 두 개가 차지했다.
+# 같은 URL 인데 행이 갈린 것이 120건이었다.
+#
+# make_id 에서 매체를 빼면 해결되지만 그러면 매체 수 집계가 죽는다 —
+# '몇 개 매체가 다뤘나' 가 중요도 1순위 신호다. 그래서 매체는 해시에
+# 그대로 두고, URL 을 **별도 키**로 세워 같은 URL 을 한 건만 남긴다.
+#
+# 추적 파라미터는 뗀다. Google News RSS 는 같은 기사에 oc=5 를 붙였다
+# 말았다 하고, utm_* 는 유입 경로일 뿐 기사 동일성과 무관하다.
+_TRACKING = re.compile(r"(?:oc|ved|usg|fbclid|gclid|utm_[a-z_]+)\Z", re.I)
+
+
+def normalize_url(url: str | None) -> str:
+    """중복 판정용 URL 키. 표시와 링크에는 언제나 원본을 쓴다."""
+    if not url:
+        return ""
+    raw = str(url).strip()
+    try:
+        p = urlsplit(raw)
+    except ValueError:
+        return raw.lower()
+    if not p.netloc:
+        return raw.lower()
+    host = p.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    query = "&".join(
+        f"{k}={v}" for k, v in sorted(parse_qsl(p.query, keep_blank_values=True))
+        if not _TRACKING.match(k))
+    return urlunsplit((p.scheme.lower() or "https", host,
+                       p.path.rstrip("/"), query, ""))
 
 
 # ══════════════════════════ 2. 카테고리 ══════════════════════════
@@ -144,15 +181,38 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return inter / (len(a) + len(b) - inter)
 
 
-def cluster_items(items: list[dict], threshold: float = 0.55) -> list[dict]:
+def cluster_items(items: list[dict], threshold: float = 0.55,
+                  seeds: list[dict] | None = None) -> list[dict]:
     """같은 사건을 묶는다. 탐욕적 단일 패스 클러스터링.
 
     건수가 하루 수백 건 수준이라 O(n x k) 로 충분하다. 대표 기사는
     클러스터에서 가장 먼저 등장한 항목으로 두고, cluster_n 에 매체 수를 센다.
+
+    seeds
+      이미 DB 에 있는 최근 항목 `[{id, title_norm, cluster_id, source}]`.
+
+      **클러스터가 배치 경계를 넘게 하는 장치다.** 이 인자가 없던 판에서는
+      수집 실행마다 클러스터를 처음부터 다시 만들었다. 아침 브리핑은 최근
+      16시간을 읽는데 그 창에는 수집 실행이 두세 번 들어간다. 그래서 같은
+      기사가 실행마다 다른 cluster_id 를 받았고, 렌더러의 클러스터 중복
+      제거를 그대로 통과했다. 2026-09-09 실측: 같은 URL 인데 클러스터가
+      갈린 것 120건, 같은 정규화 제목인데 갈린 것 142건.
+
+      배치에 이미 있는 id 는 씨앗에서 건너뛴다. 같은 행을 두 번 세면
+      매체 수가 부풀고 중요도가 따라 오른다.
     """
     reps: list[tuple[set[str], str]] = []   # (토큰, cluster_id)
     sizes: dict[str, int] = {}
     sources: dict[str, set[str]] = {}
+
+    batch_ids = {it.get("id") for it in items}
+    for sd in (seeds or []):
+        cid = sd.get("cluster_id") or sd.get("id")
+        if not cid or sd.get("id") in batch_ids:
+            continue
+        reps.append((_tokens(sd.get("title_norm") or ""), cid))
+        sizes[cid] = sizes.get(cid, 0) + 1
+        sources.setdefault(cid, set()).add((sd.get("source") or "").strip())
 
     for it in items:
         tok = _tokens(it.get("title_norm", ""))
@@ -349,6 +409,7 @@ def process_and_store(store, raw_items: list[dict],
 
     # ── 정규화 + 1차 중복 제거 ──
     seen: dict[str, dict] = {}
+    seen_urls: set[str] = set()
     for r in raw_items:
         title = (r.get("title") or "").strip()
         if len(title) < 8:
@@ -359,6 +420,13 @@ def process_and_store(store, raw_items: list[dict],
         nid = make_id(tnorm, r.get("source", ""))
         if nid in seen:
             continue
+        # 같은 URL 이면 같은 기사다. 매체 표기가 갈려 id 가 달라져도
+        # 여기서 접는다. 먼저 들어온 쪽을 남긴다.
+        ukey = normalize_url(r.get("url"))
+        if ukey and ukey in seen_urls:
+            continue
+        if ukey:
+            seen_urls.add(ukey)
         # DB 에는 tz 정보를 뗀 KST naive 문자열로 넣는다. collected 와
         # 형식을 통일해야 news_since 의 문자열 비교가 정상 동작한다.
         pub_kst = _to_kst(r.get("published"))
@@ -381,7 +449,18 @@ def process_and_store(store, raw_items: list[dict],
         }
 
     items = list(seen.values())
-    items = cluster_items(items)
+
+    # 클러스터링은 배치 경계를 넘어야 한다. 최근 항목을 씨앗으로 준다.
+    # 씨앗을 못 얻어도 정리는 계속한다 — 브리핑이 안 나가는 것보다
+    # 중복이 조금 남는 편이 낫다.
+    seeds: list[dict] = []
+    fetch_seeds = getattr(store, "recent_news_for_cluster", None)
+    if callable(fetch_seeds):
+        try:
+            seeds = fetch_seeds(hours=48) or []
+        except Exception as exc:  # noqa: BLE001 - 씨앗은 있으면 좋은 것이다
+            log.warning("클러스터 씨앗 조회 실패(무시하고 진행): %s", exc)
+    items = cluster_items(items, seeds=seeds)
 
     # ── 종목 매핑 + 중요도 ──
     links: list[tuple] = []

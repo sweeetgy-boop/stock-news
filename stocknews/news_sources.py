@@ -225,11 +225,18 @@ def collect_google(queries=GOOGLE_QUERIES, per_query: int = 12) -> list[dict]:
         for it in _parse_feed(res.text)[:per_query]:
             title = it["title"]
             source = it.get("source") or ""
-            # Google 은 "제목 - 매체명" 형태로 붙여주는 경우가 많다
-            if not source and " - " in title:
-                head, _, tail = title.rpartition(" - ")
-                if head and len(tail) <= 20:
-                    title, source = head, tail
+            # Google 은 제목 끝에 " - 매체명" 을 붙인다. <source> 가 있든
+            # 없든 제목에서는 뗀다.
+            #
+            # 예전 판은 `not source` 일 때만 뗐다. 그런데 Google 은 거의
+            # 항상 <source> 를 주므로 사실상 한 번도 떼지 않았다 —
+            # 2026-09-09 실측으로 GOOGLE 출처 1,254건 전부가 꼬리표를 달고
+            # 저장돼 있었다. 그래서 아침 브리핑 제목에 'digitaltoday.co.kr',
+            # 'v.daum.net' 같은 도메인이 그대로 찍혔다.
+            head, sep, tail = title.rpartition(" - ")
+            if sep and head and len(tail) <= 20:
+                title = head
+                source = source or tail
             out.append({
                 "title": title,
                 "url": it["url"],

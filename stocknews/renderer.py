@@ -11,6 +11,7 @@ import unicodedata
 
 from .config import Config, DEFAULT
 from .contracts import RULE_NAME, ScreenResult
+from .news import normalize_url
 
 __all__ = ["bar", "render_detail", "render_digest", "render_fib_list"]
 
@@ -662,12 +663,35 @@ CATEGORY_ICON = {
 }
 
 
+def _display_title(row) -> str:
+    """표시용 제목. 끝에 붙은 ' - 매체명' 을 뗀다.
+
+    Google News 는 제목에 매체명을 붙여 준다. 2026-09-09 아침 브리핑에는
+    '… - digitaltoday.co.kr', '… - v.daum.net' 처럼 **도메인이 제목에
+    그대로** 찍혔다. 수집 단계(news_sources.collect_google)에서 떼도록
+    고쳤지만, 그 전에 저장된 행이 DB 에 남아 있다. 브리핑은 최근 16시간을
+    읽으므로 고친 직후 한동안은 옛 행이 섞인다. 그래서 여기서도 막는다.
+
+    꼬리표가 **그 행의 매체명과 정확히 같을 때만** 뗀다. 정규식으로 끝을
+    자르면 '… - 종합' 같은 실제 제목 일부를 잘라낼 수 있다.
+    """
+    title = str(row["title"] or "").strip()
+    src = str(row.get("source") or "").strip()
+    if src and title.endswith(f" - {src}"):
+        return title[: -(len(src) + 3)].strip() or title
+    return title
+
+
 def _news_line(row, tick_map: dict, show_source: bool = True) -> str:
-    """뉴스 1건 1~2줄. 클러스터 크기와 종목 태그를 붙인다."""
+    """뉴스 1건 1~2줄. 클러스터 크기와 종목 태그를 붙인다.
+
+    URL 은 제목에 <a href> 로 감는다. 본문에 주소를 찍지 않는다 —
+    Google News RSS 주소는 한 건이 400자를 넘어 메시지를 잡아먹는다.
+    """
     icon = CATEGORY_ICON.get(row["category"], "•")
     n = int(row.get("cluster_n") or 1)
     multi = f" <i>({n}개 매체)</i>" if n >= 2 else ""
-    title = _e(str(row["title"])[:110])
+    title = _e(_display_title(row)[:110])
     line = f"{icon} <a href=\"{_e(row['url'] or '')}\">{title}</a>{multi}"
     tags = tick_map.get(row["id"]) or []
     sub = []
@@ -680,17 +704,39 @@ def _news_line(row, tick_map: dict, show_source: bool = True) -> str:
     return line + ("\n   " + " ".join(sub) if sub else "")
 
 
-def _dedup_clusters(df, limit: int):
-    """클러스터당 대표 1건만 남긴다. 같은 사건이 반복 노출되는 걸 막는다."""
+def _dedup_clusters(df, limit: int, seen: set | None = None):
+    """클러스터당 대표 1건만 남긴다. 같은 사건이 반복 노출되는 걸 막는다.
+
+    seen
+      **섹션 사이에 공유하는 집합.** 브리핑의 섹션 필터는 서로 겹친다 —
+      미국 매크로 기사는 '밤사이 해외'(region)와 '매크로·정책'(category)에
+      동시에 걸리고, 중요한 공시는 '내 종목·고중요도'와 '주요 공시'에 함께
+      걸린다. 섹션마다 집합을 새로 만들던 판에서는 그게 그대로 두 번
+      찍혔다. 2026-09-09 아침 브리핑 실측: 매크로 5건 중 4건이 해외 섹션과
+      **같은 URL** 이었다. 먼저 오는 섹션이 가져간다.
+
+      None 이면 섹션 안에서만 막는다(옛 동작).
+
+    cluster_id 만 보면 부족하다. 수집 배치가 다르면 같은 기사가 다른
+    cluster_id 를 받은 행이 DB 에 남아 있다(고치기 전에 쌓인 분). 정규화
+    URL 과 정규화 제목도 같이 열쇠로 쓴다.
+    """
     if df is None or df.empty:
         return []
-    seen: set = set()
+    if seen is None:
+        seen = set()
     out = []
     for _, r in df.iterrows():
-        cid = r.get("cluster_id") or r["id"]
-        if cid in seen:
+        keys = {("c", r.get("cluster_id") or r["id"])}
+        url = normalize_url(r.get("url"))
+        if url:
+            keys.add(("u", url))
+        tnorm = str(r.get("title_norm") or "").strip()
+        if tnorm:
+            keys.add(("t", tnorm))
+        if keys & seen:
             continue
-        seen.add(cid)
+        seen |= keys
         out.append(r)
         if len(out) >= limit:
             break
@@ -733,8 +779,10 @@ def render_morning_brief(store, asof, hours: int = 16,
         ("🎯 내 종목·고중요도", mine),
         ("📄 주요 공시", disclosure),
     )
+    # 섹션 필터가 서로 겹치므로 집합 하나를 전 섹션이 공유한다.
+    seen: set = set()
     for label, sub in sections:
-        rows = _dedup_clusters(sub, per_section)
+        rows = _dedup_clusters(sub, per_section, seen=seen)
         if not rows:
             continue
         tm = _tick_map(store, rows)
@@ -766,9 +814,10 @@ def render_evening_brief(store, asof, picks: list | None = None,
         ["반도체", "2차전지", "방산조선", "바이오", "전력AI"])]
     market = df[df["category"].isin(["국내시황", "실적"])]
 
+    seen: set = set()
     for label, sub in (("📄 공시", disclosure), ("💧 수급", flow),
                        ("🏭 테마·업종", theme), ("📊 시황·실적", market)):
-        rows = _dedup_clusters(sub, per_section)
+        rows = _dedup_clusters(sub, per_section, seen=seen)
         if not rows:
             continue
         tm = _tick_map(store, rows)

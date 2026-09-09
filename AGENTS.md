@@ -177,8 +177,8 @@ Hermes cron  ->  stocknews_nightly.py  ->  hermes\nightly.cmd
 
 ```
 잡 이름                     cron              KST         스크립트
-stock-news-news             10 8 * * 1-5      평일 08:10  stocknews_news.py
-stock-news-brief-morning    30 8 * * 1-5      평일 08:30  stocknews_brief_morning.py
+stock-news-news             0 6 * * 1-5       평일 06:00  stocknews_news.py
+stock-news-brief-morning    20 6 * * 1-5      평일 06:20  stocknews_brief_morning.py
 stock-news-flash            */5 9-15 * * 1-5  평일 5분    stocknews_flash.py    [paused]
 stock-news-nightly          30 21 * * *       매일 21:30  stocknews_nightly.py
 stock-news-brief-evening    30 22 * * 1-5     평일 22:30  stocknews_brief_evening.py
@@ -188,9 +188,17 @@ stock-news-weekly           45 22 * * 5       금 22:45    stocknews_weekly.py
 ### 왜 이 시각인가
 
 ```
-08:10 news        개장 전 수집. 브리핑보다 20분 앞이면 news 가 느려도
+06:00 news        개장 전 수집. 브리핑보다 20분 앞이면 news 가 느려도
                   (실측 42~53초) 브리핑 시각이 밀리지 않는다.
-08:30 brief-morning  --no-collect. 개장(09:00) 전.
+06:20 brief-morning  --no-collect. 개장(09:00) 전.
+
+                  ★ 2026-09-09 까지 이 둘의 순서가 뒤집혀 있었다. 문서에는
+                  08:10 news / 08:30 brief-morning 으로 적혀 있었지만 실제
+                  등록은 brief-morning 이 20 6(06:20), news 가 10 8(08:10)
+                  이었다. brief-morning 은 --no-collect 라 수집을 하지
+                  않으므로, 매일 아침 **전날 밤 수집분으로** 브리핑이
+                  나갔다. 시각을 바꿀 때는 `hermes cron list` 로 실제
+                  등록값을 먼저 확인하십시오 — 이 표는 문서일 뿐입니다.
 09:00~15:55 flash    notify.WINDOWS 의 4대 창(09:00~09:35 / 10:00~10:25 /
                   14:00~14:25 / 15:20~15:35)을 전부 덮는다. 창 밖 호출은
                   즉시 {"skipped":true} 로 끝난다.
@@ -294,7 +302,7 @@ master -> update -> flags -> credit-kiwoom -> stock-flow(미구현, 스킵)
 
 `brief-morning` · `brief-evening` · `weekly` · `flash` 는 `STEPS` 에
 없습니다. nightly 안에서 돌지 않고 **각자 Hermes cron 잡**으로 돕니다
-(위 표). `news` 는 양쪽에 다 있습니다 — 08:10 잡은 개장 전 수집이고,
+(위 표). `news` 는 양쪽에 다 있습니다 — 06:00 잡은 개장 전 수집이고,
 nightly 의 news 단계는 저녁 브리핑용 재수집입니다. 마커가 잡별로
 갈려 있어 서로를 막지 않습니다.
 
