@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import unquote
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -43,6 +44,7 @@ NUM_OF_ROWS = 100
 TIMEOUT = 15.0
 
 __all__ = ["API_URL", "ENV_KEY", "SOURCE", "fetch_holidays", "parse_response",
+           "normalize_key",
            "refresh_holidays", "extra_market_holiday", "holiday_name"]
 
 
@@ -84,11 +86,25 @@ def parse_response(data: dict, num_of_rows: int = NUM_OF_ROWS) -> tuple[list[dic
     return rows, meta
 
 
+def normalize_key(key: str) -> str:
+    """data.go.kr 는 키를 Encoding/Decoding 두 형태로 준다. 여기서는 **Decoding
+    키**가 필요하다 — requests 가 params 를 인코딩하므로 Encoding 키를 주면
+    '%2B' 가 '%252B' 로 두 번 인코딩돼 '등록되지 않은 서비스키'(403)가 난다.
+    2026-09-09 실측. '%' 가 있고 '+', '/' 가 없으면 Encoding 키로 보고 디코딩한다.
+    """
+    k = (key or "").strip()
+    if "%" in k and not any(ch in k for ch in "+/"):
+        log.info("%s 가 Encoding 형태라 디코딩해서 씁니다 (.env 에는 Decoding 키 권장)", ENV_KEY)
+        return unquote(k)
+    return k
+
+
 def fetch_holidays(year: int, key: str | None = None) -> tuple[list[dict], dict]:
     """한 해 공휴일. (행 목록, 메타). 키가 없으면 ValueError."""
     key = key or os.getenv(ENV_KEY)
     if not key:
         raise ValueError(f"{ENV_KEY} 미설정 — .env 에 넣으십시오 (발급: data.go.kr)")
+    key = normalize_key(key)
     res = requests.get(API_URL, params={
         "ServiceKey": key,            # 명세대로 대문자 S
         "solYear": f"{int(year):04d}",

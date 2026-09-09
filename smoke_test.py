@@ -2297,6 +2297,23 @@ def test_holidays(tmp: Path):
         assert seen["params"]["_type"] == "json" and "solMonth" not in seen["params"]
         assert len(rows) == 2
 
+    def t_encoding_key_is_unquoted():
+        """Encoding 키(%2B…)가 들어오면 디코딩해서 params 로 보낸다. 2026-09-09 403 회귀."""
+        assert H.normalize_key("a%2Bb%2Fc%3D%3D") == "a+b/c=="
+        assert H.normalize_key("a+b/c==") == "a+b/c=="          # Decoding 키는 그대로
+        assert H.normalize_key("plainkey123") == "plainkey123"
+        seen = {}
+        class _R:
+            status_code = 200
+            def json(self): return SAMPLE
+        s_get = H.requests.get
+        try:
+            H.requests.get = lambda url, params=None, timeout=None: (seen.update(params=params), _R())[1]
+            H.fetch_holidays(2026, key="k%2Be%2Fy%3D")
+        finally:
+            H.requests.get = s_get
+        assert seen["params"]["ServiceKey"] == "k+e/y=", seen["params"]["ServiceKey"]
+
     def t_no_key_is_precond():
         import os
         saved = os.environ.pop(H.ENV_KEY, None)
@@ -2318,6 +2335,7 @@ def test_holidays(tmp: Path):
     check("holidays", "테이블 비어도 프로브 정상", t_empty_table_falls_through_to_probe)
     check("holidays", "API 실패가 판정을 막지 않음", t_api_failure_does_not_block)
     check("holidays", "키는 params 로 (URL 조립 금지)", t_params_not_url)
+    check("holidays", "Encoding 키는 디코딩해서 사용 (403 회귀)", t_encoding_key_is_unquoted)
     check("holidays", "키 없으면 ValueError", t_no_key_is_precond)
 
 
