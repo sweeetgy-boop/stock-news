@@ -1945,14 +1945,21 @@ def test_dart_markets():
     from stocknews import news_sources as NS
 
     def t_default_off():
-        """기본값은 코스피만. 코넥스는 어떤 설정에도 없다."""
-        assert C.DART_MARKETS == ("Y",), \
-            f"기본 OFF 여야 한다 (오늘 nightly 종전대로): {C.DART_MARKETS}"
-        assert "N" not in C.DART_MARKETS
-        assert C.DART_KOSDAQ_ENABLED_ON is None, \
-            "켜지 않았는데 ON 날짜가 적혀 있다"
+        """설정 정합성. 코넥스는 어떤 설정에도 없고, 코스닥을 켰으면 기준일이 있어야 한다."""
+        assert C.DART_MARKETS[0] == "Y", f"코스피가 먼저여야 한다: {C.DART_MARKETS}"
+        assert "N" not in C.DART_MARKETS, "코넥스는 유니버스 밖이다"
+        if "K" in C.DART_MARKETS:
+            assert C.DART_KOSDAQ_ENABLED_ON, \
+                "코스닥을 켰는데 채점 구분 기준일(DART_KOSDAQ_ENABLED_ON)이 비어 있다"
+            from datetime import date
+            date.fromisoformat(C.DART_KOSDAQ_ENABLED_ON)   # YYYY-MM-DD 형식
+        else:
+            assert C.DART_KOSDAQ_ENABLED_ON is None, "켜지 않았는데 ON 날짜가 적혀 있다"
         assert set(C.DART_LIST_MAX_PAGES) >= {"Y", "K"}
         assert set(C.DART_NEWS_MAX_PAGES) >= {"Y", "K"}
+        # 2026-09-09 실측: 60일 소급에 Y 105페이지 · K 113페이지가 필요하다.
+        assert C.DART_LIST_MAX_PAGES["Y"] >= 105 and C.DART_LIST_MAX_PAGES["K"] >= 113, \
+            f"페이지 상한이 실측 필요량 아래다 (11일치 절단 결함 재발): {C.DART_LIST_MAX_PAGES}"
 
     def _fake_pages(seen: list, per_market: dict):
         """corp_cls 별로 per_market[시장] 페이지를 흘려주는 가짜 _dart_get."""
@@ -2046,7 +2053,7 @@ def test_dart_markets():
         assert ms.index("K") > ms.index("Y"), f"순서가 틀렸다: {ms}"
         assert {o["stock_code"] for o in out} == {"Y00001", "K00001"}, out
 
-    check("dart", "기본 OFF (Y만) · 코넥스 없음 · ON 날짜 비어 있음", t_default_off)
+    check("dart", "설정 정합성 (Y 선행 · N 없음 · ON 기준일 · 페이지 상한)", t_default_off)
     check("dart", "flags: Y 다음 K 순회 + 코스닥 증자 적중", t_flags_iterates_y_then_k)
     check("dart", "flags: N 건너뜀 + 시장별 페이지 상한", t_flags_skips_konex_and_respects_pages)
     check("dart", "flags: 기본 인자는 config 를 따름", t_flags_default_uses_config)
