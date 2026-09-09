@@ -366,6 +366,151 @@ class DividendConfig:
     recovery_years: int = DIV_RECOVERY_YEARS
 
 
+# ══════════════════════════ 뉴스 중복 제거 ══════════════════════════
+# 매체명 정규화표 (도메인 -> 표시명).
+#
+# Google News RSS 는 같은 매체를 피드마다 도메인으로도 주고 한글 이름으로도
+# 준다. 표기가 갈리면 두 가지가 깨진다.
+#   (1) 같은 기사가 두 건으로 남는다 — make_id 가 (정규화 제목|매체) 해시다.
+#   (2) 클러스터의 '매체 수'가 부풀어 중요도가 따라 오른다.
+#
+# 이 표는 추측이 아니라 **같은 URL 을 공유한 source 짝**에서 자동 도출했다
+# (2026-09-09 · news 2,316행 -> 67쌍). 포털/애그리게이터(네이트 · 네이버금융
+# · v.daum.net 등)는 원 기사의 매체가 아니라 재배포처라 도출에서 뺐다.
+#
+# 표에 없는 도메인은 **그대로 둔다.** 도메인에서 한글 매체명을 기계적으로
+# 만들어낼 방법은 없고, 틀린 이름을 지어내는 것보다 도메인이 그대로 보이는
+# 편이 낫다. 새 짝이 보이면 여기에 줄을 추가하면 된다.
+MEDIA_ALIASES: dict[str, str] = {
+    "ajunews.com": "아주경제",
+    "asiatoday.co.kr": "아시아투데이",
+    "banronbodo.com": "반론보도닷컴",
+    "biz.chosun.com": "Chosunbiz",
+    "biz.heraldcorp.com": "헤럴드경제",
+    "biz.sbs.co.kr": "SBS Biz",
+    "blockmedia.co.kr": "블록미디어",
+    "businesspost.co.kr": "비즈니스포스트",
+    "cbci.co.kr": "CBC뉴스",
+    "ceomagazine.co.kr": "CEONEWS",
+    "choicenews.co.kr": "초이스경제",
+    "chosundaily.com": "미주조선일보",
+    "coinreaders.com": "코인리더스",
+    "daily25news.com": "데일리25",
+    "ddaily.co.kr": "디지털데일리",
+    "digitaltoday.co.kr": "디지털투데이",
+    "donga.com": "동아일보",
+    "econovill.com": "ER 이코노믹리뷰",
+    "ekoreanews.co.kr": "이코리아",
+    "etoday.co.kr": "이투데이",
+    "financialpost.co.kr": "파이낸셜포스트",
+    "g-enews.com": "글로벌이코노믹",
+    "goodkyung.com": "굿모닝경제",
+    "greened.kr": "녹색경제신문",
+    "hankyung.com": "한국경제",
+    "hansbiz.co.kr": "한스경제",
+    "hellot.net": "헬로티",
+    "hkn24.com": "헬스코리아뉴스",
+    "icnweb.kr": "아이씨엔매거진",
+    "idomin.com": "경남도민일보",
+    "ikld.kr": "국토일보",
+    "infostockdaily.co.kr": "인포스탁데일리",
+    "kbthink.com": "KB Think",
+    "kidd.co.kr": "산업일보",
+    "koreapost.co.kr": "코리아포스트 한글판",
+    "kr.benzinga.com": "Benzinga",
+    "livebiz.today": "생생비즈플러스",
+    "m-economynews.com": "M이코노미뉴스",
+    "m-i.kr": "매일일보",
+    "market-ink.co.kr": "마켓잉크",
+    "medworld.co.kr": "메드월드뉴스",
+    "moneyneversleeps.co.kr": "머니네버슬립",
+    "mt.co.kr": "머니투데이",
+    "namdonews.com": "남도일보",
+    "newneek.co": "뉴닉",
+    "news.einfomax.co.kr": "연합인포맥스",
+    "news.mtn.co.kr": "MTN 머니투데이방송",
+    "news2day.co.kr": "뉴스투데이",
+    "newspim.com": "뉴스핌",
+    "pinpointnews.co.kr": "핀포인트뉴스",
+    "polinews.co.kr": "폴리뉴스 Polinews",
+    "sankyungtoday.com": "산경투데이",
+    "sanupin-news.kr": "산업인뉴스",
+    "sedaily.com": "서울경제",
+    "segye.com": "세계일보",
+    "segyebiz.com": "세계비즈",
+    "seoul.co.kr": "서울신문",
+    "sisajournal-e.com": "시사저널e",
+    "smedaily.co.kr": "중소기업신문",
+    "specialtimes.co.kr": "스페셜타임스",
+    "speconomy.com": "스페셜경제",
+    "straightnews.co.kr": "스트레이트뉴스",
+    "techflowpost.com": "深潮TechFlow",
+    "thebigdata.co.kr": "빅데이터뉴스",
+    "theviewers.co.kr": "뷰어스",
+    "topstarnews.net": "톱스타뉴스",
+    "youthdaily.co.kr": "청년일보",
+    # ── 아래는 위 자동 도출에 잡히지 않았으나 도메인이 자명한 국내 주요
+    #    매체다. 같은 URL 짝이 관측되지 않았을 뿐이라 손으로 넣었다. ──
+    "edaily.co.kr": "이데일리",
+    "mk.co.kr": "매일경제",
+    "chosun.com": "조선일보",
+    "joongang.co.kr": "중앙일보",
+    "yna.co.kr": "연합뉴스",
+    "newsis.com": "뉴시스",
+    "news1.kr": "뉴스1",
+    "fnnews.com": "파이낸셜뉴스",
+    "asiae.co.kr": "아시아경제",
+    "etnews.com": "전자신문",
+    "inews24.com": "아이뉴스24",
+    "heraldcorp.com": "헤럴드경제",
+    "dt.co.kr": "디지털타임스",
+    "hani.co.kr": "한겨레",
+    "khan.co.kr": "경향신문",
+    "munhwa.com": "문화일보",
+}
+
+# 대표 기사 선정에 쓰는 주요 매체. 순위표가 아니라 집합이다 — 이 안에
+# 들면 대표 후보에서 한 칸 앞선다. 매체에 점수를 매기는 게 아니므로
+# 세부 서열은 두지 않는다. (교리: 뉴스에는 점수를 매기지 않는다)
+MAJOR_MEDIA: frozenset[str] = frozenset({
+    "연합뉴스", "연합인포맥스", "뉴시스", "뉴스1", "매일경제", "매일경제 마켓",
+    "한국경제", "서울경제", "이데일리", "파이낸셜뉴스", "머니투데이",
+    "아시아경제", "헤럴드경제", "조선일보", "Chosunbiz", "중앙일보",
+    "동아일보", "전자신문", "비즈니스포스트", "인포스탁데일리",
+    "DART", "네이버금융", "Yahoo Finance", "Reuters", "Bloomberg",
+})
+
+
+@dataclass(frozen=True)
+class NewsDedupConfig:
+    """뉴스 중복 제거 3층 파라미터.
+
+    3층(같은 사건 묶기)의 임계값은 픽스처
+    `tests/fixtures/news_brief_20260909.json` (187건) 으로 맞췄다.
+    바꾸면 그 회귀 검사부터 다시 보십시오.
+
+    왜 Jaccard 하나로 안 되는가
+    --------------------------
+    실측한 사례:
+      A "중동 확전 우려 뉴욕증시 하락…유가 100달러 육박·엔화 급등"
+      B "뉴욕증시, 국제 유가 상승에 하락 출발…다우, 0.88%↓"
+    사람이 보면 같은 사건인데 토큰 Jaccard 는 **0.214** 다. 공통 토큰이
+    {뉴욕증시, 유가, 하락} 3개인데 합집합이 14개라 분모가 커진다. 이걸
+    묶으려고 임계값을 0.21 까지 내리면 관계없는 기사들이 줄줄이 붙는다
+    (실측: 오병합 후보가 5개 -> 12개).
+
+    그래서 두 번째 통로를 둔다. **공통 토큰이 충분히 많고(>=3) 짧은 쪽
+    제목의 상당 부분(>=0.40)이 겹치면** 같은 사건으로 본다. 위 사례는
+    포함도 3/7 = 0.429 로 통과한다. 긴 제목이 짧은 제목을 삼키는 것을
+    막기 위해 절대 개수(min_shared_tokens)를 함께 걸었다.
+    """
+
+    sim_threshold: float = 0.50       # 1통로: 토큰 Jaccard
+    min_shared_tokens: int = 3        # 2통로: 공통 토큰 최소 개수
+    min_containment: float = 0.40     # 2통로: 짧은 쪽 기준 포함도
+    seed_hours: int = 48              # 배치 경계를 넘기 위한 씨앗 조회 구간
+
+
 @dataclass(frozen=True)
 class Config:
     ma: MAConfig = MAConfig()
@@ -376,6 +521,7 @@ class Config:
     audit: AuditConfig = AuditConfig()
     sector: SectorConfig = SectorConfig()
     news_freq: NewsFreqConfig = NewsFreqConfig()
+    news_dedup: NewsDedupConfig = NewsDedupConfig()
     dividend: DividendConfig = DividendConfig()
 
 

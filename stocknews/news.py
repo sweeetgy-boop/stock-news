@@ -32,11 +32,15 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import pandas as pd
 
+from .config import (DEFAULT, MAJOR_MEDIA, MEDIA_ALIASES,
+                     Config, NewsDedupConfig)
+
 log = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 
-__all__ = ["normalize_title", "make_id", "normalize_url", "classify",
+__all__ = ["normalize_title", "make_id", "normalize_url", "canonical_source",
+           "event_tokens", "same_event", "representative_rank", "classify",
            "cluster_items", "build_alias_index", "map_tickers",
            "score_importance", "process_and_store", "theme_shift"]
 
@@ -123,6 +127,36 @@ def normalize_url(url: str | None) -> str:
                        p.path.rstrip("/"), query, ""))
 
 
+# ─────────────── 2층: 매체명 정규화 ───────────────
+_DOMAINISH = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.I)
+
+
+def canonical_source(source: str | None,
+                     aliases: dict | None = None) -> str:
+    """매체 표기를 하나로 모은다. 'digitaltoday.co.kr' -> '디지털투데이'.
+
+    Google News 는 같은 매체를 피드마다 도메인으로도, 한글 이름으로도 준다.
+    표기가 갈리면 (1) 같은 기사가 두 건으로 남고 (2) 클러스터 매체 수가
+    부풀어 중요도가 따라 오른다.
+
+    표(config.MEDIA_ALIASES)에 없는 도메인은 **그대로 돌려준다.** 도메인에서
+    한글 매체명을 기계적으로 만들 방법은 없다. 틀린 이름을 지어내느니
+    도메인이 보이는 편이 낫고, 새 짝은 표에 한 줄 넣으면 된다.
+    """
+    s = (source or "").strip()
+    if not s:
+        return ""
+    table = MEDIA_ALIASES if aliases is None else aliases
+    key = s.lower()
+    if key in table:
+        return table[key]
+    if _DOMAINISH.match(s):
+        bare = key[4:] if key.startswith("www.") else key
+        if bare in table:
+            return table[bare]
+    return s
+
+
 # ══════════════════════════ 2. 카테고리 ══════════════════════════
 # 순서가 우선순위다. 앞에서 걸리면 뒤는 안 본다.
 CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -169,9 +203,43 @@ def classify(title: str, hint: str | None = None) -> str:
 _STOP = {"이", "그", "저", "및", "등", "the", "a", "of", "to", "in", "for",
          "on", "and", "is", "억", "원", "만", "천", "조"}
 
+# 조사·어미. 긴 것부터 떼야 '에서'가 '에'로 먼저 잘리지 않는다.
+#
+# 한국어 헤드라인은 같은 사건을 써도 조사가 달라붙어 토큰이 어긋난다.
+# '유가 급등에' 와 '유가 상승에' 는 '급등에'/'상승에' 로 남아 '유가' 만
+# 겹치는 식이다. 형태소 분석기를 넣지 않고(의존성 추가 금지) 꼬리만 뗀다.
+_JOSA = ("으로부터", "에서부터", "에서는", "으로는", "에서도", "으로", "에서",
+         "에는", "에게", "한테", "까지", "부터", "보다", "이나", "마다",
+         "처럼", "같이", "은", "는", "이", "가", "을", "를", "에", "의",
+         "와", "과", "도", "만", "로")
+# 순수 숫자 토큰(등락률·지수·시각)은 사건 식별에 쓸모가 없다. 같은 사건을
+# 다룬 기사들이 '1 18' / '0 88' 처럼 서로 다른 숫자를 달고 나오므로
+# 남겨두면 분모만 키워 유사도를 떨어뜨린다.
+_NUMERIC = re.compile(r"^\d+$")
+
+
+def _strip_josa(word: str) -> str:
+    for j in _JOSA:
+        if len(word) > len(j) + 1 and word.endswith(j):
+            return word[: -len(j)]
+    return word
+
+
+def event_tokens(title_norm: str) -> set[str]:
+    """사건 비교용 토큰. 조사를 떼고 순수 숫자를 버린다."""
+    out: set[str] = set()
+    for w in (title_norm or "").split():
+        if _NUMERIC.match(w):
+            continue
+        w = _strip_josa(w)
+        if len(w) > 1 and w not in _STOP:
+            out.add(w)
+    return out
+
 
 def _tokens(title_norm: str) -> set[str]:
-    return {w for w in title_norm.split() if len(w) > 1 and w not in _STOP}
+    """옛 이름. event_tokens 로 대체됐다."""
+    return event_tokens(title_norm)
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -181,9 +249,64 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return inter / (len(a) + len(b) - inter)
 
 
-def cluster_items(items: list[dict], threshold: float = 0.55,
+# 회차 식별자. '제22회 전환사채' 와 '제25회 전환사채' 는 문구가 거의
+# 같지만 **다른 공시**다. 회차가 서로 다르면 유사도가 아무리 높아도
+# 묶지 않는다. 이 가드가 없으면 두 건의 Jaccard 가 0.45, 포함도가 0.625 라
+# 2통로로 붙어버린다.
+_SERIAL = re.compile(r"(?:제\s*)?(\d+)\s*(?:회차|회|차)(?![가-힣])")
+
+
+def event_serials(title: str | None) -> set[str]:
+    """제목에서 회차 번호를 뽑는다. 없으면 빈 집합."""
+    return set(_SERIAL.findall(title or ""))
+
+
+def same_event(a: set[str], b: set[str],
+               cfg: NewsDedupConfig | None = None) -> float:
+    """두 제목이 같은 사건인가. 0.0 이면 아니다.
+
+    통로가 둘이다.
+      ① 토큰 Jaccard >= sim_threshold
+      ② 공통 토큰 >= min_shared_tokens **그리고**
+         짧은 쪽 기준 포함도 >= min_containment
+
+    ②가 필요한 이유는 NewsDedupConfig 독스트링에 실측과 함께 적어 뒀다.
+    한 줄로 줄이면: 같은 사건이라도 한쪽 제목이 길면 Jaccard 의 분모가
+    커져 0.21 까지 떨어진다.
+    """
+    cfg = cfg or DEFAULT.news_dedup
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if not inter:
+        return 0.0
+    jac = inter / (len(a) + len(b) - inter)
+    if jac >= cfg.sim_threshold:
+        return jac
+    cont = inter / min(len(a), len(b))
+    if inter >= cfg.min_shared_tokens and cont >= cfg.min_containment:
+        return cont
+    return 0.0
+
+
+def representative_rank(row, has_ticker: bool = False,
+                        major: frozenset | None = None) -> tuple:
+    """대표 기사 정렬 키. **작을수록** 대표에 가깝다.
+
+    내 종목 언급 > 주요 매체 > 먼저 수집된 것.
+
+    매체에 점수를 매기는 게 아니다. 같은 사건을 여럿이 썼을 때 어느 한
+    줄을 보여줄지 고르는 것뿐이고, 중요도 산정에는 관여하지 않는다.
+    """
+    major = MAJOR_MEDIA if major is None else major
+    src = canonical_source(row.get("source"))
+    when = str(row.get("collected") or row.get("published") or "~")
+    return (0 if has_ticker else 1, 0 if src in major else 1, when)
+
+
+def cluster_items(items: list[dict], cfg: NewsDedupConfig | None = None,
                   seeds: list[dict] | None = None) -> list[dict]:
-    """같은 사건을 묶는다. 탐욕적 단일 패스 클러스터링.
+    """같은 사건을 묶는다 (3층). 탐욕적 단일 패스 클러스터링.
 
     건수가 하루 수백 건 수준이라 O(n x k) 로 충분하다. 대표 기사는
     클러스터에서 가장 먼저 등장한 항목으로 두고, cluster_n 에 매체 수를 센다.
@@ -200,39 +323,58 @@ def cluster_items(items: list[dict], threshold: float = 0.55,
 
       배치에 이미 있는 id 는 씨앗에서 건너뛴다. 같은 행을 두 번 세면
       매체 수가 부풀고 중요도가 따라 오른다.
+
+    가드
+      회차가 서로 다르거나(제22회 CB vs 제25회 CB), 태깅된 종목이 겹치지
+      않으면 유사도를 보지 않고 자른다. 3층 임계를 낮추면 이 두 가지가
+      가장 먼저 오병합으로 나타난다.
     """
-    reps: list[tuple[set[str], str]] = []   # (토큰, cluster_id)
+    cfg = cfg or DEFAULT.news_dedup
+    # (토큰, 회차, 종목코드, cluster_id)
+    reps: list[tuple[set[str], set[str], set[str], str]] = []
     sizes: dict[str, int] = {}
     sources: dict[str, set[str]] = {}
+
+    def _codes(d) -> set[str]:
+        return {c for c, _ in (d.get("tickers") or ())}
 
     batch_ids = {it.get("id") for it in items}
     for sd in (seeds or []):
         cid = sd.get("cluster_id") or sd.get("id")
         if not cid or sd.get("id") in batch_ids:
             continue
-        reps.append((_tokens(sd.get("title_norm") or ""), cid))
+        reps.append((event_tokens(sd.get("title_norm") or ""),
+                     event_serials(sd.get("title")), _codes(sd), cid))
         sizes[cid] = sizes.get(cid, 0) + 1
-        sources.setdefault(cid, set()).add((sd.get("source") or "").strip())
+        sources.setdefault(cid, set()).add(canonical_source(sd.get("source")))
 
     for it in items:
-        tok = _tokens(it.get("title_norm", ""))
-        cid = None
-        best = 0.0
-        for rtok, rcid in reps:
-            s = _jaccard(tok, rtok)
+        tok = event_tokens(it.get("title_norm", ""))
+        ser = event_serials(it.get("title"))
+        cod = _codes(it)
+        cid, best = None, 0.0
+        for rtok, rser, rcod, rcid in reps:
+            # 가드 — 유사도를 보기 전에 자른다.
+            if ser and rser and not (ser & rser):
+                continue          # 회차가 다르면 다른 공시다
+            if cod and rcod and not (cod & rcod):
+                continue          # 태깅된 종목이 겹치지 않으면 다른 사건이다
+            s = same_event(tok, rtok, cfg)
             if s > best:
                 best, cid = s, rcid
-        if cid is None or best < threshold:
+        if cid is None:
             cid = it["id"]
-            reps.append((tok, cid))
+            reps.append((tok, ser, cod, cid))
         it["cluster_id"] = cid
         sizes[cid] = sizes.get(cid, 0) + 1
-        sources.setdefault(cid, set()).add((it.get("source") or "").strip())
+        sources.setdefault(cid, set()).add(canonical_source(it.get("source")))
 
     for it in items:
         cid = it["cluster_id"]
         # 매체 수를 센다. 같은 매체의 후속 기사는 중복으로 보지 않는다.
-        it["cluster_n"] = max(len(sources.get(cid, ())), 1)
+        # 표기 정규화를 거치므로 '디지털투데이'와 'digitaltoday.co.kr'이
+        # 두 매체로 세어지지 않는다.
+        it["cluster_n"] = max(len({s for s in sources.get(cid, ()) if s}), 1)
         it["cluster_items"] = sizes.get(cid, 1)
     return items
 
@@ -377,7 +519,8 @@ def score_importance(item: dict, held: set[str], recommended: set[str],
 
 # ══════════════════════════ 6. 파이프라인 ══════════════════════════
 def process_and_store(store, raw_items: list[dict],
-                      summarize_hook=None) -> dict:
+                      summarize_hook=None,
+                      cfg: Config | None = None) -> dict:
     """수집 원본 -> 정규화/클러스터/태깅/채점 -> DB 저장.
 
     summarize_hook(clusters: dict[str, list[dict]]) -> dict[cluster_id, str]
@@ -410,6 +553,7 @@ def process_and_store(store, raw_items: list[dict],
     # ── 정규화 + 1차 중복 제거 ──
     seen: dict[str, dict] = {}
     seen_urls: set[str] = set()
+    seen_norm: set[tuple] = set()
     for r in raw_items:
         title = (r.get("title") or "").strip()
         if len(title) < 8:
@@ -420,13 +564,19 @@ def process_and_store(store, raw_items: list[dict],
         nid = make_id(tnorm, r.get("source", ""))
         if nid in seen:
             continue
-        # 같은 URL 이면 같은 기사다. 매체 표기가 갈려 id 가 달라져도
+        # 1층 — 같은 URL 이면 같은 기사다. 매체 표기가 갈려 id 가 달라져도
         # 여기서 접는다. 먼저 들어온 쪽을 남긴다.
         ukey = normalize_url(r.get("url"))
         if ukey and ukey in seen_urls:
             continue
+        # 2층 — URL 이 달라도(추적 파라미터·리다이렉트) 정규화 제목과
+        # 정규화 매체명이 같으면 같은 매체의 같은 기사다.
+        nkey = (tnorm, canonical_source(r.get("source")))
+        if nkey in seen_norm:
+            continue
         if ukey:
             seen_urls.add(ukey)
+        seen_norm.add(nkey)
         # DB 에는 tz 정보를 뗀 KST naive 문자열로 넣는다. collected 와
         # 형식을 통일해야 news_since 의 문자열 비교가 정상 동작한다.
         pub_kst = _to_kst(r.get("published"))
@@ -450,29 +600,38 @@ def process_and_store(store, raw_items: list[dict],
 
     items = list(seen.values())
 
+    # ── 종목 매핑 ──
+    # **클러스터링보다 먼저** 한다. 3층의 종목 가드가 이 결과를 쓴다
+    # (태깅된 종목이 겹치지 않으면 같은 사건으로 보지 않는다).
+    for it in items:
+        it["tickers"] = map_tickers(it["title"], alias_idx,
+                                    it.get("_extra_names"),
+                                    it.get("_stock_code"))
+
+    # ── 3층: 사건 클러스터 ──
     # 클러스터링은 배치 경계를 넘어야 한다. 최근 항목을 씨앗으로 준다.
     # 씨앗을 못 얻어도 정리는 계속한다 — 브리핑이 안 나가는 것보다
     # 중복이 조금 남는 편이 낫다.
+    dedup_cfg = cfg.news_dedup if cfg is not None else DEFAULT.news_dedup
     seeds: list[dict] = []
     fetch_seeds = getattr(store, "recent_news_for_cluster", None)
     if callable(fetch_seeds):
         try:
-            seeds = fetch_seeds(hours=48) or []
+            seeds = fetch_seeds(hours=dedup_cfg.seed_hours) or []
         except Exception as exc:  # noqa: BLE001 - 씨앗은 있으면 좋은 것이다
             log.warning("클러스터 씨앗 조회 실패(무시하고 진행): %s", exc)
-    items = cluster_items(items, seeds=seeds)
+    items = cluster_items(items, cfg=dedup_cfg, seeds=seeds)
 
-    # ── 종목 매핑 + 중요도 ──
+    # ── 중요도 ──
+    # 산정 방식은 그대로다: 매체 수(1순위) + 내 종목(2순위) + 키워드 + 신선도.
+    # 매체 수만 정확해졌다 — 표기가 갈려 한 매체를 둘로 세던 것을 고쳤다.
     links: list[tuple] = []
     for it in items:
-        pairs = map_tickers(it["title"], alias_idx,
-                            it.get("_extra_names"), it.get("_stock_code"))
-        it["tickers"] = pairs
         # 신선도 감점은 tz-aware datetime 이 필요하므로 원본을 따로 넘긴다.
         pub_dt = it.pop("_published_dt", None)
         it["importance"] = score_importance(
             {**it, "published": pub_dt}, held, recommended, universe)
-        for code, nm in pairs:
+        for code, nm in it["tickers"]:
             links.append((it["id"], code, nm))
 
     # ── 선택적 요약 훅 ──

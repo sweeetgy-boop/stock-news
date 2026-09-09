@@ -1599,7 +1599,7 @@ def test_news():
             {"id": "4", "title_norm": "에코프로비엠 양극재 증설 투자 결정",
              "source": "매체A"},
         ]
-        out = cluster_items(raw, threshold=0.55)
+        out = cluster_items(raw)
         cids = {it["id"]: it["cluster_id"] for it in out}
         assert cids["1"] == cids["2"] == cids["3"], \
             f"같은 사건이 묶이지 않음: {cids}"
@@ -1729,13 +1729,211 @@ def test_news():
     check("news", "URL 정규화 (중복 판정 키)", t_normalize_url)
     check("news", "클러스터가 수집 배치를 넘음", t_cluster_crosses_batch)
     check("news", "씨앗 매체 수 중복 집계 방지", t_cluster_seed_not_double_counted)
+    def t_canonical_source():
+        """2층 — 도메인 표기와 한글 표기를 하나로 모은다."""
+        from stocknews.news import canonical_source
+        assert canonical_source("digitaltoday.co.kr") == "디지털투데이"
+        assert canonical_source("DigitalToday.co.KR") == "디지털투데이"
+        assert canonical_source("www.digitaltoday.co.kr") == "디지털투데이"
+        assert canonical_source("디지털투데이") == "디지털투데이"
+        # 표에 없으면 지어내지 않고 그대로 둔다.
+        assert canonical_source("nosuchpaper.co.kr") == "nosuchpaper.co.kr"
+        assert canonical_source("") == "" and canonical_source(None) == ""
+
+    def t_media_count_not_inflated():
+        """같은 매체가 표기만 달라 두 매체로 세어지면 안 된다."""
+        tn = "대양금속 제22회 전환사채 전환가액 하향 조정"
+        out = cluster_items([
+            {"id": "a", "title": tn, "title_norm": tn, "source": "digitaltoday.co.kr"},
+            {"id": "b", "title": tn, "title_norm": tn, "source": "디지털투데이"}])
+        assert out[0]["cluster_id"] == out[1]["cluster_id"], "같은 제목이 안 묶임"
+        assert out[0]["cluster_n"] == 1, \
+            f"한 매체를 둘로 셌다: {out[0]['cluster_n']}개 매체"
+
+    def t_event_tokens():
+        """3층 — 조사를 떼고 순수 숫자를 버린다."""
+        from stocknews.news import event_tokens
+        got = event_tokens("뉴욕증시 중동 긴장 유가 급등에 하락 다우 1 18")
+        assert "급등" in got and "급등에" not in got, got
+        assert "1" not in got and "18" not in got, f"숫자 토큰이 남았다: {got}"
+        assert "뉴욕증시" in got and "유가" in got
+
+    def t_same_event_two_gates():
+        """Jaccard 로는 못 묶는 같은 사건을 2통로가 잡는다.
+
+        2026-09-09 실측 쌍이다. 사람이 보면 같은 사건인데 Jaccard 는 0.214.
+        """
+        from stocknews.news import event_tokens, same_event
+        a = event_tokens("중동 확전 우려 뉴욕증시 하락 유가 100달러 육박 엔화 급등")
+        b = event_tokens("뉴욕증시 국제 유가 상승에 하락 출발 다우 0 88")
+        inter = len(a & b)
+        jac = inter / len(a | b)
+        assert jac < 0.30, f"전제가 깨졌다 (Jaccard {jac:.3f})"
+        assert same_event(a, b) > 0.0, "2통로가 같은 사건을 못 잡았다"
+
+    def t_serial_guard():
+        """회차가 다른 전환사채 공시는 문구가 같아도 별건이다."""
+        rows = [
+            {"id": "a", "title": "대양금속, 제22회 전환사채 전환가액 1774원에서 1184원으로 하향 조정",
+             "title_norm": "대양금속 제22회 전환사채 전환가액 1774원에서 1184원으로 하향 조정",
+             "source": "디지털투데이"},
+            {"id": "b", "title": "대양금속, 제25회 전환사채 전환가액 1863원에서 1857원으로 하향 조정",
+             "title_norm": "대양금속 제25회 전환사채 전환가액 1863원에서 1857원으로 하향 조정",
+             "source": "디지털투데이"},
+        ]
+        out = cluster_items(rows)
+        assert out[0]["cluster_id"] != out[1]["cluster_id"], \
+            "22회차와 25회차가 한 사건으로 묶였다"
+
+    def t_ticker_guard():
+        """태깅된 종목이 겹치지 않으면 같은 사건으로 보지 않는다."""
+        rows = [
+            {"id": "a", "title": "A사 3분기 영업이익 급증 흑자전환 성공",
+             "title_norm": "a사 3분기 영업이익 급증 흑자전환 성공",
+             "source": "매체A", "tickers": [("000001", "A사")]},
+            {"id": "b", "title": "B사 3분기 영업이익 급증 흑자전환 성공",
+             "title_norm": "b사 3분기 영업이익 급증 흑자전환 성공",
+             "source": "매체B", "tickers": [("000002", "B사")]},
+        ]
+        out = cluster_items(rows)
+        assert out[0]["cluster_id"] != out[1]["cluster_id"], \
+            "다른 종목 기사가 한 사건으로 묶였다"
+
+    def t_representative_rank():
+        """대표 선정: 내 종목 언급 > 주요 매체 > 먼저 수집된 것."""
+        from stocknews.news import representative_rank
+        mine = {"source": "듣보뉴스", "collected": "2026-09-09T09:00:00"}
+        major = {"source": "연합뉴스", "collected": "2026-09-09T09:00:00"}
+        early = {"source": "듣보뉴스", "collected": "2026-09-09T01:00:00"}
+        assert representative_rank(mine, has_ticker=True) < \
+            representative_rank(major, has_ticker=False), "내 종목이 1순위여야 한다"
+        assert representative_rank(major, has_ticker=False) < \
+            representative_rank(early, has_ticker=False), "주요 매체가 2순위여야 한다"
+        late = {"source": "듣보뉴스", "collected": "2026-09-09T23:00:00"}
+        assert representative_rank(early, has_ticker=False) < \
+            representative_rank(late, has_ticker=False), "먼저 수집된 것이 3순위여야 한다"
+
     check("news", "Google 제목 매체 꼬리표 제거", t_google_strips_media_tail)
+    check("news", "2층 매체명 정규화", t_canonical_source)
+    check("news", "2층 매체 수 부풀림 방지", t_media_count_not_inflated)
+    check("news", "3층 토큰 (조사·숫자 제거)", t_event_tokens)
+    check("news", "3층 두 번째 통로 (포함도)", t_same_event_two_gates)
+    check("news", "3층 회차 가드 (22회 != 25회)", t_serial_guard)
+    check("news", "3층 종목 가드", t_ticker_guard)
+    check("news", "대표 기사 선정 순위", t_representative_rank)
     check("news", "카테고리 분류", t_classify)
     check("news", "사건 클러스터 + 매체 수", t_cluster)
     check("news", "별칭 인덱스 (우선주/모호 배제)", t_alias_index)
     check("news", "부분 겹침 오태깅 방지", t_map_tickers_partial)
     check("news", "DART 종목코드 직접 매핑", t_map_tickers_dart)
     check("news", "중요도 (매체 수 1순위)", t_importance)
+
+
+# ═══════════════ 8-1. 중복 제거 3층 — 실측 픽스처 회귀 ═══════════════
+def test_news_dedup_fixture():
+    """2026-09-09 06:20 아침 브리핑이 실제로 읽은 187건으로 회귀를 건다.
+
+    임계값을 만지면 여기가 먼저 깨진다. 그게 목적이다 — 압축은 늘리되
+    다른 사건을 붙이지는 않았는지 한 곳에서 본다. 네트워크도 실 DB 도
+    쓰지 않는다 (픽스처는 저장소에 있다).
+    """
+    import json
+    from stocknews.news import canonical_source
+    from stocknews.renderer import _group_events
+
+    path = (Path(__file__).parent / "tests" / "fixtures"
+            / "news_brief_20260909.json")
+
+    def _load():
+        assert path.exists(), f"픽스처 없음: {path}"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def t_fixture_shape():
+        data = _load()
+        assert data["count"] == 187, f"픽스처 건수가 바뀌었다: {data['count']}"
+        assert len(data["rows"]) == 187
+        need = {"id", "title", "title_norm", "url", "source", "category",
+                "region", "importance", "cluster_id", "collected", "tickers"}
+        assert need <= set(data["rows"][0]), "픽스처 열이 모자란다"
+
+    def _groups():
+        import pandas as pd
+        rows = _load()["rows"]
+        tm = {r["id"]: [n for _, n in r["tickers"]] for r in rows if r["tickers"]}
+        return rows, _group_events(pd.DataFrame(rows), tm)
+
+    def t_compression():
+        """187건 -> 사건 수. 압축이 줄면(로직 후퇴) 잡는다."""
+        rows, groups = _groups()
+        assert len(groups) <= 155, \
+            f"압축이 후퇴했다: {len(rows)}건 -> {len(groups)}사건 (155 이하 기대)"
+        assert len(groups) >= 140, \
+            f"과병합 의심: {len(rows)}건 -> {len(groups)}사건 (140 이상 기대)"
+
+    def t_daeyang_serials_split():
+        """대양금속 전환사채 — 회차별로 갈라져 있어야 한다."""
+        _, groups = _groups()
+        by_serial = {}
+        for g in groups:
+            for s in ("제22회", "제25회", "24회"):
+                if any(s in r["title"] for r in g):
+                    by_serial.setdefault(s, set()).add(id(g))
+        assert set(by_serial) == {"제22회", "제25회", "24회"}, by_serial
+        ids = [next(iter(v)) for v in by_serial.values()]
+        assert len(set(ids)) == 3, "서로 다른 회차의 CB 공시가 한 사건으로 묶였다"
+        for s, v in by_serial.items():
+            assert len(v) == 1, f"{s} 가 {len(v)}개 사건으로 흩어졌다"
+
+    def t_daeyang_media_merged():
+        """같은 회차의 도메인/한글 표기 두 건은 한 사건 · 한 매체."""
+        _, groups = _groups()
+        g = next(g for g in groups
+                 if sum("제22회" in r["title"] for r in g) == 2)
+        assert len(g) == 2, len(g)
+        assert len({canonical_source(r["source"]) for r in g}) == 1, \
+            "같은 매체가 둘로 세어졌다"
+
+    def t_nyse_merged():
+        """뉴욕증시 하락 기사 3건이 한 사건으로 묶인다 (2통로가 잡는 것)."""
+        _, groups = _groups()
+        g = next((g for g in groups
+                  if any("thefairnews" in (r["source"] or "") for r in g)), None)
+        assert g is not None, "thefairnews 행이 사라졌다"
+        assert len(g) >= 3, f"뉴욕증시 사건이 {len(g)}건으로만 묶였다"
+        assert any("뉴시스" == r["source"] for r in g), \
+            "뉴시스 기사가 같은 사건으로 묶이지 않았다"
+        assert g[0]["source"] == "뉴시스", \
+            f"대표가 주요 매체가 아니다: {g[0]['source']}"
+
+    def t_no_serial_crossing():
+        """어떤 사건에도 서로 다른 회차가 섞여 있으면 안 된다."""
+        from stocknews.news import event_serials
+        _, groups = _groups()
+        for g in groups:
+            found = [event_serials(r["title"]) for r in g]
+            nonempty = [s for s in found if s]
+            if len(nonempty) > 1:
+                assert set.intersection(*nonempty), \
+                    f"회차가 다른 기사가 묶였다: {[r['title'][:40] for r in g]}"
+
+    def t_no_ticker_crossing():
+        """서로 다른 종목이 태깅된 기사가 한 사건으로 묶이면 안 된다."""
+        rows, groups = _groups()
+        tk = {r["id"]: {c for c, _ in r["tickers"]} for r in rows}
+        for g in groups:
+            sets = [tk.get(r["id"]) or set() for r in g]
+            nonempty = [s for s in sets if s]
+            if len(nonempty) > 1:
+                assert set.intersection(*nonempty), \
+                    f"다른 종목 기사가 묶였다: {[r['title'][:40] for r in g]}"
+
+    check("dedup", "픽스처 형태 (187건)", t_fixture_shape)
+    check("dedup", "압축률 회귀", t_compression)
+    check("dedup", "대양금속 회차 분리", t_daeyang_serials_split)
+    check("dedup", "같은 회차 매체 표기 병합", t_daeyang_media_merged)
+    check("dedup", "뉴욕증시 사건 병합 + 대표", t_nyse_merged)
+    check("dedup", "회차 교차 오병합 없음", t_no_serial_crossing)
+    check("dedup", "종목 교차 오병합 없음", t_no_ticker_crossing)
 
 
 # ══════════════════════════ 8-2. 알림 시간창 ══════════════════════════
@@ -5606,28 +5804,55 @@ def test_renderer(st):
     check("renderer", "주간 리포트", t_weekly)
     check("renderer", "아침/저녁 브리핑", t_briefs)
     check("renderer", "주간 뉴스 테마", t_news_weekly)
-    def t_news_cross_section_dedup():
-        """섹션 필터가 겹쳐도 같은 기사는 브리핑에 한 번만 나온다.
+    def t_news_one_section_only():
+        """1층 — 한 기사는 가장 잘 맞는 섹션 하나에만 들어간다.
 
-        2026-09-09 아침 브리핑 실측: '매크로·정책' 5건 중 4건이 '밤사이
-        해외' 와 같은 URL 이었다. 섹션마다 seen 집합을 새로 만든 탓이다.
+        섹션 필터는 서로 겹친다. 2026-09-09 아침 브리핑 실측: '매크로·정책'
+        5건 중 4건이 '밤사이 해외'와 같은 URL 이었다.
+        배정 우선순위는 내 종목 > 공시 > 매크로 > 해외.
         """
         import pandas as pd
-        from stocknews.renderer import _dedup_clusters
-        rows = pd.DataFrame([
+        from stocknews.renderer import _group_events, _assign_sections
+        df = pd.DataFrame([
             {"id": "a", "cluster_id": "a", "url": "https://x/1?oc=5",
-             "title_norm": "미 cpi 예상보다 높으면 fomc 금리 오를 것"},
+             "title": "美 CPI 높으면 FOMC 금리 오를 것", "category": "매크로",
+             "title_norm": "미 cpi 높으면 fomc 금리 오를 것",
+             "source": "v.daum.net", "region": "US", "importance": 3.0},
             {"id": "b", "cluster_id": "b", "url": "https://x/1",
-             "title_norm": "미 cpi 예상보다 높으면 fomc 금리 오를 것"},
+             "title": "美 CPI 높으면 FOMC 금리 오를 것", "category": "매크로",
+             "title_norm": "미 cpi 높으면 fomc 금리 오를 것",
+             "source": "다음", "region": "US", "importance": 3.0},
         ])
-        seen: set = set()
-        first = _dedup_clusters(rows, 5, seen=seen)
-        assert len(first) == 1, \
-            f"cluster_id 가 갈린 같은 URL 두 건이 다 남았다: {len(first)}"
-        assert _dedup_clusters(rows, 5, seen=seen) == [], \
-            "다음 섹션에서 같은 기사가 또 나왔다"
-        assert len(_dedup_clusters(rows, 5)) == 1, \
-            "seen 을 안 줘도 섹션 안에서는 막혀야 한다"
+        groups = _group_events(df, {})
+        assert len(groups) == 1, f"같은 URL 두 건이 안 묶였다: {len(groups)}"
+        priority = (
+            ("🎯 내 종목·고중요도", lambda r: float(r.get("importance") or 0) >= 5.0),
+            ("📄 주요 공시", lambda r: r.get("category") == "공시"),
+            ("🏛 매크로·정책", lambda r: r.get("category") in ("매크로", "정책")),
+            ("🌏 밤사이 해외", lambda r: r.get("region") in ("US", "GLOBAL")),
+        )
+        picked = _assign_sections(groups, priority, 5)
+        placed = [lbl for lbl, rows in picked.items() if rows]
+        assert placed == ["🏛 매크로·정책"], \
+            f"한 섹션에만 들어가야 하는데 {placed} 에 들어갔다"
+        assert picked["🏛 매크로·정책"][0][1] == 2, "묶인 매체 수가 안 맞다"
+
+    def t_news_priority_order():
+        """공시이면서 고중요도이면 '내 종목' 이 가져간다."""
+        import pandas as pd
+        from stocknews.renderer import _group_events, _assign_sections
+        df = pd.DataFrame([{
+            "id": "a", "cluster_id": "a", "url": "https://x/9",
+            "title": "[공시] 어떤회사 유상증자 결정", "category": "공시",
+            "title_norm": "어떤회사 유상증자 결정", "source": "DART",
+            "region": "KR", "importance": 8.0}])
+        priority = (
+            ("🎯 내 종목·고중요도", lambda r: float(r.get("importance") or 0) >= 5.0),
+            ("📄 주요 공시", lambda r: r.get("category") == "공시"),
+        )
+        picked = _assign_sections(_group_events(df, {}), priority, 5)
+        assert picked["🎯 내 종목·고중요도"] and not picked["📄 주요 공시"], \
+            "우선순위(내 종목 > 공시)가 지켜지지 않았다"
 
     def t_news_title_media_tail():
         """제목 끝의 매체명만 뗀다. 매체명이 아닌 꼬리는 건드리지 않는다."""
@@ -5653,7 +5878,8 @@ def test_renderer(st):
         assert "디지털투데이</a>" not in head, f"제목에 매체 꼬리표: {head}"
 
     check("renderer", "청산 알림/요약", t_exit_render)
-    check("renderer", "브리핑 섹션 간 중복 제거", t_news_cross_section_dedup)
+    check("renderer", "1층 한 기사 = 한 섹션", t_news_one_section_only)
+    check("renderer", "1층 섹션 배정 우선순위", t_news_priority_order)
     check("renderer", "뉴스 제목 매체 꼬리표 제거", t_news_title_media_tail)
     check("renderer", "뉴스 URL 은 제목 링크로", t_news_line_links_title)
     check("renderer", "보유 현황", t_positions_render)
@@ -7327,6 +7553,7 @@ def main() -> int:
         st = test_store(tmp)
         test_exits()
         test_news()
+        test_news_dedup_fixture()
         test_notify(tmp)
         test_reco_dow()
         test_trading_day(tmp)

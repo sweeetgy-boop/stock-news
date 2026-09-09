@@ -11,7 +11,8 @@ import unicodedata
 
 from .config import Config, DEFAULT
 from .contracts import RULE_NAME, ScreenResult
-from .news import normalize_url
+from .news import (canonical_source, cluster_items, normalize_url,
+                   representative_rank)
 
 __all__ = ["bar", "render_detail", "render_digest", "render_fib_list"]
 
@@ -682,14 +683,15 @@ def _display_title(row) -> str:
     return title
 
 
-def _news_line(row, tick_map: dict, show_source: bool = True) -> str:
+def _news_line(row, tick_map: dict, show_source: bool = True,
+               cluster_n: int | None = None) -> str:
     """뉴스 1건 1~2줄. 클러스터 크기와 종목 태그를 붙인다.
 
     URL 은 제목에 <a href> 로 감는다. 본문에 주소를 찍지 않는다 —
     Google News RSS 주소는 한 건이 400자를 넘어 메시지를 잡아먹는다.
     """
     icon = CATEGORY_ICON.get(row["category"], "•")
-    n = int(row.get("cluster_n") or 1)
+    n = int((cluster_n if cluster_n is not None else row.get("cluster_n")) or 1)
     multi = f" <i>({n}개 매체)</i>" if n >= 2 else ""
     title = _e(_display_title(row)[:110])
     line = f"{icon} <a href=\"{_e(row['url'] or '')}\">{title}</a>{multi}"
@@ -697,50 +699,109 @@ def _news_line(row, tick_map: dict, show_source: bool = True) -> str:
     sub = []
     if tags:
         sub.append("· " + " ".join(f"<b>{_e(t)}</b>" for t in tags[:4]))
-    if show_source and row.get("source"):
-        sub.append(f"({_e(row['source'])})")
+    src = canonical_source(row.get("source"))
+    if show_source and src:
+        sub.append(f"({_e(src)})")
     if row.get("summary"):
         sub.insert(0, "· " + _e(str(row["summary"])[:120]))
     return line + ("\n   " + " ".join(sub) if sub else "")
 
 
-def _dedup_clusters(df, limit: int, seen: set | None = None):
-    """클러스터당 대표 1건만 남긴다. 같은 사건이 반복 노출되는 걸 막는다.
+def _group_events(df, tick_map: dict | None = None, cfg=None) -> list[list]:
+    """창 안의 기사를 **사건 단위**로 묶는다. 각 묶음의 0번이 대표다.
 
-    seen
-      **섹션 사이에 공유하는 집합.** 브리핑의 섹션 필터는 서로 겹친다 —
-      미국 매크로 기사는 '밤사이 해외'(region)와 '매크로·정책'(category)에
-      동시에 걸리고, 중요한 공시는 '내 종목·고중요도'와 '주요 공시'에 함께
-      걸린다. 섹션마다 집합을 새로 만들던 판에서는 그게 그대로 두 번
-      찍혔다. 2026-09-09 아침 브리핑 실측: 매크로 5건 중 4건이 해외 섹션과
-      **같은 URL** 이었다. 먼저 오는 섹션이 가져간다.
+    DB 의 cluster_id 를 그대로 믿지 않고 여기서 다시 묶는 이유가 둘이다.
 
-      None 이면 섹션 안에서만 막는다(옛 동작).
+      1. 브리핑 창(16시간)에는 수집 실행이 두세 번 들어간다. 고치기 전에
+         쌓인 행은 실행마다 다른 cluster_id 를 달고 있어서, cluster_id 만
+         보면 같은 기사가 그대로 두 번 나온다.
+      2. 화면에 찍는 '(N개 매체)' 는 **실제로 화면에서 묶인 것**과 같아야
+         한다. 적재 시점의 집계를 그대로 쓰면 창 밖 기사까지 세게 된다.
 
-    cluster_id 만 보면 부족하다. 수집 배치가 다르면 같은 기사가 다른
-    cluster_id 를 받은 행이 DB 에 남아 있다(고치기 전에 쌓인 분). 정규화
-    URL 과 정규화 제목도 같이 열쇠로 쓴다.
+    대표 선정은 `news.representative_rank` 를 따른다 —
+    내 종목 언급 > 주요 매체 > 먼저 수집된 것.
     """
     if df is None or df.empty:
         return []
-    if seen is None:
-        seen = set()
-    out = []
-    for _, r in df.iterrows():
-        keys = {("c", r.get("cluster_id") or r["id"])}
+    tick_map = tick_map or {}
+    rows = [r for _, r in df.iterrows()]
+
+    # cluster_items 는 dict 를 기대한다. 판정에 필요한 열만 넘긴다.
+    probe = [{"id": r["id"], "title": r.get("title"),
+              "title_norm": r.get("title_norm"),
+              "source": r.get("source"),
+              "tickers": [(c, c) for c in tick_map.get(r["id"], ())]}
+             for r in rows]
+    cluster_items(probe, cfg=cfg)
+    cid_of = {p["id"]: p["cluster_id"] for p in probe}
+
+    # 1층 — 같은 URL 은 유사도를 볼 것도 없이 같은 기사다. 클러스터가
+    # 갈려 있어도 URL 로 다시 붙인다 (추적 파라미터는 normalize_url 이 뗀다).
+    parent: dict = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_url: dict = {}
+    for r in rows:
+        key = cid_of.get(r["id"]) or r["id"]
+        find(key)
         url = normalize_url(r.get("url"))
         if url:
-            keys.add(("u", url))
-        tnorm = str(r.get("title_norm") or "").strip()
-        if tnorm:
-            keys.add(("t", tnorm))
-        if keys & seen:
-            continue
-        seen |= keys
-        out.append(r)
-        if len(out) >= limit:
-            break
+            if url in by_url:
+                union(by_url[url], key)
+            else:
+                by_url[url] = key
+
+    groups: dict = {}
+    order: list = []
+    for r in rows:
+        key = find(cid_of.get(r["id"]) or r["id"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
+    out = []
+    for k in order:
+        g = groups[k]
+        g.sort(key=lambda r: representative_rank(
+            r, has_ticker=bool(tick_map.get(r["id"]))))
+        out.append(g)
     return out
+
+
+def _assign_sections(groups: list[list], priority: tuple,
+                     per_section: int) -> dict:
+    """사건 하나를 **가장 잘 맞는 섹션 하나에만** 넣는다 (1층).
+
+    브리핑의 섹션 필터는 서로 겹친다 — 미국 매크로 기사는 지역으로도
+    카테고리로도 걸리고, 중요한 공시는 '내 종목'에도 '공시'에도 걸린다.
+    예전에는 섹션마다 따로 걸러서 같은 URL 이 두 섹션에 그대로 찍혔다
+    (2026-09-09 실측: 매크로 5건 중 4건이 해외 섹션과 같은 URL).
+
+    priority 는 **배정 우선순위 순서**의 `(라벨, 판정함수)` 튜플이다.
+    화면 표시 순서와는 별개다.
+    """
+    picked: dict = {label: [] for label, _ in priority}
+    for g in groups:
+        rep = g[0]
+        for label, match in priority:
+            if len(picked[label]) >= per_section:
+                continue
+            if match(rep):
+                picked[label].append((rep, len({canonical_source(x.get("source"))
+                                                for x in g if x.get("source")})))
+                break
+    return picked
 
 
 def _tick_map(store, rows) -> dict:
@@ -764,30 +825,30 @@ def render_morning_brief(store, asof, hours: int = 16,
         return (f"☀️ <b>[아침 브리핑]</b> {asof:%m/%d}\n\n"
                 "• 수집된 뉴스가 없습니다. 수집 배치를 확인하십시오.")
 
-    overseas = df[df["region"].isin(["US", "GLOBAL"])]
-    macro = df[df["category"].isin(["매크로", "정책"])]
-    mine = df[df["importance"] >= 5.0]
-    disclosure = df[df["category"] == "공시"]
+    tm = _tick_map(store, [r for _, r in df.iterrows()])
+    groups = _group_events(df, tm)
 
     out = [f"☀️ <b>[아침 브리핑]</b> {asof:%Y-%m-%d %H:%M}",
-           f"• 최근 {hours}시간 {len(df)}건 · "
-           f"사건 {df['cluster_id'].nunique()}건", ""]
+           f"• 최근 {hours}시간 {len(df)}건 · 사건 {len(groups)}건", ""]
 
-    sections = (
-        ("🌏 밤사이 해외", overseas),
-        ("🏛 매크로·정책", macro),
-        ("🎯 내 종목·고중요도", mine),
-        ("📄 주요 공시", disclosure),
+    # 배정 우선순위 — 한 기사는 여기서 처음 걸리는 섹션 하나로만 간다.
+    priority = (
+        ("🎯 내 종목·고중요도", lambda r: float(r.get("importance") or 0.0) >= 5.0),
+        ("📄 주요 공시", lambda r: r.get("category") == "공시"),
+        ("🏛 매크로·정책", lambda r: r.get("category") in ("매크로", "정책")),
+        ("🌏 밤사이 해외", lambda r: r.get("region") in ("US", "GLOBAL")),
     )
-    # 섹션 필터가 서로 겹치므로 집합 하나를 전 섹션이 공유한다.
-    seen: set = set()
-    for label, sub in sections:
-        rows = _dedup_clusters(sub, per_section, seen=seen)
+    # 표시 순서는 예전 그대로 둔다. 배정과 표시는 다른 문제다.
+    display = ("🌏 밤사이 해외", "🏛 매크로·정책",
+               "🎯 내 종목·고중요도", "📄 주요 공시")
+
+    picked = _assign_sections(groups, priority, per_section)
+    for label in display:
+        rows = picked.get(label) or []
         if not rows:
             continue
-        tm = _tick_map(store, rows)
         out.append(f"━━ {label} ({len(rows)}건) ━━")
-        out += [_news_line(r, tm) for r in rows]
+        out += [_news_line(r, tm, cluster_n=n) for r, n in rows]
         out.append("")
 
     out.append("※ 뉴스에는 점수를 매기지 않습니다. 중요도는 '몇 개 매체가")
@@ -804,25 +865,25 @@ def render_evening_brief(store, asof, picks: list | None = None,
         out.append("\n• 국내 뉴스 수집분이 없습니다.")
         return "\n".join(out)
 
-    out.append(f"• 최근 {hours}시간 {len(df)}건 · "
-               f"사건 {df['cluster_id'].nunique()}건")
+    tm = _tick_map(store, [r for _, r in df.iterrows()])
+    groups = _group_events(df, tm)
+    out.append(f"• 최근 {hours}시간 {len(df)}건 · 사건 {len(groups)}건")
     out.append("")
 
-    disclosure = df[df["category"] == "공시"]
-    flow = df[df["category"] == "수급"]
-    theme = df[df["category"].isin(
-        ["반도체", "2차전지", "방산조선", "바이오", "전력AI"])]
-    market = df[df["category"].isin(["국내시황", "실적"])]
-
-    seen: set = set()
-    for label, sub in (("📄 공시", disclosure), ("💧 수급", flow),
-                       ("🏭 테마·업종", theme), ("📊 시황·실적", market)):
-        rows = _dedup_clusters(sub, per_section, seen=seen)
+    themes = ("반도체", "2차전지", "방산조선", "바이오", "전력AI")
+    priority = (
+        ("📄 공시", lambda r: r.get("category") == "공시"),
+        ("💧 수급", lambda r: r.get("category") == "수급"),
+        ("🏭 테마·업종", lambda r: r.get("category") in themes),
+        ("📊 시황·실적", lambda r: r.get("category") in ("국내시황", "실적")),
+    )
+    picked = _assign_sections(groups, priority, per_section)
+    for label, _ in priority:
+        rows = picked.get(label) or []
         if not rows:
             continue
-        tm = _tick_map(store, rows)
         out.append(f"━━ {label} ({len(rows)}건) ━━")
-        out += [_news_line(r, tm) for r in rows]
+        out += [_news_line(r, tm, cluster_n=n) for r, n in rows]
         out.append("")
 
     # 추천 10선과 뉴스 교차 — 뉴스가 붙은 추천 종목을 표시한다
