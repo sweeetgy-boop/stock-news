@@ -97,10 +97,70 @@ from stocknews.universe import (backfill_one, fetch_day, fill_sectors,
                                 liquidity_filter, refresh_master)
 from stocknews.weekly import weekly_report
 
-# 로그는 stderr 로 보낸다. stdout 은 --json 결과 전용이어야
-# 에이전트가 파싱할 수 있다.
-logging.basicConfig(level=logging.INFO, stream=sys.stderr,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+# 로그는 stderr 와 파일에 동시에 쓴다. stdout 은 --json 결과 전용이어야
+# 에이전트가 파싱할 수 있으므로 절대 쓰지 않는다.
+#
+# 파일이 필요한 이유: 발송 실패 같은 사건은 그것이 일어난 밤에는 아무도
+# 안 보고, 며칠 뒤에야 "그때 왜 안 왔지"로 되돌아온다. 콘솔 스크롤백은
+# 그때 이미 없다.
+LOG_DIR = Path("logs")
+LOG_RETENTION_DAYS = 30
+# 우리가 만든 일자 로그만 고른다. 이 디렉터리에는 nightly.py 가 만드는
+# 잡별 로그(daily.log, brief-morning_20260909.log ...)도 함께 살고 있어서,
+# 정리 대상을 이 접두어로 좁히지 않으면 남의 파일을 지운다.
+_LOG_GLOB = "stocknews_*.log"
+
+
+def _log_path(day=None) -> Path:
+    return LOG_DIR / f"stocknews_{(day or now_kst().date()):%Y%m%d}.log"
+
+
+def _prune_logs(keep_days: int = LOG_RETENTION_DAYS) -> list[str]:
+    """보존 기간이 지난 일자 로그를 지운다. 지운 파일명을 돌려준다.
+
+    이름에서 날짜를 못 읽는 파일은 건드리지 않는다. mtime 이 아니라
+    파일명의 날짜로 판단하는 이유는, 복사·동기화로 mtime 이 갱신된
+    오래된 로그가 영원히 남는 일을 막기 위해서다.
+    """
+    cutoff = now_kst().date() - timedelta(days=keep_days)
+    removed: list[str] = []
+    try:
+        paths = sorted(LOG_DIR.glob(_LOG_GLOB))
+    except OSError:
+        return removed
+    for p in paths:
+        stem = p.name[len("stocknews_"):-len(".log")]
+        try:
+            day = datetime.strptime(stem, "%Y%m%d").date()
+        except ValueError:
+            continue          # 규칙에 안 맞는 이름은 우리 것이 아니다
+        if day < cutoff:
+            try:
+                p.unlink()
+                removed.append(p.name)
+            except OSError:
+                pass          # 정리 실패가 배치를 막으면 안 된다
+    return removed
+
+
+def _setup_logging() -> None:
+    """stderr + 일자 파일. 파일을 못 열어도 배치는 계속한다."""
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(_log_path(), encoding="utf-8"))
+    except OSError as exc:
+        # 로그를 못 쓴다고 배치를 죽이지는 않는다. 다만 조용히 넘기면
+        # 파일이 없는 이유를 나중에 알 수 없으므로 stderr 에는 남긴다.
+        # (_say 는 아직 정의 전이고 SUMMARY 도 비어 있다. 여기서는
+        #  stderr 가 유일한 정답이므로 직접 고른다.)
+        msg = f"[run] 파일 로깅 비활성 ({exc}) — stderr 로만 기록합니다"
+        print(msg, file=sys.stderr)
+    logging.basicConfig(level=logging.INFO, handlers=handlers,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+_setup_logging()
 log = logging.getLogger("run")
 
 # ── 종료 코드 규약 (Hermes 가 이 값으로 재시도/알림을 판단한다) ──
@@ -166,13 +226,19 @@ def _emit(text: str, dry: bool) -> None:
         SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
         return
     # 발송 실패를 성공으로 집계하면 무음 장애를 알아챌 수 없다.
-    ok = send_telegram(text)
+    report = send_telegram(text)
     SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
-    if ok:
-        log.info("텔레그램 발송 완료 (%d자)", len(text))
-    else:
-        SUMMARY["send_failed"] = SUMMARY.get("send_failed", 0) + 1
-        log.error("텔레그램 발송 실패 (%d자) — 재시도 소진", len(text))
+    if report:
+        log.info("텔레그램 발송 완료 (%d자 · 수신자 %d명)",
+                 len(text), report.sent)
+        return
+    # 수신자별 상세를 남긴다. 개수만 세면 "두 명 중 누가 못 받았나"를
+    # 알 수 없고, 그게 바로 알아야 하는 정보다.
+    SUMMARY["send_failed"] = (SUMMARY.get("send_failed", 0)
+                              + len(report.failures))
+    SUMMARY.setdefault("send_failures", []).extend(report.as_dicts())
+    log.error("텔레그램 %s (%d자 · 성공 %d명)",
+              report.summary(), len(text), report.sent)
 
 
 def _partial(ok: int, failed: int) -> bool:
@@ -1800,6 +1866,15 @@ def main(argv=None) -> int:
     SUMMARY["mode"] = args.mode
     SUMMARY["started"] = now_kst().isoformat(timespec="seconds")
 
+    # 보존 기간이 지난 일자 로그 정리. 실행마다 한 번이면 충분하고,
+    # 파일 수가 적어 비용이 없다.
+    pruned = _prune_logs()
+    if pruned:
+        log.info("오래된 로그 %d개 정리 (%d일 보존): %s",
+                 len(pruned), LOG_RETENTION_DAYS,
+                 ", ".join(pruned[:5]) + ("..." if len(pruned) > 5 else ""))
+        SUMMARY["logs_pruned"] = len(pruned)
+
     # ── 진입점 추적 ──
     # nightly.cmd 와 nightly.py 가 자식 환경에 STOCKNEWS_ENTRY=nightly 를
     # 넣는다. 없다면 누군가 run_screen.py 를 직접 부른 것이다.
@@ -1875,8 +1950,11 @@ def main(argv=None) -> int:
     # 발송이 실패했는데 exit 0 이면 무음 장애를 아무도 모른다. 판정 자체는
     # 성공했으므로 치명적 실패가 아니라 부분 실패로 알린다.
     if SUMMARY.get("send_failed") and rc == EXIT_OK:
-        log.error("텔레그램 발송 %d건 실패 — 부분 실패로 보고합니다",
-                  SUMMARY["send_failed"])
+        detail = ", ".join(
+            f"{f.get('chat', '????')}: {f.get('status') or '무응답'}"
+            for f in SUMMARY.get("send_failures", []))
+        log.error("텔레그램 발송 %d건 실패%s — 부분 실패로 보고합니다",
+                  SUMMARY["send_failed"], f" (수신자 {detail})" if detail else "")
         rc = EXIT_PARTIAL
     SUMMARY["exit_code"] = int(rc)
     SUMMARY["elapsed_sec"] = round(elapsed, 1)

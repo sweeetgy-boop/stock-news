@@ -423,8 +423,8 @@ def _notify(text: str, log: Log, enabled: bool,
     try:
         from stocknews.notify import TelegramNotConfigured, send_telegram
         try:
-            ok = send_telegram(text)
-            log("알림 발송 " + ("완료" if ok else "실패(재시도 소진)"))
+            rep = send_telegram(text)
+            log("알림 발송 " + ("완료" if rep else rep.summary()))
         except TelegramNotConfigured:
             # 토큰이 없는 것은 설정 문제다. 파이프라인 실패가 아니다.
             log("알림 생략 — TELEGRAM_BOT_TOKEN / CHAT_ID 미설정")
@@ -461,10 +461,27 @@ def _summary(job: Job, started: datetime, finished: datetime,
             head += f" · 휴장 기록 {', '.join(j['marked_non_trading'])}"
         if j.get("source_outage"):
             head += f" · 미적재 {', '.join(j['source_outage'])}"
+    # 발송 실패는 rc=2 로 드러나긴 하지만, 어느 수신자가 왜 막혔는지는
+    # 자식의 --json 안에만 있다. 수신자가 여러 명이면 "누가 못 받았나"가
+    # 곧 조치 대상이므로 요약문에 끌어올린다.
+    sf = _send_failures(results)
+    if sf:
+        detail = ", ".join(
+            f"{f.get('chat', '????')}: {f.get('status') or '무응답'}"
+            for f in sf)
+        head += f"\n발송 실패 {len(sf)}건 (수신자 {detail})"
     if dry:
         head += ("\n※ --dry-run (STOCKNEWS_SEND=1 로 실발송 전환 · "
                  f"잡별 예외는 {DRY_JOBS_ENV})")
     return head
+
+
+def _send_failures(results: list[dict]) -> list[dict]:
+    """모든 단계의 --json 에서 수신자별 발송 실패를 모은다."""
+    out: list[dict] = []
+    for r in results:
+        out += ((r.get("json") or {}).get("send_failures") or [])
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
