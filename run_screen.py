@@ -1012,6 +1012,10 @@ def mode_credit_kiwoom(store: Store, args) -> int:
 
     if not written:
         log.warning("기록된 종목이 0건입니다. 실패 사유를 확인하십시오.")
+        # reason 을 반드시 남긴다. 비워 두면 nightly 가 이 exit 4 를 '키
+        # 없음'과 구분하지 못한다. 2026-09-03~10 매일 300/300 종목이 8050
+        # 인증 실패였는데 '기대된 스킵'으로 세어져 "실패 없음"이 나갔다.
+        SUMMARY["reason"] = "all_failed" if stats["failed"] else "no_rows"
         return EXIT_PRECOND
     return EXIT_PARTIAL if _partial(written, stats["failed"]) else EXIT_OK
 

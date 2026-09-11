@@ -59,6 +59,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -161,6 +162,7 @@ __all__ = [
     "limiter_from_env", "parse_expiry", "parse_number",
     "pick_latest_credit", "resolve_share_unit", "collect_credit",
     "classify_return_code", "return_code_of", "requests_transport",
+    "failure_code",
 ]
 
 
@@ -777,6 +779,23 @@ def _asof(rec: dict, fallback: str) -> str:
     return str(fallback)[:10]
 
 
+# return_msg 안의 원인 코드. "인증에 실패했습니다[8050:지정단말기 ...]"
+_INNER_CODE = re.compile(r"\[(\d{3,5}):")
+
+
+def failure_code(exc: KiwoomRestError) -> str | None:
+    """실패 집계용 코드. 메시지 대괄호 안 코드가 return_code 보다 우선한다.
+
+    운영에서 지정단말기 인증 실패는 return_code=3 으로 오고 원인 코드
+    8050 은 return_msg 대괄호 안에만 있었다 (2026-09-03~10). return_code 로
+    세면 전부 '3' 이 돼 무엇을 고쳐야 하는지가 안 보인다.
+    """
+    m = _INNER_CODE.search(str(exc))
+    if m:
+        return m.group(1)
+    return None if exc.return_code is None else str(exc.return_code)
+
+
 def collect_credit(client: KiwoomRestClient, tickers: list[str], *,
                    trade_date: str, listed_shares: dict | None = None,
                    qry_tp: str = INQUIRY_LOAN, max_pages: int = 1,
@@ -794,7 +813,14 @@ def collect_credit(client: KiwoomRestClient, tickers: list[str], *,
     shares_map = listed_shares or {}
     latest: dict[str, dict] = {}
     failures: list[dict] = []
+    # 코드별 실패 건수. failures 는 20건에서 잘리므로 따로 전부 센다.
+    codes: dict[str, int] = {}
     total = len(tickers)
+
+    def _count(exc: KiwoomRestError) -> None:
+        c = failure_code(exc)
+        if c:
+            codes[c] = codes.get(c, 0) + 1
 
     for i, raw in enumerate(tickers, 1):
         code = str(raw).strip().zfill(6)
@@ -808,9 +834,11 @@ def collect_credit(client: KiwoomRestClient, tickers: list[str], *,
                                           max_pages=max_pages)
         except SymbolNotFound as exc:
             failures.append({"ticker": code, "reason": f"없는 종목: {exc}"})
+            _count(exc)
             continue
         except KiwoomRestError as exc:
             failures.append({"ticker": code, "reason": str(exc)})
+            _count(exc)
             log.warning("%s 신용잔고 조회 실패: %s", code, exc)
             continue
         rec = pick_latest_credit(records)
@@ -846,6 +874,7 @@ def collect_credit(client: KiwoomRestClient, tickers: list[str], *,
         "rows": len(rows),
         "failed": len(failures),
         "failures": failures[:20],
+        "failure_codes": dict(sorted(codes.items(), key=lambda kv: -kv[1])),
         "share_unit_scale": scale,
         "share_unit_note": scale_note,
         "api_stats": dict(client.stats),

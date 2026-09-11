@@ -23,7 +23,7 @@
 
 종료 코드
 --------
-  0   정상 (휴장일 스킵, '오늘 이미 완주' 스킵도 0)
+  0   정상 (휴장일 스킵, '오늘 이미 실행' 스킵도 0)
   1   파이프라인 자체 실패 (락 획득 실패는 0 이 아니라 3)
   2   부분 실패 — 한 단계 이상 실패했으나 완주함
   3   이중 실행 (락 점유 중)
@@ -124,6 +124,10 @@ class Step:
     # 이 종료 코드는 '실패'가 아니라 '기대된 스킵'으로 센다.
     # credit-kiwoom 은 앱키가 없거나 대상이 0종목이면 exit 4 를 낸다.
     soft: frozenset = field(default_factory=frozenset)
+    # 비어 있지 않으면 soft 코드라도 --json 의 reason 이 여기 있을 때만
+    # 스킵이다. credit-kiwoom 은 전 종목 조회 실패(8050 인증 실패 등)도
+    # 같은 exit 4 로 끝나서, 코드만 보면 실패가 스킵으로 삼켜진다.
+    soft_reasons: frozenset = field(default_factory=frozenset)
     # 모드가 아직 없을 수 있는 단계. exit 64(인자 오류)면 미구현으로 본다.
     optional: bool = False
     # STOCKNEWS_DRY_JOBS 로 이 잡이 지목됐다. STOCKNEWS_SEND 와 무관하게
@@ -144,7 +148,10 @@ STEPS: tuple[Step, ...] = (
     Step("master", ["--mode", "master"]),
     Step("update", ["--mode", "update"]),
     Step("flags", ["--mode", "flags", "--dart-limit", "400"]),
-    Step("credit-kiwoom", ["--mode", "credit-kiwoom"], soft=frozenset({4})),
+    # exit 4 중 '키 없음'·'대상 0건'만 스킵. 2026-09-03~10 은 매일 300/300
+    # 종목이 8050(지정단말기 인증 실패)이었는데 스킵으로 세어져 "실패 없음".
+    Step("credit-kiwoom", ["--mode", "credit-kiwoom"], soft=frozenset({4}),
+         soft_reasons=frozenset({"no_credentials", "no_targets"})),
     # 수급 수집. 2026-09-01 조사 결론: 키움 ka10059 로 종목별은 가능하나
     # 전종목 합산은 유량 제한으로 매일 불가(약 3시간). 모드가 아직 없어서
     # optional 로 둔다 — 있으면 돌고 없으면 '미구현'으로 건너뛴다.
@@ -348,28 +355,7 @@ def _run_step(step: Step, dry: bool, log: Log, timeout: int) -> dict:
                 payload = {}
             break
 
-    # ── 판정 ──
-    if rc is None:
-        state, note = "fail", err[:120]
-    elif rc == 0:
-        state = "ok"
-        note = "생략" if payload.get("skipped") else ""
-        if payload.get("reason"):
-            note = f"생략({payload['reason']})"
-    elif rc == 2:
-        # 부분 실패. 다음 잡은 계속한다(AGENTS 2장). 성공으로 세되 경고.
-        state, note = "warn", f"부분 실패 (실패 {payload.get('failed', '?')})"
-    elif rc == 64 and step.optional:
-        state, note = "skip", "미구현 모드"
-    elif rc in step.soft:
-        state = "skip"
-        note = f"기대된 스킵 rc={rc}"
-        if payload.get("reason"):
-            note += f" ({payload['reason']})"
-    else:
-        state, note = "fail", f"rc={rc}"
-        if payload.get("reason"):
-            note += f" {payload['reason']}"
+    state, note, detail = _judge(step, rc, err, payload)
 
     # ── 소스 장애는 '성공'이 아니다 ──
     # 2026-09-08 실측. update 가 rc=0 · 0.8초 · 적재 0건으로 끝났고
@@ -381,7 +367,66 @@ def _run_step(step: Step, dry: bool, log: Log, timeout: int) -> dict:
     log(f"---- {step.name} 종료 rc={rc} · {elapsed:.1f}초 · {state}"
         + (f" · {note}" if note else "") + " ----")
     return {"name": step.name, "rc": rc, "state": state, "note": note,
-            "elapsed": elapsed, "json": payload}
+            "detail": detail, "elapsed": elapsed, "json": payload}
+
+
+def _judge(step: Step, rc: int | None, err: str,
+           payload: dict) -> tuple[str, str, str]:
+    """종료 코드 + --json 으로 (state, note, detail) 판정.
+
+    detail 은 실패 원인 코드별 건수("8050 × 300건")다. 없으면 빈 문자열.
+    """
+    reason = payload.get("reason")
+    if rc is None:
+        return "fail", err[:120], ""
+    if rc == 0:
+        note = "생략" if payload.get("skipped") else ""
+        if reason:
+            note = f"생략({reason})"
+        return "ok", note, ""
+    if rc == 2:
+        # 부분 실패. 다음 잡은 계속한다(AGENTS 2장). 성공으로 세되 경고.
+        return "warn", f"부분 실패 (실패 {payload.get('failed', '?')})", ""
+    if rc == 64 and step.optional:
+        return "skip", "미구현 모드", ""
+    if rc in step.soft and (not step.soft_reasons
+                            or reason in step.soft_reasons):
+        note = f"기대된 스킵 rc={rc}"
+        if reason:
+            note += f" ({reason})"
+        return "skip", note, ""
+    detail = _codes_detail(payload)
+    if detail:
+        return "fail", detail, detail
+    return "fail", f"rc={rc}" + (f" {reason}" if reason else ""), ""
+
+
+def _codes_detail(payload: dict) -> str:
+    """`failure_codes` -> "8050 × 300건". 코드를 못 뽑은 실패는 '기타'."""
+    codes = payload.get("failure_codes") or {}
+    if not codes:
+        return ""
+    parts = [f"{c} × {n}건"
+             for c, n in sorted(codes.items(), key=lambda kv: -int(kv[1]))]
+    rest = int(payload.get("failed") or 0) - sum(int(n) for n in codes.values())
+    if rest > 0:
+        parts.append(f"기타 × {rest}건")
+    return ", ".join(parts)
+
+
+def _outcome(results: list[dict]) -> str:
+    """마커·알림에 쓸 결과: '완주' / '부분 완료' / '부분 실패'.
+
+    '부분 완료'는 실패 단계는 없지만 update 가 시세를 한 건도 적재하지
+    않은 밤이다. 2026-09-08 은 update 가 rc=0 · 0.8초 · 0건으로 끝났는데
+    마커도 알림도 '완주'였다. 모든 단계를 돌긴 했어도 그날 시세는 없다.
+    """
+    if any(r["state"] == "fail" for r in results):
+        return "부분 실패"
+    upd = next((r for r in results if r["name"] == "update"), None)
+    if upd and not (upd.get("json") or {}).get("rows"):
+        return "부분 완료"
+    return "완주"
 
 
 def _health_override(step: Step, state: str, note: str,
@@ -440,13 +485,16 @@ def _summary(job: Job, started: datetime, finished: datetime,
     skips = [r for r in results if r["state"] == "skip"]
     mins = (finished - started).total_seconds() / 60.0
 
-    head = (f"{job.emoji} {job.label} 완료 {started:%H:%M}~{finished:%H:%M} "
+    word = "부분 완료" if _outcome(results) == "부분 완료" else "완료"
+    head = (f"{job.emoji} {job.label} {word} {started:%H:%M}~{finished:%H:%M} "
             f"({mins:.0f}분) | 성공 {len(ok)}/{len(results)}")
     if skips:
         head += f" | 건너뜀 {len(skips)}"
     if fails:
+        # 코드별 건수(detail)가 있는 단계는 이름만 적고 아래 줄에 따로 쓴다.
         head += " | 실패: " + ", ".join(
-            f"{r['name']}({r['note']})" for r in fails)
+            r["name"] if r.get("detail") else f"{r['name']}({r['note']})"
+            for r in fails)
     else:
         head += " | 실패 없음"
 
@@ -461,6 +509,9 @@ def _summary(job: Job, started: datetime, finished: datetime,
             head += f" · 휴장 기록 {', '.join(j['marked_non_trading'])}"
         if j.get("source_outage"):
             head += f" · 미적재 {', '.join(j['source_outage'])}"
+    for r in fails:
+        if r.get("detail"):
+            head += f"\n{r['name']} 실패: {r['detail']}"
     # 발송 실패는 rc=2 로 드러나긴 하지만, 어느 수신자가 왜 막혔는지는
     # 자식의 --json 안에만 있다. 수신자가 여러 명이면 "누가 못 받았나"가
     # 곧 조치 대상이므로 요약문에 끌어올린다.
@@ -546,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
     day = f"{started:%Y-%m-%d}"
     marker = REPO / (args.done_marker or job.marker_path)
     try:
-        # ── 오늘 이미 완주했으면 스킵 ──
+        # ── 오늘 이미 돌았으면 스킵 ──
         # 반드시 락을 잡은 뒤에 본다. 순서를 뒤집으면 동시에 뜬 두
         # 프로세스가 같은 마커를 읽고 둘 다 '아직 안 돌았다'로 판정한다.
         #
@@ -556,15 +607,17 @@ def main(argv: list[str] | None = None) -> int:
         # 두 번 나가면 그건 사람에게 그대로 보인다.
         done = _read_done(marker) if job.once_per_day else {}
         if done.get("date") == day and not args.force:
-            log(f"오늘({day}) 이미 완주 — 스킵 "
+            log(f"오늘({day}) 이미 실행 — 스킵 "
                 f"(완료 {done.get('finished')} · exit {done.get('exit')} "
                 f"· {done.get('reason')})")
             log("다시 돌리려면 --force")
             # 휴장 스킵과 대칭으로 알림을 낸다. 스킵이 조용하면 '오늘 안
             # 돌았나?' 를 사람이 확인하러 가게 되고, 그 확인이 수동 재실행
             # 으로 이어진다. 스킵도 결과다 — 결과는 보고한다.
+            # '이미 완주'라고 쓰지 않는다. reason 이 '부분 완료'·'부분 실패'
+            # 일 수 있다.
             _notify(f"{job.emoji} {job.label} 스킵 {started:%m/%d %H:%M} | "
-                    f"오늘 이미 완주({done.get('reason')})",
+                    f"오늘 이미 실행({done.get('reason')})",
                     log, notify_on and not job.quiet_ok,
                     why="--no-telegram" if not notify_on else "quiet_ok 잡")
             log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit 0")
@@ -614,13 +667,13 @@ def main(argv: list[str] | None = None) -> int:
 
         fails = [r for r in results if r["state"] == "fail"]
         rc_final = 2 if fails else 0
-        # 부분 실패(exit 2)도 '완주'다. nightly.py 의 설계 원칙 1 이
-        # '한 단계가 실패해도 다음 단계는 돈다'이므로, 여기 도달했다는 건
-        # 모든 단계를 한 번씩 시도했다는 뜻이다. 재시도는 사람이 --force 로
-        # 판단한다 — 자동 재시도는 장중 재실행으로 이어져 부분 적재를 만든다.
+        # 부분 실패(exit 2)·부분 완료도 마커는 남긴다. nightly.py 의 설계
+        # 원칙 1 이 '한 단계가 실패해도 다음 단계는 돈다'이므로, 여기
+        # 도달했다는 건 모든 단계를 한 번씩 시도했다는 뜻이다. 재시도는
+        # 사람이 --force 로 판단한다 — 자동 재시도는 장중 재실행으로 이어져
+        # 부분 적재를 만든다. reason 은 _outcome 이 정한다.
         if job.once_per_day:
-            _mark_done(marker, day, rc_final,
-                       "완주" if rc_final == 0 else "부분 실패")
+            _mark_done(marker, day, rc_final, _outcome(results))
         text = _summary(job, started, finished, results, job_dry)
         log(f"{job.name} 종료 {finished:%H:%M:%S} · exit {rc_final}")
         # quiet_ok 잡은 실패일 때만 알린다. flash 는 5분마다 돌아서

@@ -3196,8 +3196,8 @@ def test_market_source(tmp: Path):
         # 중위값 2,400 의 50% = 1,200 (절대 하한 500 보다 크다)
         assert uni.load_floor(st2) == 1200, uni.load_floor(st2)
 
-    def t_nightly_counts_outage_as_failure():
-        """'실패 없음'인데 시세가 없는 상태를 만들지 않는다."""
+    def _nightly():
+        """nightly.py 를 모듈로 읽는다 (패키지 밖 진입점)."""
         import importlib.util
         repo = Path(__file__).resolve().parent
         spec = importlib.util.spec_from_file_location(
@@ -3210,6 +3210,11 @@ def test_market_source(tmp: Path):
             spec.loader.exec_module(mod)
         finally:
             sys.modules.pop(spec.name, None)
+        return mod
+
+    def t_nightly_counts_outage_as_failure():
+        """'실패 없음'인데 시세가 없는 상태를 만들지 않는다."""
+        mod = _nightly()
         upd = mod.Step("update", ["--mode", "update"])
 
         state, note = mod._health_override(
@@ -3229,6 +3234,92 @@ def test_market_source(tmp: Path):
         state, _ = mod._health_override(
             upd, "ok", "", {"rows": 0, "judge_pending": ["2026-09-09"]})
         assert state == "ok", state
+
+    def t_nightly_credit_kiwoom_rc4():
+        """credit-kiwoom exit 4: 키 없음·대상 0건만 스킵, 전 종목 실패는 실패."""
+        mod = _nightly()
+        ck = next(s for s in mod.STEPS if s.name == "credit-kiwoom")
+        for why in ("no_credentials", "no_targets"):
+            state, _, _ = mod._judge(ck, 4, "", {"skipped": True,
+                                                 "reason": why})
+            assert state == "skip", (why, state)
+
+        # 2026-09-10 운영 페이로드 모양: 300/300 종목이 8050
+        p = {"written": 0, "failed": 300, "reason": "all_failed",
+             "failure_codes": {"8050": 300}}
+        state, note, detail = mod._judge(ck, 4, "", p)
+        assert state == "fail", state
+        assert detail == "8050 × 300건", detail
+        # reason 없는 exit 4 (고치기 전 run_screen) 도 스킵으로 삼키지 않는다
+        for payload in ({}, {"reason": "auth"}, {"reason": "no_prices"}):
+            s, _, _ = mod._judge(ck, 4, "", payload)
+            assert s == "fail", (payload, s)
+        # 코드를 못 뽑은 실패는 '기타' 로 붙는다
+        _, _, d2 = mod._judge(ck, 4, "", {"failed": 5, "reason": "all_failed",
+                                          "failure_codes": {"8050": 3}})
+        assert d2 == "8050 × 3건, 기타 × 2건", d2
+
+        results = [
+            {"name": "update", "rc": 0, "state": "ok", "note": "",
+             "detail": "", "json": {"rows": 2419,
+                                    "last_price_date": "2026-09-10"}},
+            {"name": "credit-kiwoom", "rc": 4, "state": state, "note": note,
+             "detail": detail, "json": p},
+        ]
+        text = mod._summary(mod.JOBS["nightly"], datetime(2026, 9, 10, 21, 30),
+                            datetime(2026, 9, 10, 22, 9), results, False)
+        assert "credit-kiwoom 실패: 8050 × 300건" in text, text
+        assert "실패 없음" not in text, text
+
+    def t_nightly_zero_rows_is_partial_done():
+        """update 가 0건 적재로 끝난 밤은 '완주'가 아니라 '부분 완료' (09-08)."""
+        import contextlib
+        import io
+        import json as _j
+        mod = _nightly()
+
+        def res(name, state="ok", **payload):
+            return {"name": name, "rc": 0, "state": state, "note": "",
+                    "detail": "", "elapsed": 0.0, "json": payload}
+
+        # 휴장 근거가 있어 실패로는 안 잡히는 0건
+        zero = [res("update", rows=0, holidays_skipped=1), res("daily")]
+        assert mod._outcome(zero) == "부분 완료", mod._outcome(zero)
+        assert mod._outcome([res("update", rows=2419), res("daily")]) == "완주"
+        assert mod._outcome([res("update", rows=0),
+                             res("news", state="fail")]) == "부분 실패"
+        # update 단계가 없는 잡은 0건 판정 대상이 아니다
+        assert mod._outcome([res("brief-evening")]) == "완주"
+
+        # main 경로: 마커 reason · 완료 알림 · 같은 날 두 번째 기동의 스킵 알림
+        root = tmp / "nightly_zero"
+        root.mkdir(parents=True, exist_ok=True)
+        sent: list[str] = []
+        saved = (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
+                 mod._notify)
+        try:
+            mod.REPO = root
+            mod.load_env = lambda *a, **k: {"exists": True, "path": ""}
+            mod.market_status = lambda store, when: "OPEN"
+            mod._run_step = lambda step, dry, log, timeout: res(
+                step.name, **({"rows": 0, "holidays_skipped": 1}
+                              if step.name == "update" else {}))
+            mod._notify = lambda text, log, enabled, why="": sent.append(text)
+            argv = ["--db", str(root / "q.db"),
+                    "--lock-dir", str(root / "locks")]
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc1 = mod.main(argv)
+                done = _j.loads((root / mod.DONE_MARKER).read_text(
+                    encoding="utf-8"))
+                first = sent[-1] if sent else ""
+                rc2 = mod.main(argv)
+        finally:
+            (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
+             mod._notify) = saved
+        assert rc1 == 0 and rc2 == 0, (rc1, rc2)
+        assert done["reason"] == "부분 완료", done
+        assert "nightly 부분 완료" in first, first
+        assert "이미 완주" not in sent[-1] and "부분 완료" in sent[-1], sent[-1]
 
     def t_snapshot_path_used():
         """스냅샷이 검증되면 요청 1회로 적재된다."""
@@ -3274,6 +3365,8 @@ def test_market_source(tmp: Path):
     check("market_source", "종가 조회 3분기 + 재시도", t_close_on_status_three_way)
     check("market_source", "적재량 하한", t_load_floor)
     check("market_source", "소스 장애를 실패로 집계", t_nightly_counts_outage_as_failure)
+    check("market_source", "credit-kiwoom exit 4 스킵/실패 구분", t_nightly_credit_kiwoom_rc4)
+    check("market_source", "update 0건은 부분 완료", t_nightly_zero_rows_is_partial_done)
     check("market_source", "스냅샷 경로 적재", t_snapshot_path_used)
     check("market_source", "주말 즉시 생략", t_weekend_short_circuits)
 
@@ -3902,6 +3995,28 @@ def test_kiwoom_rest(tmp: Path):
         collect_credit(c, ["005930", "000660"], trade_date="2026-08-27")
         assert len(fake.tr_calls) == 2, len(fake.tr_calls)
 
+    def t_collect_counts_failure_codes():
+        """failures 는 20건에서 잘린다. 코드별 건수는 전 종목을 센다.
+
+        운영 응답 모양: return_code 는 3 이고 원인 코드 8050 은 메시지
+        대괄호 안에만 있다 (2026-09-03~10).
+        """
+        fake = Fake()
+        deny = {"return_code": 3, "return_msg":
+                "인증에 실패했습니다[8050:지정단말기 인증에 실패했습니다]"}
+        fake.script = [HttpReply(200, dict(deny)) for _ in range(25)]
+        fake.script.append(HttpReply(200, {"return_code": 1504,
+                                           "return_msg": "입력값 오류"}))
+        tickers = [f"{i:06d}" for i in range(1, 27)]
+        rows, stats = collect_credit(_client(fake), tickers + ["bad"],
+                                     trade_date="2026-08-27")
+        assert rows == [], rows
+        assert stats["failed"] == 27, stats["failed"]
+        assert len(stats["failures"]) == 20, len(stats["failures"])
+        # 대괄호 코드가 없으면 return_code, 코드 자체가 없으면('bad') 안 센다
+        assert stats["failure_codes"] == {"8050": 25, "1504": 1}, \
+            stats["failure_codes"]
+
     def t_continuation_capped():
         """cont-yn=Y 여도 max_pages 를 넘겨선 안 된다."""
         fake = Fake()
@@ -3949,6 +4064,7 @@ def test_kiwoom_rest(tmp: Path):
     check("kiwoom-rest", "잔고 단위 역산 판정", t_share_unit_resolved)
     check("kiwoom-rest", "단위 불명이면 추측 안 함", t_share_unit_refuses_to_guess)
     check("kiwoom-rest", "수집 전 경로 왕복", t_collect_credit_roundtrip)
+    check("kiwoom-rest", "실패 코드별 건수", t_collect_counts_failure_codes)
     check("kiwoom-rest", "종목당 요청 1건", t_collect_uses_one_request_per_ticker)
     check("kiwoom-rest", "연속조회 페이지 상한", t_continuation_capped)
     check("kiwoom-rest", "주문 경로 없음", t_no_order_calls)
@@ -5490,6 +5606,18 @@ def test_env(tmp: Path):
         finally:
             os.environ.pop("WAT_IS_THIS", None)
 
+    def t_krx_api_key_known():
+        """운영 .env 의 KRX_API_KEY 가 매 실행 '알 수 없는 키' 경고를 내면 안 된다."""
+        p = tmp / "krx.env"
+        p.write_text("KRX_API_KEY=abc\n", encoding="utf-8")
+        os.environ.pop("KRX_API_KEY", None)
+        try:
+            rep = load_env(p)
+            assert "KRX_API_KEY" not in rep["unknown_keys"], rep
+            assert mask("KRX_API_KEY", "abc") == "설정됨", "인증키 값이 노출된다"
+        finally:
+            os.environ.pop("KRX_API_KEY", None)
+
     def t_example_matches_known_keys():
         """`.env.example` 과 KNOWN_KEYS 가 어긋나면 안 된다.
 
@@ -5547,6 +5675,7 @@ def test_env(tmp: Path):
     check("env", "OS 환경변수 우선", t_os_env_wins)
     check("env", "값 적용", t_applies_value)
     check("env", "알 수 없는 키 보고", t_unknown_key_reported)
+    check("env", "KRX_API_KEY 는 알려진 키", t_krx_api_key_known)
     check("env", ".env.example <-> KNOWN_KEYS 일치", t_example_matches_known_keys)
     check("env", "비밀 값 미노출", t_secrets_never_echoed)
     check("env", "저장소 루트 기준", t_repo_root_not_cwd)

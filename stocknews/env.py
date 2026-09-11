@@ -45,6 +45,9 @@ KNOWN_KEYS: tuple[str, ...] = (
     "DART_API_KEY",
     "DATA_GO_KR_KEY",
     "KRX_CREDIT_BLD",
+    # KRX 오픈API 인증키. 아직 읽는 모드는 없지만 운영 .env 에 들어 있어서
+    # 여기 없으면 매 실행 "알 수 없는 키" 경고가 난다 (2026-09-10~).
+    "KRX_API_KEY",
     "KIWOOM_APP_KEY",
     "KIWOOM_APP_SECRET",
     "KIWOOM_API_BASE",
@@ -57,7 +60,7 @@ KNOWN_KEYS: tuple[str, ...] = (
 
 # 값을 절대 출력하면 안 되는 키. 부분 마스킹조차 하지 않는다.
 SECRET_KEYS: frozenset[str] = frozenset({
-    "TELEGRAM_BOT_TOKEN", "DART_API_KEY", "DATA_GO_KR_KEY",
+    "TELEGRAM_BOT_TOKEN", "DART_API_KEY", "DATA_GO_KR_KEY", "KRX_API_KEY",
     "KIWOOM_APP_KEY", "KIWOOM_APP_SECRET",
 })
 
