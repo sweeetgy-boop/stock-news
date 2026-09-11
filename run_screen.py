@@ -31,15 +31,24 @@
   python run_screen.py --mode flash         # 아침 즉시 속보
 
 모든 모드에 --dry-run 을 붙이면 텔레그램 대신 콘솔로 출력한다.
-환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+설정
+----
+저장소 루트의 `.env` 를 자동으로 읽는다 (`--env-file` 로 경로 변경).
+이미 설정된 OS 환경변수가 `.env` 보다 우선한다. 키 목록은 `.env.example`
+과 `stocknews/env.py` 의 KNOWN_KEYS 를 참조.
+  필수  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  선택  DART_API_KEY, KIWOOM_APP_KEY, KIWOOM_APP_SECRET, KRX_CREDIT_BLD
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -47,24 +56,40 @@ import pandas as pd
 
 from stocknews.config import DEFAULT
 from stocknews.daily import run_daily, scan_all, select_recommendations
-from stocknews.exits import run_exits
+from stocknews.dividend_calendar import (build_dividend_report,
+                                         report_send_allowed)
+from stocknews.dividend_data import (collect_dividends, dart_key_present,
+                                     latest_fiscal_year)
+from stocknews.env import load_env
+from stocknews.exits import run_exits, stop_price_for
 from stocknews.backtest import (BacktestConfig, control_random, control_rsi,
                                 run_backtest, simulate_exit_rules,
                                 summarize, summarize_exits, sweep_thresholds)
-from stocknews.flags import flag_summary, refresh_credit, refresh_flags
-from stocknews.krx_credit import probe as krx_probe
+from stocknews.flags import (flag_summary, refresh_credit,
+                             refresh_credit_chain, refresh_flags)
+from stocknews import kiwoom_rest
+from stocknews.kiwoom import CREDIT_CSV as KIWOOM_CREDIT_CSV
+from stocknews.kiwoom import build_plan as kiwoom_plan
+from stocknews.kiwoom import check_environment as kiwoom_env
+from stocknews.kiwoom import estimate_seconds as kiwoom_estimate
+from stocknews.kiwoom import write_credit_csv
+from stocknews.krx_credit import diagnose as krx_diagnose
 from stocknews.krx_credit import refresh_credit_auto
 from stocknews.joblock import JobLock, clear_locks
 from stocknews.notify import TelegramNotConfigured, now_kst
 from stocknews.trading_day import (is_definitely_closed, market_status,
                                    news_window_hours, should_scan_intraday)
 from stocknews.news import process_and_store, theme_shift
+from stocknews.news_freq import collect_news_freq
 from stocknews.news_sources import collect_all
-from stocknews.notify import AlertGate, send_telegram  # noqa: F401
-from stocknews.renderer import (render_detail, render_evening_brief,
-                                render_exit_alert, render_exit_digest,
-                                render_fib_list, render_morning_brief,
-                                render_news_weekly, render_positions,
+from stocknews.notify import (AlertGate, reco_send_allowed,  # noqa: F401
+                             reco_send_dow_label, send_telegram)
+from stocknews.renderer import (render_daily_holdings, render_detail,
+                                render_dividend_report,
+                                render_evening_brief, render_exit_alert,
+                                render_exit_digest, render_fib_list,
+                                render_morning_brief, render_news_weekly,
+                                render_positions, render_reco_stored,
                                 render_top10, render_weekly)
 from stocknews.screener import screen_one
 from stocknews.store import Store
@@ -72,10 +97,70 @@ from stocknews.universe import (backfill_one, fetch_day, fill_sectors,
                                 liquidity_filter, refresh_master)
 from stocknews.weekly import weekly_report
 
-# 로그는 stderr 로 보낸다. stdout 은 --json 결과 전용이어야
-# 에이전트가 파싱할 수 있다.
-logging.basicConfig(level=logging.INFO, stream=sys.stderr,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+# 로그는 stderr 와 파일에 동시에 쓴다. stdout 은 --json 결과 전용이어야
+# 에이전트가 파싱할 수 있으므로 절대 쓰지 않는다.
+#
+# 파일이 필요한 이유: 발송 실패 같은 사건은 그것이 일어난 밤에는 아무도
+# 안 보고, 며칠 뒤에야 "그때 왜 안 왔지"로 되돌아온다. 콘솔 스크롤백은
+# 그때 이미 없다.
+LOG_DIR = Path("logs")
+LOG_RETENTION_DAYS = 30
+# 우리가 만든 일자 로그만 고른다. 이 디렉터리에는 nightly.py 가 만드는
+# 잡별 로그(daily.log, brief-morning_20260909.log ...)도 함께 살고 있어서,
+# 정리 대상을 이 접두어로 좁히지 않으면 남의 파일을 지운다.
+_LOG_GLOB = "stocknews_*.log"
+
+
+def _log_path(day=None) -> Path:
+    return LOG_DIR / f"stocknews_{(day or now_kst().date()):%Y%m%d}.log"
+
+
+def _prune_logs(keep_days: int = LOG_RETENTION_DAYS) -> list[str]:
+    """보존 기간이 지난 일자 로그를 지운다. 지운 파일명을 돌려준다.
+
+    이름에서 날짜를 못 읽는 파일은 건드리지 않는다. mtime 이 아니라
+    파일명의 날짜로 판단하는 이유는, 복사·동기화로 mtime 이 갱신된
+    오래된 로그가 영원히 남는 일을 막기 위해서다.
+    """
+    cutoff = now_kst().date() - timedelta(days=keep_days)
+    removed: list[str] = []
+    try:
+        paths = sorted(LOG_DIR.glob(_LOG_GLOB))
+    except OSError:
+        return removed
+    for p in paths:
+        stem = p.name[len("stocknews_"):-len(".log")]
+        try:
+            day = datetime.strptime(stem, "%Y%m%d").date()
+        except ValueError:
+            continue          # 규칙에 안 맞는 이름은 우리 것이 아니다
+        if day < cutoff:
+            try:
+                p.unlink()
+                removed.append(p.name)
+            except OSError:
+                pass          # 정리 실패가 배치를 막으면 안 된다
+    return removed
+
+
+def _setup_logging() -> None:
+    """stderr + 일자 파일. 파일을 못 열어도 배치는 계속한다."""
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(_log_path(), encoding="utf-8"))
+    except OSError as exc:
+        # 로그를 못 쓴다고 배치를 죽이지는 않는다. 다만 조용히 넘기면
+        # 파일이 없는 이유를 나중에 알 수 없으므로 stderr 에는 남긴다.
+        # (_say 는 아직 정의 전이고 SUMMARY 도 비어 있다. 여기서는
+        #  stderr 가 유일한 정답이므로 직접 고른다.)
+        msg = f"[run] 파일 로깅 비활성 ({exc}) — stderr 로만 기록합니다"
+        print(msg, file=sys.stderr)
+    logging.basicConfig(level=logging.INFO, handlers=handlers,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+_setup_logging()
 log = logging.getLogger("run")
 
 # ── 종료 코드 규약 (Hermes 가 이 값으로 재시도/알림을 판단한다) ──
@@ -106,26 +191,54 @@ PARTIAL_FAIL_RATIO = 0.10
 
 # DB 를 쓰는 모드. 락으로 직렬화한다. 읽기 전용 조회는 제외.
 _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
+                "credit-kiwoom", "collect-dividends", "dividend-report",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
-                "flash", "pos-open", "fill", "pos-close"}
+                "flash", "pos-open", "fill", "pos-close", "holidays"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
 SUMMARY: dict = {}     # --json 출력용. 각 모드가 여기에 결과를 적는다.
 
 
+def _out():
+    """사람이 읽는 보고문을 낼 스트림.
+
+    `--json` 일 때 stdout 은 JSON 한 줄 전용이다. AGENTS.md 가 그렇게
+    규정하고 에이전트가 그걸 파싱한다. 사람용 출력이 섞이면
+    `ConvertFrom-Json` 이 깨진다. 그래서 --json 이면 stderr 로 보낸다.
+    """
+    return sys.stderr if SUMMARY.get("_json") else sys.stdout
+
+
+def _say(*args, **kwargs) -> None:
+    """print 대체. 모드 핸들러는 맨 print 를 쓰지 말고 이것을 쓴다."""
+    kwargs.setdefault("file", _out())
+    print(*args, **kwargs)
+
+
 def _emit(text: str, dry: bool) -> None:
     if dry:
         # --json 과 함께 쓸 때 stdout 을 오염시키지 않도록 stderr 로 보낸다.
-        out = sys.stderr if SUMMARY.get("_json") else sys.stdout
+        out = _out()
         print("=" * 62, file=out)
         print(text, file=out)
         print("=" * 62, file=out)
         SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
         return
-    send_telegram(text)
+    # 발송 실패를 성공으로 집계하면 무음 장애를 알아챌 수 없다.
+    report = send_telegram(text)
     SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
-    log.info("텔레그램 발송 완료 (%d자)", len(text))
+    if report:
+        log.info("텔레그램 발송 완료 (%d자 · 수신자 %d명)",
+                 len(text), report.sent)
+        return
+    # 수신자별 상세를 남긴다. 개수만 세면 "두 명 중 누가 못 받았나"를
+    # 알 수 없고, 그게 바로 알아야 하는 정보다.
+    SUMMARY["send_failed"] = (SUMMARY.get("send_failed", 0)
+                              + len(report.failures))
+    SUMMARY.setdefault("send_failures", []).extend(report.as_dicts())
+    log.error("텔레그램 %s (%d자 · 성공 %d명)",
+              report.summary(), len(text), report.sent)
 
 
 def _partial(ok: int, failed: int) -> bool:
@@ -136,13 +249,76 @@ def _partial(ok: int, failed: int) -> bool:
     return (failed / total) > PARTIAL_FAIL_RATIO
 
 
+# ── 실행 이력용 카운트 해석 ──
+# 모드마다 '몇 건 처리했나'를 다른 키로 보고한다. runs 테이블은 두 칸
+# (ok/failed)뿐이므로 여기서 한 번만 접는다. 순서가 우선순위다.
+_OK_KEYS = ("ok", "scanned", "stored", "written", "picks", "decisions",
+            "parsed", "messages", "total", "categories")
+_FAIL_KEYS = ("failed", "empty")
+
+
+def _run_counts(rc: int) -> tuple[int, int]:
+    """SUMMARY 에서 runs 테이블용 (ok, failed) 를 뽑는다.
+
+    카운트를 보고하지 않는 모드(pos-close 등)는 성공 1건 / 실패 1건으로
+    센다. 0/0 으로 남기면 '돌았지만 아무것도 안 했다'와 '안 돌았다'가
+    구분되지 않는다.
+    """
+    ok = failed = None
+    for k in _OK_KEYS:
+        v = SUMMARY.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            ok = int(v)
+            break
+    for k in _FAIL_KEYS:
+        v = SUMMARY.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            failed = int(v)
+            break
+    if ok is None and failed is None:
+        return (1, 0) if rc == EXIT_OK else (0, 1)
+    return int(ok or 0), int(failed or 0)
+
+
+def _pad(text, width: int, align: str = "<") -> str:
+    """한글을 섞은 표를 맞춘다.
+
+    파이썬의 `{:<16}` 은 **글자 수**로 채운다. 한글은 콘솔에서 두 칸을
+    차지하므로 헤더가 한글이면 표가 어긋난다. 동아시아 전각 폭을 세서
+    실제 표시 폭으로 맞춘다.
+    """
+    s = str(text)
+    w = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+    fill = " " * max(0, width - w)
+    return (s + fill) if align == "<" else (fill + s)
+
+
+def _run_note(rc: int) -> str:
+    """runs.note 에 남길 한 줄. 사람이 이력만 보고 원인을 짚을 수 있게."""
+    bits = [f"rc={rc}"]
+    for k in ("trade_date", "reason", "error", "locked_by", "window",
+              "send_failed", "skipped"):
+        v = SUMMARY.get(k)
+        if v not in (None, "", False):
+            bits.append(f"{k}={str(v)[:80]}")
+    return " ".join(bits)
+
+
 # ────────────────────────── 모드 구현 ──────────────────────────
 def mode_master(store: Store, args) -> int:
     refresh_master(store, include_preferred=args.include_preferred)
-    fill_sectors(store)
+    sectors = fill_sectors(store)
     n = len(store.active_tickers())
-    log.info("활성 종목 %d개", n)
-    SUMMARY["active_tickers"] = n
+    cov = store.sector_coverage()
+    log.info("활성 종목 %d개 · 업종 %d/%d (%.1f%%, %d업종)",
+             n, cov["with_sector"], cov["active"], cov["pct"], cov["sectors"])
+    SUMMARY.update({"active_tickers": n, "sectors_filled": sectors,
+                    "sector_coverage": cov})
+    # 섹터가 비면 추천 10선의 분산 제한이 조용히 꺼진다. 에러가 아니므로
+    # 보고에 남겨야 사람이 알아챈다.
+    if cov["pct"] < 50.0:
+        log.warning("업종 커버리지 %.1f%% — 추천 섹터 분산 제한이 대부분 "
+                    "적용되지 않습니다.", cov["pct"])
     # 마스터가 비면 이후 전부가 무의미하다. 조회 실패를 성공으로 보고하면
     # 에이전트가 다음 단계로 넘어가 더 큰 혼란이 생긴다.
     return EXIT_OK if n > 0 else EXIT_FAIL
@@ -153,8 +329,11 @@ def mode_backfill(store: Store, args) -> int:
     started = datetime.now()
     tickers = store.active_tickers()
     if not tickers:
-        log.error("종목 마스터가 비어 있다. --mode master 를 먼저 실행하라.")
-        return 1
+        # 순서가 틀린 것이다. exit 1 로 내면 에이전트가 3회 재시도하는데
+        # master 를 돌리지 않는 한 영원히 실패한다. 전제조건으로 분류한다.
+        log.error("종목 마스터가 비어 있습니다. --mode master 를 먼저 "
+                  "실행하십시오.")
+        return EXIT_PRECOND
 
     done = store.backfill_done()
     todo = [t for t in tickers if t not in done]
@@ -177,7 +356,8 @@ def mode_backfill(store: Store, args) -> int:
             log.info("  %d/%d 적재 (성공 %d, 빈값 %d) · 잔여 약 %.0f분",
                      i, len(todo), ok, fail, eta)
 
-    store.log_run("backfill", started, ok, fail)
+    # runs 기록은 main() 이 전 모드에 대해 한 번만 남긴다. 여기서 또
+    # 부르면 backfill 만 이력이 두 줄씩 생겨 집계가 틀어진다.
     bars = store.bar_count(120)
     log.info("백필 완료: 성공 %d / 빈값 %d · 120봉 이상 확보 %d종목",
              ok, fail, bars)
@@ -197,11 +377,24 @@ def mode_update(store: Store, args) -> int:
     """
     started = now_kst()
     since = (started - timedelta(days=args.catchup + 5)).strftime("%Y-%m-%d")
-    have = store.existing_dates(since=since)
+    # 부분 적재일은 '아직 안 받은 날'로 취급해 다시 요청한다. 행이 1개라도
+    # 있으면 완료로 보던 예전 조건이 2026-09 의 구멍 4일을 영구화했다.
+    have = store.complete_dates(since=since)
+    partial = store.partial_dates(since=since)
+    if partial:
+        log.warning("부분 적재 %d일 재요청: %s", len(partial),
+                    ", ".join(f"{d}({n}종목)"
+                              for d, n in sorted(partial.items())))
+    SUMMARY["partial_refetch"] = dict(sorted(partial.items()))
     # 이미 휴장일로 확인된 날짜는 다시 요청하지 않는다. 이게 없으면
     # 공휴일을 catchup 기간 내내 매번 재요청한다(0건이라 have 에 안 들어감).
     holidays = store.known_non_trading_days(since=since)
     total, skipped = 0, 0
+    # 날짜별 판정 근거. '적재 0건'이 휴장인지 장애인지를 구분해서 위로
+    # 올린다. 이게 없으면 nightly 가 소스 장애를 '실패 없음'으로 보고한다.
+    outages: list[str] = []
+    marked: list[str] = []
+    pending: list[str] = []
     for back in range(args.catchup, -1, -1):
         day = started - timedelta(days=back)
         if day.weekday() >= 5:            # 토/일
@@ -212,20 +405,42 @@ def mode_update(store: Store, args) -> int:
         if ds in holidays:
             skipped += 1
             continue
-        n = fetch_day(store, day.strftime("%Y%m%d"))
+        rep: dict = {}
+        n = fetch_day(store, day.strftime("%Y%m%d"), report=rep)
         total += n
+        verdict = rep.get("verdict")
+        if verdict == "OUTAGE":
+            outages.append(ds)
+        elif verdict == "PENDING":
+            pending.append(ds)
+        elif verdict == "CLOSED" and rep.get("path") == "closed":
+            marked.append(ds)
         if n:
             time.sleep(0.6)
     if skipped:
         log.info("알려진 휴장일 %d일 건너뜀", skipped)
+    if marked:
+        log.info("휴장일로 새로 기록: %s", ", ".join(marked))
+    if pending:
+        log.info("장 마감 전이라 판정 보류: %s", ", ".join(pending))
     SUMMARY["holidays_skipped"] = skipped
-    store.log_run("update", started, total, 0)
     last = store.last_price_date()
     log.info("증분 적재 %d건 · 최신 거래일 %s", total, last)
-    SUMMARY.update({"rows": total, "last_price_date": last})
+    SUMMARY.update({"rows": total, "last_price_date": last,
+                    "source_outage": outages,
+                    "marked_non_trading": marked,
+                    "judge_pending": pending})
     if not total and not have:
         # 시세가 하나도 없다. backfill 이 선행돼야 한다.
         return EXIT_PRECOND
+    if outages:
+        # **성공으로 끝내지 않는다.** 거래일인데 시세를 못 받은 것은
+        # 조용히 넘어가면 안 되는 상태다. 휴장일로 기록하지 않았으니
+        # 다음 실행이 다시 요청하지만, 그 사실이 사람에게 보여야 한다.
+        log.error("소스 장애로 적재하지 못한 거래일 %d일: %s — 휴장일로 "
+                  "기록하지 않았으므로 다음 실행에서 다시 요청합니다.",
+                  len(outages), ", ".join(outages))
+        return EXIT_PARTIAL
     return EXIT_OK
 
 
@@ -259,21 +474,54 @@ def _closed_guard(store: Store, args, mode: str) -> str | None:
     return None
 
 
-def mode_daily(store: Store, args) -> int:
-    """저녁 전종목 스캔 + 추천 10선."""
-    reason = _closed_guard(store, args, "daily")
-    if reason:
-        log.info("%s", reason)
-        SUMMARY.update({"skipped": True, "reason": reason})
-        return EXIT_OK
+def _holdings_msg(store: Store, args, asof, trade_date: str, scanned: int,
+                  picks: int, dow_label: str) -> None:
+    """발송 요일이 아닌 날의 daily 메시지. 신규 추천은 넣지 않는다."""
+    positions = store.list_positions("OPEN")
+    pm = {p.ticker: store.load_ohlcv(p.ticker, days=5) for p in positions}
+    _emit(render_daily_holdings(positions, pm, asof, trade_date,
+                                scanned, picks, dow_label), args.dry_run)
 
+
+def mode_daily(store: Store, args) -> int:
+    """저녁 전종목 스캔 + 추천 10선.
+
+    스캔과 기록은 매일, 추천 발송은 주 1회(`GateConfig.reco_send_dow`).
+    채점 표본은 매일 쌓여야 하고, 사람의 결정은 주 1회여야 한다.
+    """
+    asof = now_kst()
+    send_ok, send_reason = reco_send_allowed(asof, DEFAULT, force=args.force)
+    dow_label = reco_send_dow_label(DEFAULT)
+    SUMMARY.update({"dow": asof.weekday(), "send_reason": send_reason,
+                    "reco_sent": False})
+
+    # 스캔 생략 판정과 발송 판정을 분리한다. 발송 요일(일요일)은 휴장이라
+    # 스캔이 항상 생략되는데, 예전처럼 여기서 함께 return 하면 주간 발송이
+    # 영구히 나가지 않는다.
+    skip = _closed_guard(store, args, "daily")
     trade_date = store.last_price_date()
-    if trade_date and store.has_scan(trade_date) and not args.force:
-        # 같은 거래일 스냅샷이 이미 있다. 재실행하면 Top-10 이 중복 발송된다.
-        log.info("%s 스냅샷이 이미 있습니다 — 생략 (--force 로 재실행)",
-                 trade_date)
-        SUMMARY.update({"skipped": True, "reason": "snapshot exists",
+    if not skip and trade_date and store.has_scan(trade_date) and not args.force:
+        # 같은 거래일 스냅샷이 이미 있다. 재실행하면 스냅샷이 중복 생성된다.
+        skip = "snapshot exists"
+
+    if skip:
+        log.info("%s", skip)
+        SUMMARY.update({"skipped": True, "reason": skip,
                         "trade_date": trade_date})
+        if not send_ok:
+            return EXIT_OK
+        # 발송 요일이다. 새로 스캔하지 않고 마지막 거래일에 기록된 추천을 낸다.
+        rows = store.reco_history(days=1)
+        n = 0 if rows is None else int(len(rows))
+        SUMMARY.update({"picks": n, "from_db": True})
+        if not n:
+            # 보낼 게 없으면 보내지 않는다. "추천 없음" 알림은 소음이다.
+            # 배치가 안 돈 것 자체는 --mode runs 가 잡는다.
+            log.warning("발송 요일이지만 기록된 추천이 없습니다 — 발송 생략")
+            return EXIT_OK
+        log.info("주간 추천 발송: 기록된 %d건 (스캔 생략)", n)
+        _emit(render_reco_stored(rows, asof, dow_label), args.dry_run)
+        SUMMARY["reco_sent"] = True
         return EXIT_OK
 
     tickers = _scan_pool(store, args)
@@ -282,10 +530,18 @@ def mode_daily(store: Store, args) -> int:
         return EXIT_PRECOND
 
     res = run_daily(store, cfg=DEFAULT, top_n=args.top, tickers=tickers)
-    asof = now_kst()
 
-    _emit(render_top10(res["picks"], asof, res["trade_date"],
-                       scanned=len(res["results"]), cfg=DEFAULT), args.dry_run)
+    if send_ok:
+        _emit(render_top10(res["picks"], asof, res["trade_date"],
+                           scanned=len(res["results"]), cfg=DEFAULT),
+              args.dry_run)
+        SUMMARY["reco_sent"] = True
+    else:
+        # 평일. 추천은 DB 에만 쌓고 보유 종목 상태만 보낸다.
+        log.info("발송 요일(%s) 이 아님 — 보유 요약만 발송 (추천 %d건 기록)",
+                 dow_label, len(res["picks"]))
+        _holdings_msg(store, args, asof, res["trade_date"],
+                      len(res["results"]), len(res["picks"]), dow_label)
 
     if args.with_fib:
         picked = [r for r in res["results"]
@@ -308,9 +564,25 @@ def mode_daily(store: Store, args) -> int:
 
 
 def mode_weekly(store: Store, args) -> int:
+    # --monthly 를 주면 전월 회고를 강제로 붙인다. 기본은 '그 달의 첫
+    # 금요일인가'로 자동 판정한다.
     rep = weekly_report(store, cfg=DEFAULT, week_days=args.week_days,
-                        horizon=args.horizon)
+                        horizon=args.horizon,
+                        monthly=True if args.monthly else None)
     SUMMARY["days_covered"] = rep.get("days_covered", 0)
+    mon = rep.get("monthly")
+    SUMMARY["monthly"] = bool(mon)
+    if mon:
+        c = mon.get("compliance") or {}
+        SUMMARY["monthly_review"] = {
+            "month": mon.get("month"), "recos": mon.get("recos", 0),
+            "entries": len(mon.get("entries") or []),
+            "exits": len(mon.get("exits") or []),
+            "min_hold_violations": c.get("min_hold_violations", 0),
+            "stop_not_executed": c.get("stop_not_executed", 0),
+            "reentry_violations": c.get("reentry_violations", 0),
+            "compliance_pct": c.get("compliance_pct"),
+        }
     _emit(render_weekly(rep, now_kst(), DEFAULT), args.dry_run)
     return EXIT_OK
 
@@ -388,7 +660,13 @@ def mode_news(store: Store, args) -> int:
     res = process_and_store(store, raw)
     log.info("뉴스 정리 완료: 수집 %d → 저장 %d · 종목링크 %d",
              res["collected"], res["stored"], res["links"])
-    return 0
+    SUMMARY.update({"collected": res["collected"], "stored": res["stored"],
+                    "links": res["links"]})
+    # 테마 언급 빈도 기록. 수집 직후라야 그날 최신 건수가 잡힌다.
+    # 기록 전용이고 실패를 삼키므로 이 모드의 종료 코드에 영향이 없다.
+    freq = collect_news_freq(store, cfg=DEFAULT)
+    SUMMARY["news_freq"] = {k: v for k, v in freq.items() if k != "top"}
+    return EXIT_OK
 
 
 def mode_brief_morning(store: Store, args) -> int:
@@ -427,9 +705,11 @@ def mode_brief_evening(store: Store, args) -> int:
         # 오늘 추천 목록을 렌더러가 쓰는 최소 형태로 재구성한다.
         picks = [(r["slot"], _RecoRow(r)) for _, r in rec.iterrows()]
 
-    _emit(render_evening_brief(store, datetime.now(), picks=picks,
+    _emit(render_evening_brief(store, now_kst(), picks=picks,
                                hours=args.news_hours), args.dry_run)
-    return 0
+    SUMMARY.update({"news_hours": args.news_hours,
+                    "picks": 0 if picks is None else len(picks)})
+    return EXIT_OK
 
 
 class _RecoRow:
@@ -454,50 +734,442 @@ class _RecoRow:
 def mode_brief_weekly(store: Store, args) -> int:
     """주간 뉴스 테마 부침."""
     shift = theme_shift(store, week_days=args.week_days)
-    _emit(render_news_weekly(shift, datetime.now()), args.dry_run)
-    return 0
+    _emit(render_news_weekly(shift, now_kst()), args.dry_run)
+    # theme_shift 는 DataFrame 을 준다 (index=category, delta 내림차순).
+    SUMMARY.update({"week_days": args.week_days,
+                    "categories": int(len(shift)),
+                    "top_rising": (str(shift.index[0]) if len(shift) else None),
+                    "top_falling": (str(shift.index[-1]) if len(shift) else None)})
+    return EXIT_OK
 
 
 def mode_credit_probe(store: Store, args) -> int:
-    """KRX 신용잔고 bld 코드 탐침.
+    """신용잔고 자동 수집 가능성 진단.
 
-    '신용거래융자 종목별 잔고'의 정확한 bld 코드는 확인되지 않았다.
-    추측을 코드에 박는 대신 후보를 시험해 어느 것이 동작하는지 보고한다.
+    2026-08 조사 결론은 '불가'다. KRX 는 종목별 신용거래융자 잔고를
+    공개하지 않는다. 그 결론을 문서에만 적어두면 KRX 가 정책을 바꿨을 때
+    아무도 모르므로, 실행 시점에 엔드포인트와 메뉴를 다시 확인한다.
     """
     td = (args.date or store.last_price_date() or
           now_kst().strftime("%Y-%m-%d"))
     ymd = str(td).replace("-", "")[:8]
     extra = (args.bld,) if args.bld else ()
-    report = krx_probe(ymd, extra_blds=extra)
+    rep = krx_diagnose(ymd, extra_blds=extra)
+    SUMMARY["diagnose"] = rep
 
-    print(f"\nKRX 신용잔고 bld 탐침 (기준일 {ymd})\n")
-    hit = None
-    for it in report:
-        mark = "OK  " if it.get("usable") else "    "
-        print(f"{mark}{it['bld']}  rows={it['rows']}")
-        if it.get("columns"):
-            print(f"      컬럼: {', '.join(str(c) for c in it['columns'])}")
-            print(f"      매핑: 종목={it.get('ticker_col')} "
-                  f"수량={it.get('qty_col')} 비율={it.get('ratio_col')}")
-        if it.get("usable") and hit is None:
-            hit = it["bld"]
-    SUMMARY["probe"] = report
-    SUMMARY["usable_bld"] = hit
+    _say(f"\n신용잔고 자동 수집 진단 (기준일 {ymd})\n")
 
-    if hit:
-        print(f"\n사용 가능: {hit}")
-        print(f"  고정하려면:  setx KRX_CREDIT_BLD {hit}")
-        print("  또는 .env 에 KRX_CREDIT_BLD= 로 추가\n")
+    ep = rep.get("endpoint", {})
+    if ep.get("reachable"):
+        _say(f"  엔드포인트   응답함 (HTTP {ep.get('status')})")
+    elif ep.get("login_required"):
+        _say(f"  엔드포인트   로그인 필요 — HTTP {ep.get('status')} "
+             f"{ep.get('body')}")
+        _say("               익명 조회 경로가 닫혔습니다.")
+    else:
+        _say(f"  엔드포인트   실패 — {ep.get('status') or ep.get('note')}")
+
+    mn = rep.get("menu", {})
+    hits = mn.get("credit_hits") or []
+    if mn.get("ok"):
+        _say(f"  통계 메뉴     {mn.get('menus')}개 중 신용거래융자 화면 "
+             f"{len(hits)}건")
+        for h in hits:
+            _say(f"                - {h}")
+    else:
+        _say(f"  통계 메뉴     확인 실패 — {mn.get('status') or mn.get('note')}")
+
+    for t in rep.get("bld_tested") or []:
+        mark = "OK " if t["usable"] else "   "
+        _say(f"  {mark}bld       {t['bld']}  rows={t['rows']}")
+
+    cov = store.credit_coverage()
+    _say(f"\n  수동 주입     {cov['with_credit']}/{cov['active']}종목")
+    _say(f"\n  판정: {rep.get('verdict')}\n")
+    for i, s in enumerate(rep.get("next_steps") or [], 1):
+        _say(f"    {i}. {s}")
+    _say()
+
+    SUMMARY.update({"verdict": rep.get("verdict"),
+                    "coverage": cov,
+                    "menu_hits": len(hits)})
+    return EXIT_OK if rep.get("verdict") == "가능" else EXIT_PRECOND
+
+
+def mode_kiwoom_plan(store: Store, args) -> int:
+    """키움 OpenAPI+ 수집 계획 + 환경 준비도.
+
+    OCX 를 건드리지 않으므로 64비트 본체에서 그대로 돌아간다. 실제 조회는
+    32비트 `kiwoom_bridge.py` 가 한다.
+
+    전종목이 왜 안 되는지를 말이 아니라 수치로 낸다. 시간당 1,000건
+    제한이 지배적이라 2,800종목은 세 시간이 걸린다.
+    """
+    env = kiwoom_env()
+    plan = kiwoom_plan(store, limit=args.kw_limit, scan_days=args.kw_days)
+    SUMMARY["kiwoom_env"] = {k: v for k, v in env.items() if k != "missing"}
+    SUMMARY["kiwoom_plan"] = {k: v for k, v in plan.items() if k != "tickers"}
+
+    rest_ready = kiwoom_rest.credentials_from_env() is not None
+    rest_base = kiwoom_rest.base_url_from_env()
+    rest_limiter = kiwoom_rest.limiter_from_env()
+    rest_caps = [cap for _, cap in rest_limiter.windows]
+    rest_eta = kiwoom_estimate(plan["targets"], per_second=rest_caps[0],
+                               per_minute=rest_caps[1], per_hour=rest_caps[2])
+    SUMMARY["kiwoom_rest"] = {
+        "ready": rest_ready, "base_url": rest_base,
+        "per_second": rest_caps[0], "per_minute": rest_caps[1],
+        "per_hour": rest_caps[2],
+        "limits_published": kiwoom_rest.LIMITS_ARE_PUBLISHED,
+        "eta_sec": round(rest_eta, 1),
+    }
+
+    _say("\n키움 REST 경로 (권장 · 에이전트가 직접 실행 가능)")
+    _say(f"  도메인         {rest_base}")
+    _say(f"  앱키/시크릿    {'설정됨' if rest_ready else '미설정 (.env)'}")
+    _say(f"  유량 기본값    초당 {rest_caps[0]} / 분당 {rest_caps[1]} "
+         f"/ 시간당 {rest_caps[2]}")
+    _say("  ! 키움이 REST 유량 제한 수치를 공개하지 않습니다. 보수적 "
+         "기본값으로 시작해")
+    _say("    return_code 1700/1701/1702 나 HTTP 429 를 받으면 스스로 "
+         "절반으로 줄입니다.")
+    _say(f"  예상 소요      {rest_eta / 60:.1f}분  ({plan['targets']}종목)")
+    if not rest_ready:
+        _say("  준비: https://openapi.kiwoom.com 에서 앱 등록 후 "
+             ".env 의 KIWOOM_APP_KEY / KIWOOM_APP_SECRET 를 채우십시오.")
+
+    bit_note = ""
+    if env.get("ocx_wow64_only"):
+        bit_note = "  (InprocServer32 가 WOW6432Node 에만 = 32비트 전용)"
+    _say(f"\n키움 OpenAPI+ (구 OCX 경로)  (파이썬 {env['python_bits']}비트)")
+    _say(f"  OCX 파일       {env['ocx_inproc_path'] or '없음'}")
+    _say(f"  COM 등록       {env['ocx_registered']}{bit_note}")
+    _say(f"  TR 정의 파일   {env['tr_defs']}")
+    _say(f"  pywin32 {env['win32com']}   PyQt5 {env['PyQt5']}   "
+         f"KOA Studio {env['koa_studio']}")
+    _say(f"  준비 완료      {env['ready']}")
+    if env["missing"]:
+        _say("\n  남은 준비:")
+        for i, m in enumerate(env["missing"], 1):
+            _say(f"    {i}. {m}")
+
+    lim = plan["limits"]
+    _say(f"\n호출 제한  초당 {lim['per_second']} / 분당 {lim['per_minute']} "
+         f"/ 시간당 {lim['per_hour']}  (안전마진 적용 "
+         f"{plan['safe_limits']['per_hour']}/시간)")
+    _say("  분당·시간당 제한에 걸리면 프로그램을 재실행해야 하므로 "
+         "여유를 둡니다.")
+
+    _say(f"\n수집 대상  {plan['targets']}종목 / 활성 {plan['active_tickers']}종목")
+    for reason, n in plan["by_reason"].items():
+        _say(f"    {reason:12s} {n}종목")
+    _say(f"\n  예상 소요    {plan['eta_sec'] / 60:.1f}분  "
+         f"({plan['requests']}건)")
+    _say(f"  전수조사면   {plan['full_scan_eta_sec'] / 3600:.2f}시간  "
+         f"({plan['full_scan_requests']}건)  <- 매일 불가")
+    if not plan["feasible_daily"]:
+        _say("  ! 대상이 많아 1시간을 넘습니다. --kw-limit 을 줄이십시오.")
+
+    cov = plan.get("coverage_now")
+    if cov:
+        _say(f"\n현재 신용잔고 커버리지  {cov['with_credit']}/{cov['active']}종목"
+             f" · 기준일 {cov['asof'] or '-'}")
+
+    if args.write_targets:
+        p = Path(args.write_targets)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(plan["tickers"]) + "\n", encoding="utf-8")
+        _say(f"\n대상 목록 기록 -> {p}  ({len(plan['tickers'])}종목)")
+        _say("  REST 경로(권장):")
+        _say(f"    hermes\\run.cmd --mode credit-kiwoom --targets-file {p}")
+    else:
+        _say("\n  목록을 파일로 뽑으려면: --write-targets "
+             "data/kiwoom_targets.txt")
+    _say()
+
+    if not plan["targets"]:
+        log.warning("대상이 0종목입니다. 먼저 --mode daily 로 스캔 이력을 "
+                    "만들거나 포지션을 등록하십시오.")
+        return EXIT_PRECOND
+    # 준비 판정은 REST 를 기준으로 한다. OCX 는 이제 대체 경로이고, 그쪽이
+    # 안 돼 있다고 exit 4 를 내면 REST 가 준비된 환경에서도 계속 실패한다.
+    if rest_ready or env["ready"]:
         return EXIT_OK
-
-    print("\n동작하는 후보가 없습니다. 직접 찾으십시오 (1분):")
-    print("  1. https://data.krx.co.kr 접속")
-    print("  2. [통계] > [주식] 에서 신용융자 잔고 화면을 연다")
-    print("  3. F12 > Network 탭 > 조회 버튼 클릭")
-    print("  4. getJsonData.cmd 요청의 Payload 에서 bld 값 복사")
-    print("  5. --mode credit-probe --bld <복사한값> 으로 재확인")
-    print("\n  확정 전까지는 data/credit_manual.csv 수동 주입을 쓰십시오.\n")
     return EXIT_PRECOND
+
+
+def mode_credit_kiwoom(store: Store, args) -> int:
+    """키움 REST(ka10013)로 종목별 신용잔고를 실측 수집한다.
+
+    OCX 브릿지를 대체하는 경로다. 32비트 프로세스도, 로그인 창도, 필드명
+    탐침도 필요 없다. 앱키/시크릿만 `.env` 에 있으면 무인으로 돈다.
+
+    조회 전용이다. 주문 TR 은 호출하지 않는다 (AGENTS.md 8장).
+
+    대상은 전종목이 아니다. 유량 제한 때문에 판정을 바꾸는 종목만 고른다
+    (`--mode kiwoom-plan` 이 그 계획을 보여준다).
+    """
+    creds = kiwoom_rest.credentials_from_env()
+    if not creds:
+        log.error("KIWOOM_APP_KEY / KIWOOM_APP_SECRET 가 없습니다. "
+                  ".env 에 넣으십시오 (발급: https://openapi.kiwoom.com).")
+        SUMMARY.update({"skipped": True, "reason": "no_credentials"})
+        return EXIT_PRECOND
+
+    trade_date = args.date or store.last_price_date()
+    if not trade_date:
+        log.error("시세가 없어 기준일을 정할 수 없습니다. "
+                  "--mode master -> update 를 먼저 실행하십시오.")
+        SUMMARY.update({"skipped": True, "reason": "no_prices"})
+        return EXIT_PRECOND
+
+    if args.targets_file:
+        p = Path(args.targets_file)
+        if not p.exists():
+            log.error("대상 파일이 없습니다: %s "
+                      "(--mode kiwoom-plan --write-targets 로 만드십시오)", p)
+            SUMMARY.update({"skipped": True, "reason": "no_targets_file"})
+            return EXIT_PRECOND
+        tickers = [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
+                   if ln.strip()]
+        origin = str(p)
+    else:
+        plan = kiwoom_plan(store, limit=args.kw_limit, scan_days=args.kw_days)
+        tickers = plan["tickers"]
+        origin = f"build_plan(limit={args.kw_limit})"
+
+    if not tickers:
+        log.error("대상이 0종목입니다. --mode daily 로 스캔 이력을 만들거나 "
+                  "포지션을 등록하십시오.")
+        SUMMARY.update({"skipped": True, "reason": "no_targets"})
+        return EXIT_PRECOND
+
+    base = kiwoom_rest.base_url_from_env(mock=args.kiwoom_mock)
+    limiter = kiwoom_rest.limiter_from_env()
+    eta = kiwoom_estimate(len(tickers),
+                          per_second=limiter.windows[0][1],
+                          per_minute=limiter.windows[1][1],
+                          per_hour=limiter.windows[2][1])
+    log.info("키움 REST %s · 대상 %d종목 · 기준일 %s · 예상 %.1f분",
+             base, len(tickers), trade_date, eta / 60)
+
+    # 상장주식수는 잔고(remn) 단위를 검증하는 데 쓴다. 문서에 단위가 없다.
+    try:
+        meta = store.ticker_meta()
+        listed = {t: float(v) for t, v in meta["shares"].dropna().items()
+                  if float(v) > 0}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("상장주식수 조회 실패: %s", exc)
+        listed = {}
+
+    client = kiwoom_rest.KiwoomRestClient(
+        *creds, base_url=base, limiter=limiter,
+        max_retries=args.kw_retries)
+
+    def _progress(i: int, total: int, code: str) -> None:
+        if i == 1 or i % 25 == 0 or i == total:
+            log.info("  %d/%d  %s", i, total, code)
+
+    try:
+        rows, stats = kiwoom_rest.collect_credit(
+            client, tickers, trade_date=str(trade_date),
+            listed_shares=listed, max_pages=args.kw_pages,
+            progress=_progress)
+    except kiwoom_rest.CredentialsMissing as exc:
+        log.error("%s", exc)
+        SUMMARY.update({"skipped": True, "reason": "no_credentials"})
+        return EXIT_PRECOND
+    except kiwoom_rest.AuthError as exc:
+        log.error("인증 실패: %s", exc)
+        SUMMARY.update({"error": str(exc), "reason": "auth"})
+        return EXIT_PRECOND
+
+    out = Path(args.kiwoom_out)
+    written = write_credit_csv(rows, out)
+    res = refresh_credit(store, out, source="kiwoom")
+    cov = res.get("coverage") or store.credit_coverage()
+
+    SUMMARY.update({"base_url": base, "targets": len(tickers),
+                    "origin": origin, "trade_date": str(trade_date),
+                    "csv": str(out), "written": written,
+                    "stored": res.get("stored"),
+                    "derived": res.get("derived"),
+                    "coverage": cov, "by_source": store.credit_sources()})
+    SUMMARY.update({k: v for k, v in stats.items() if k != "failures"})
+    SUMMARY["failures"] = stats.get("failures")
+
+    _say(f"\n키움 REST 신용잔고  {base}")
+    _say(f"  대상 {len(tickers)}종목 · 응답 {stats['answered']} · "
+         f"기록 {written} · 실패 {stats['failed']}")
+    _say(f"  잔고 단위    {stats['share_unit_note']}")
+    _say(f"  CSV          {out}")
+    _say(f"  DB 적재      {res.get('stored')}종목 (source=kiwoom)")
+    _say(f"  커버리지     {cov['with_credit']}/{cov['active']}종목 "
+         f"· 최신 기준일 {cov['asof'] or '-'}")
+    for src, info in (store.credit_sources() or {}).items():
+        _say(f"    {src:12s} {info['n']:5d}종목  기준일 {info['asof'] or '-'}")
+    _say()
+
+    if not written:
+        log.warning("기록된 종목이 0건입니다. 실패 사유를 확인하십시오.")
+        # reason 을 반드시 남긴다. 비워 두면 nightly 가 이 exit 4 를 '키
+        # 없음'과 구분하지 못한다. 2026-09-03~10 매일 300/300 종목이 8050
+        # 인증 실패였는데 '기대된 스킵'으로 세어져 "실패 없음"이 나갔다.
+        SUMMARY["reason"] = "all_failed" if stats["failed"] else "no_rows"
+        return EXIT_PRECOND
+    return EXIT_PARTIAL if _partial(written, stats["failed"]) else EXIT_OK
+
+
+def mode_collect_dividends(store: Store, args) -> int:
+    """배당 실적 수집 (OpenDART). **월 1회 갱신용이다.**
+
+    nightly 에 넣지 않는다. 배당은 사업보고서 시즌(3월)에만 바뀌므로
+    매일 도는 것은 DART 호출을 태우는 짓이다. 스케줄은 월 1회로 잡고,
+    중간에 끊기면 같은 명령을 다시 부르면 된다 — `--div-ttl` 일 안에
+    이미 받은 종목은 건너뛴다.
+
+    호출 수를 줄인 근거는 `dividend_data` 모듈 독스트링에 있다. 응답
+    하나가 3개 사업연도를 주므로 5년치가 종목당 2회다.
+    """
+    if not dart_key_present():
+        log.error("DART_API_KEY 가 없습니다. .env 에 넣으십시오 "
+                  "(발급: https://opendart.fss.or.kr).")
+        SUMMARY.update({"skipped": True, "reason": "no_dart_key"})
+        return EXIT_PRECOND
+
+    if not store.active_tickers():
+        log.error("종목 마스터가 비어 있습니다. --mode master 를 먼저 "
+                  "실행하십시오.")
+        SUMMARY.update({"skipped": True, "reason": "no_master"})
+        return EXIT_PRECOND
+
+    base = args.div_year or latest_fiscal_year()
+    t0 = time.time()
+
+    def _progress(i: int, total: int, code: str) -> None:
+        if i == 1 or i % 100 == 0 or i == total:
+            log.info("  %d/%d  %s", i, total, code)
+
+    res = collect_dividends(
+        store, years=args.div_years, base_year=base, limit=args.limit,
+        ttl_days=args.div_ttl, force=args.force,
+        with_cashflow=not args.div_no_cashflow, progress=_progress)
+
+    if res.get("error"):
+        log.error("배당 수집 전제조건 미충족: %s", res["error"])
+        SUMMARY.update({k: v for k, v in res.items() if k != "failures"})
+        return EXIT_PRECOND
+
+    took = time.time() - t0
+    done = res["stored"] + res["failed"]
+    per = (took / done) if done else 0.0
+    cov = res.get("coverage") or {}
+    # 전종목 1회 소요를 실측값으로 환산해 남긴다. 추정이 아니라 이번
+    # 실행의 종목당 실측 시간을 쓴다.
+    full = cov.get("active", 0) * per
+
+    SUMMARY.update({k: v for k, v in res.items() if k != "failures"})
+    SUMMARY.update({"sec_per_ticker": round(per, 3),
+                    "full_scan_min": round(full / 60.0, 1)})
+    SUMMARY["failures"] = res.get("failures")
+
+    _say(f"\n배당 실적 수집  기준 사업연도 {base} · 최근 {args.div_years}년")
+    _say(f"  대상 {res['targets']}종목 · 적재 {res['stored']} · "
+         f"실패 {res['failed']} · TTL 스킵 {res['skipped_ttl']}")
+    _say(f"  DART 호출 {res['calls']}회 · 종목당 {per:.2f}초")
+    _say(f"  전종목 1회 환산 {full / 60.0:.1f}분 "
+         f"({cov.get('active', 0)}종목 기준)")
+    for st, n in sorted(res.get("by_status", {}).items()):
+        _say(f"    {st:<10} {n:6d}행")
+    _say(f"  커버리지     {cov.get('collected', 0)}/{cov.get('active', 0)}종목"
+         f" · 배당 {cov.get('paid', 0)} · 무배당 {cov.get('no_dividend', 0)}")
+    if res.get("no_corp_code"):
+        _say(f"  corp_code 없음 {res['no_corp_code']}종목 (비상장 매핑 누락)")
+    _say()
+
+    if not res["stored"] and res["targets"]:
+        log.warning("적재 0종목 — 실패 사유를 확인하십시오: %s",
+                    res.get("failures")[:3])
+        return EXIT_PRECOND
+    return EXIT_PARTIAL if _partial(res["stored"], res["failed"]) else EXIT_OK
+
+
+def mode_dividend_report(store: Store, args) -> int:
+    """월간 배당 팩트 리포트. **텔레그램 발송은 매월 첫 토요일 1회.**
+
+    발송일이 아니어도 계산은 한다. 필터 판정을 저장해 두면 나중에 '그때
+    무엇이 통과했나'를 되짚을 수 있고, 사람이 아무 날에 명령을 쳐서
+    표를 확인할 수도 있어야 한다. 발송만 요일로 묶는다 (12장과 같은
+    이유다 — 알림 빈도가 판단을 지배하지 않게).
+    """
+    allowed, reason = report_send_allowed(cfg=DEFAULT, force=args.force)
+    rep = build_dividend_report(
+        store, DEFAULT, trade_date=args.date or None,
+        base_year=args.div_year or None, force_screen=args.force)
+
+    scr = rep.get("screen") or {}
+    SUMMARY.update({
+        "trade_date": rep.get("trade_date"), "base_year": rep.get("base_year"),
+        "dow": now_kst().weekday(), "send_reason": reason,
+        "evaluated": rep.get("evaluated", 0), "passed": rep.get("passed", 0),
+        "stored": scr.get("stored", 0), "funnel": rep.get("funnel"),
+        "rows": len(rep.get("rows") or []),
+        "confirmed_calendar": rep.get("confirmed_calendar"),
+    })
+    if rep.get("reason"):
+        SUMMARY["reason"] = rep["reason"]
+
+    text = render_dividend_report(rep, now_kst(), DEFAULT)
+    if allowed:
+        _emit(text, args.dry_run)
+        SUMMARY["report_sent"] = True
+    else:
+        # 발송일이 아니다. 사람이 읽을 수 있게 콘솔로만 낸다.
+        log.info("발송일(매월 첫 토요일)이 아님 — 표만 표시합니다 (%s)", reason)
+        _say("\n" + text + "\n")
+        SUMMARY["report_sent"] = False
+
+    SUMMARY["top"] = [
+        {"rank": i, "ticker": r["code"], "name": r["name"],
+         "price": r["price"], "dps": r["dps"], "yield": r["div_yield"],
+         "payout": r["payout"], "years": r["years_paid"], "cagr": r["cagr"],
+         "record_date": str(r["record_date"]) if r["record_date"] else None,
+         "last_buy": str(r["last_buy"]) if r["last_buy"] else None}
+        for i, r in enumerate(rep.get("rows") or [], 1)]
+    return EXIT_OK
+
+
+def mode_holidays(store: Store, args) -> int:
+    """공휴일 적재 (한국천문연구원 API). 휴장일 판정의 사전 필터.
+
+    올해 + 내년 2회 호출. nightly 에 넣지 않는다 — 공휴일은 분기에 한 번
+    갱신하면 충분하고, API 가 죽은 날 nightly 까지 흔들 이유가 없다.
+    한 해가 실패해도 나머지는 적재하고 exit 2 로 알린다.
+    """
+    from stocknews.holidays import ENV_KEY, refresh_holidays
+
+    if not os.getenv(ENV_KEY):
+        log.error("%s 가 없습니다. .env 에 넣으십시오 (data.go.kr 특일정보).", ENV_KEY)
+        SUMMARY.update({"skipped": True, "reason": f"no_{ENV_KEY.lower()}"})
+        return EXIT_PRECOND
+
+    base = int(args.year) if args.year else now_kst().year
+    years = (base, base + 1)
+    res = refresh_holidays(store, years)
+    SUMMARY.update({"years": res["years"], "stored": res["stored"],
+                    "failed": res["failed"]})
+    for y in years:
+        got = res["years"].get(y, {})
+        if "error" in got:
+            _say(f"{y}: 실패 — {got['error']}")
+            continue
+        rows = store.holidays_in_year(y)
+        _say(f"{y}: {len(rows)}건" + (" ⚠ totalCount 초과(잘림)" if got.get("truncated") else ""))
+        for d, name in rows:
+            _say(f"   {d}  {name}")
+    if len(res["failed"]) == len(years):
+        return EXIT_FAIL
+    return EXIT_PARTIAL if res["failed"] else EXIT_OK
 
 
 def mode_credit(store: Store, args) -> int:
@@ -506,8 +1178,10 @@ def mode_credit(store: Store, args) -> int:
     값이 들어온 종목만 LPS credit_heat 가 프록시 캡(1.25점)을 벗고
     만점(4.0점)까지 열리며, 청산 계층 6의 재급증 규칙이 살아난다.
 
-    순서: KRX 자동 수집 → 수동 CSV 로 덮어쓰기.
-    수동이 나중이므로 항상 사람의 값이 우선한다.
+    적재 순서: KRX 자동 → 키움 REST 결과 CSV → 수동 CSV.
+    수동이 마지막이므로 항상 사람의 값이 이긴다. 예전에는 수동 파일
+    하나만 읽어서, 키움이 만든 `credit_kiwoom.csv` 가 아무도 읽지 않는
+    채로 남아 있었다.
     """
     if not args.no_krx:
         auto = refresh_credit_auto(store, trade_date=args.date, bld=args.bld)
@@ -516,22 +1190,115 @@ def mode_credit(store: Store, args) -> int:
             log.info("KRX 자동 수집: %d종목 적재 (bld=%s)",
                      auto.get("stored", 0), auto.get("bld"))
         else:
-            log.warning("KRX 자동 수집 실패: %s — 수동 CSV 로 진행",
+            log.warning("KRX 자동 수집 실패: %s — CSV 로 진행",
                         auto.get("note"))
 
-    res = refresh_credit(store, args.credit_file)
+    res = refresh_credit_chain(store, manual_path=args.credit_file)
     cov = res.get("coverage") or store.credit_coverage()
     log.info("파싱 %s · 적재 %s · 주식수 역산 %s",
              res.get("parsed"), res.get("stored"), res.get("derived"))
-    print(f"\n신용잔고 커버리지: {cov['with_credit']}/{cov['active']}종목 "
-          f"· 최신 기준일 {cov['asof'] or '-'}")
+    _say(f"\n신용잔고 커버리지: {cov['with_credit']}/{cov['active']}종목 "
+         f"· 최신 기준일 {cov['asof'] or '-'}")
+    for step in res.get("steps") or []:
+        _say(f"    {step['source']:12s} {step['stored']:5d}종목  {step['path']}")
     if not cov["with_credit"]:
-        print(f"  {args.credit_file} 이 비어 있습니다.")
-        print("  템플릿: data/credit_manual.csv.example")
-        print("  값이 없으면 매집 점수 상한이 8.49점으로 눌립니다.\n")
+        _say(f"  {args.credit_file} 이 비어 있습니다.")
+        _say("  템플릿: data/credit_manual.csv.example")
+        _say("  자동 경로: hermes\\run.cmd --mode credit-kiwoom")
+        _say("  값이 없으면 매집 점수 상한이 8.49점으로 눌립니다.\n")
     else:
-        print("  해당 종목은 실측으로 채점됩니다 (credit_heat 최대 4.0점).\n")
-    return 0
+        _say("  해당 종목은 실측으로 채점됩니다 (credit_heat 최대 4.0점).\n")
+    SUMMARY.update({"parsed": res.get("parsed"), "stored": res.get("stored"),
+                    "derived": res.get("derived"), "coverage": cov,
+                    "steps": res.get("steps"),
+                    "by_source": res.get("by_source")})
+    return EXIT_OK
+
+
+# ── 스케줄 기대치 (AGENTS.md 4장) ──
+# '어제 daily 가 안 돌았다'를 알아채려면 무엇이 매일 돌아야 하는지를
+# 코드가 알고 있어야 한다. 휴장일에도 각 모드는 skipped 로 exit 0 을
+# 내고 이력을 남기므로, 이력의 공백은 곧 cron/전원 문제다.
+_SCHEDULE_DAILY = ("news", "brief-morning", "master", "update", "flags",
+                   "daily", "exits", "brief-evening")
+_SCHEDULE_WEEKLY = ("weekly", "brief-weekly", "export", "credit")
+STALE_DAILY_HOURS = 36.0      # 하루 + 여유
+STALE_WEEKLY_HOURS = 24.0 * 9   # 주간 + 연휴 여유
+
+
+def mode_runs(store: Store, args) -> int:
+    """배치 이력 조회 + 스케줄 공백 점검. 읽기 전용.
+
+    `runs` 테이블은 쓰기만 하고 읽는 코드가 없었다. AGENTS.md 7장이
+    "모든 배치 이력이 남습니다"라고 약속하는데 확인할 명령이 없으면
+    그 약속은 검증되지 않는다. 그리고 실제로는 22개 모드 중 둘만
+    기록하고 있었다.
+
+    이게 전략 검증의 전제다. 스캔 결과가 비었을 때 '시장이 조용했다'와
+    '잡이 죽어 있었다'를 구분해야 성과 해석이 성립한다.
+    """
+    hist = store.run_history(days=args.runs_days, mode=args.runs_mode,
+                            limit=args.runs_limit)
+    summary = store.run_summary(days=args.runs_days)
+
+    stale: list[dict] = []
+    for group, modes, limit_h in (("daily", _SCHEDULE_DAILY, STALE_DAILY_HOURS),
+                                  ("weekly", _SCHEDULE_WEEKLY,
+                                   STALE_WEEKLY_HOURS)):
+        for m in modes:
+            info = summary.get(m)
+            if info is None:
+                stale.append({"mode": m, "group": group, "age_hours": None,
+                              "note": f"최근 {args.runs_days}일 이력 없음"})
+            elif info["age_hours"] is not None and info["age_hours"] > limit_h:
+                stale.append({"mode": m, "group": group,
+                              "age_hours": info["age_hours"],
+                              "note": f"{limit_h:.0f}시간 기준 초과"})
+
+    failing = {m: i for m, i in summary.items() if i["failed"] > 0}
+
+    SUMMARY.update({"days": args.runs_days, "total": int(len(hist)),
+                    "modes": len(summary), "by_mode": summary,
+                    "stale": stale, "failing": sorted(failing)})
+
+    _say(f"\n배치 이력  최근 {args.runs_days}일 · {len(hist)}회 · "
+         f"{len(summary)}개 모드")
+    if hist.empty:
+        _say("  이력이 없습니다. 아직 배치를 돌리지 않았거나 DB 가 새 것입니다.")
+    else:
+        _say("\n  " + _pad("모드", 16) + _pad("최근 실행", 21)
+             + _pad("경과", 8, ">") + _pad("회", 5, ">")
+             + _pad("성공", 9, ">") + _pad("실패", 8, ">")
+             + _pad("평균초", 9, ">"))
+        for m, i in summary.items():
+            age = "-" if i["age_hours"] is None else f"{i['age_hours']:.1f}h"
+            _say(f"  {m:<16}{str(i['last'] or '-'):<21}{age:>8}"
+                 f"{i['runs']:>5}{i['ok']:>9}{i['failed']:>8}"
+                 f"{i['avg_sec']:>9.1f}")
+
+    if stale:
+        _say(f"\n  ! 스케줄 공백 {len(stale)}건 — cron 또는 전원 절전을 "
+             "확인하십시오")
+        for s in stale:
+            age = "이력 없음" if s["age_hours"] is None \
+                else f"{s['age_hours']:.1f}시간 전"
+            _say(f"      {s['mode']:<16}{s['group']:<8}{age}")
+    else:
+        _say("\n  스케줄 공백 없음")
+
+    if failing:
+        _say(f"\n  실패가 집계된 모드: {', '.join(sorted(failing))}")
+
+    if args.runs_mode and not hist.empty:
+        _say(f"\n  {args.runs_mode} 최근 {min(len(hist), 15)}회")
+        for _, r in hist.head(15).iterrows():
+            _say(f"      {r['started']}  {r['elapsed']:>7.1f}s  "
+                 f"ok={r['ok']} fail={r['failed']}  "
+                 f"{str(r['note'] or '')[:50]}")
+    _say()
+
+    # 공백이 있으면 exit 2 로 알린다. 조회 자체는 성공했으므로 실패가 아니다.
+    return EXIT_PARTIAL if stale else EXIT_OK
 
 
 def mode_backtest(store: Store, args) -> int:
@@ -584,11 +1351,8 @@ def mode_backtest(store: Store, args) -> int:
 
 
 def _print_backtest_report(s: dict, sweep, ex: dict, bt, args) -> None:
-    out = sys.stderr if args.json else sys.stdout
     w = 66
-
-    def p(*a):
-        print(*a, file=out)
+    p = _say
 
     p("\n" + "=" * w)
     p(" 백테스트 결과")
@@ -683,12 +1447,14 @@ def mode_export(store: Store, args) -> int:
     엑셀에서 한글이 깨지지 않도록 utf-8-sig(BOM) 로 쓴다.
     """
     written = store.export_csv(out_dir=args.export_dir, days=args.export_days)
-    print(f"\nCSV 내보내기 ({args.export_dir}):")
+    _say(f"\nCSV 내보내기 ({args.export_dir}):")
     for name, info in written.items():
-        print(f"  {name:<14} {info['rows']:>7,}행   {info['path']}")
-    print("\n  인코딩 utf-8-sig — 한글 엑셀에서 바로 열립니다.")
-    print("  scans 파일이 전종목 점수표입니다. 신용잔고 대조용으로 넘기십시오.\n")
-    return 0
+        _say(f"  {name:<14} {info['rows']:>7,}행   {info['path']}")
+    _say("\n  인코딩 utf-8-sig — 한글 엑셀에서 바로 열립니다.")
+    _say("  scans 파일이 전종목 점수표입니다. 신용잔고 대조용으로 넘기십시오.\n")
+    SUMMARY.update({"out_dir": args.export_dir,
+                    "files": {k: v["rows"] for k, v in written.items()}})
+    return EXIT_OK
 
 
 def mode_flags(store: Store, args) -> int:
@@ -713,22 +1479,33 @@ def mode_flags(store: Store, args) -> int:
 
     disc = stats.get("_discontinuity_list") or []
     if disc:
-        print("\n시세 불연속 의심 (재적재 권고):")
+        _say("\n시세 불연속 의심 (재적재 권고):")
         for code, memo in disc:
-            print(f"  {code}  {memo}")
-        print("  조치: DELETE FROM prices WHERE ticker='코드' 후 backfill 재실행\n")
+            _say(f"  {code}  {memo}")
+        _say("  조치: DELETE FROM prices WHERE ticker='코드' 후 backfill 재실행\n")
+
+    cool = stats.get("_cooldown_list") or []
+    if cool:
+        _say(f"\n재진입 금지 {stats.get('cooldown_active', 0)}종목 "
+             f"(손절 후 {DEFAULT.exit.cooldown_days}거래일 · 만료 시 자동 해제):")
+        _say("  " + ", ".join(cool))
+        _say()
 
     summary = flag_summary(store)
-    if summary is not None and len(summary):
-        print(f"\n배제 대상 {len(summary)}종목 (상위 25):")
+    n_excluded = 0 if summary is None else int(len(summary))
+    if n_excluded:
+        _say(f"\n배제 대상 {n_excluded}종목 (상위 25):")
         for _, r in summary.head(25).iterrows():
             imp = r.get("capital_impair")
             it = f" (잠식 {float(imp):.1f}%)" if imp == imp and imp else ""
-            print(f"  {r['ticker']} {r['name'][:14]:<14} {r['reasons']}{it}")
-        print()
+            _say(f"  {r['ticker']} {r['name'][:14]:<14} {r['reasons']}{it}")
+        _say()
     else:
         log.warning("배제 대상 0건 — 공급원이 모두 실패했을 수 있다")
-    return 0
+
+    SUMMARY.update({k: v for k, v in stats.items() if not k.startswith("_")})
+    SUMMARY.update({"excluded": n_excluded, "discontinuity": len(disc)})
+    return EXIT_OK
 
 
 # ────────────────────────── 포지션 / 청산 ──────────────────────────
@@ -772,6 +1549,8 @@ def mode_exits(store: Store, args) -> int:
         "exits": [{"ticker": d.ticker, "name": d.name, "layer": d.layer,
                    "rule": d.rule, "action": d.action, "qty": d.qty,
                    "ret_pct": d.ret_pct} for d in decs],
+        # 손절이 난 종목은 그 자리에서 재진입 금지가 걸린다.
+        "cooldown_added": res.get("cooldown_added") or [],
     })
     if errs:
         log.warning("청산 판정 오류 %d건: %s", len(errs), errs[:3])
@@ -781,14 +1560,15 @@ def mode_exits(store: Store, args) -> int:
 def mode_pos_open(store: Store, args) -> int:
     """포지션 개시. 진입 시점 밴드/피보 레벨을 스냅샷으로 고정한다."""
     if not args.ticker or not args.qty:
+        # 인자 오류다. exit 1 은 재시도 대상이라 무한히 실패한다.
         log.error("--ticker 와 --qty 가 필요합니다")
-        return 1
+        return EXIT_USAGE
 
     code = str(args.ticker).zfill(6)
     ohlcv = store.load_ohlcv(code, days=420)
     if ohlcv is None or len(ohlcv) < DEFAULT.ma.long + 30:
-        log.error("%s 시세가 부족합니다 (backfill/update 확인)", code)
-        return 1
+        log.error("%s 시세가 부족합니다 (backfill/update 를 먼저 실행)", code)
+        return EXIT_PRECOND
 
     names = store.active_tickers()
     name = args.name or names.get(code, code)
@@ -814,8 +1594,11 @@ def mode_pos_open(store: Store, args) -> int:
 
     track = args.track or ("TREND" if res.trend_score >= res.value_score
                            else "VALUE")
+    # 손절선은 여기서 한 번 확정된다. 이후 재계산·수정 경로는 없다.
+    stop_price = stop_price_for(entry_price, DEFAULT)
     pos_id = store.open_position(code, name, track, entry_date, entry_price,
-                                 int(args.qty), snapshot=snap,
+                                 int(args.qty), stop_price=stop_price,
+                                 snapshot=snap,
                                  opened_by="cli", note=args.note or "")
 
     log.info("포지션 개시 #%d %s(%s) %s %d주 @ %.0f",
@@ -825,15 +1608,28 @@ def mode_pos_open(store: Store, args) -> int:
         v = snap.get(key)
         return f"{float(v):,.0f}원" if v else "없음"
 
-    print(f"\n포지션 #{pos_id} 개시: {name} ({code}) [{track}]")
-    print(f"  진입 {entry_date} @ {entry_price:,.0f}원 x {int(args.qty):,}주")
-    print(f"  손절선(밴드 하단 -44%) : {_won('band_lo')}")
-    print(f"  대량청산 중심(-30%)    : {_won('band_mid')}")
-    print(f"  목표선(밴드 상단 -16%) : {_won('band_hi')}")
-    print(f"  피보 0.382 (2차 익절)  : {_won('fib_0382')}")
-    print(f"  골든크로스 봉 저가     : {_won('cross_low')}")
-    print("  ※ 위 값은 고정됩니다. 이후 재계산하지 않습니다.\n")
-    return 0
+    _say(f"\n포지션 #{pos_id} 개시: {name} ({code}) [{track}]")
+    _say(f"  진입 {entry_date} @ {entry_price:,.0f}원 x {int(args.qty):,}주")
+    _say(f"  손절선(진입가 -{DEFAULT.exit.stop_loss_pct:.0f}%) "
+         f": {stop_price:,.0f}원   ← 고정. 수정 API 없음")
+    _say(f"  보유기간 {DEFAULT.exit.min_hold_days}~"
+         f"{DEFAULT.exit.max_hold_days}거래일 "
+         f"(최소 전 비손절 청산 억제 / 최대 도달 시 재평가)")
+    _say(f"  밴드 하단(-44%)        : {_won('band_lo')}")
+    _say(f"  대량청산 중심(-30%)    : {_won('band_mid')}")
+    _say(f"  목표선(밴드 상단 -16%) : {_won('band_hi')}")
+    _say(f"  피보 0.382 (2차 익절)  : {_won('fib_0382')}")
+    _say(f"  골든크로스 봉 저가     : {_won('cross_low')}")
+    _say("  ※ 위 값은 고정됩니다. 이후 재계산하지 않습니다.\n")
+
+    SUMMARY.update({"pos_id": int(pos_id), "ticker": code, "name": name,
+                    "track": track, "entry_date": entry_date,
+                    "entry_price": entry_price, "qty": int(args.qty),
+                    "stop_price": stop_price,
+                    "min_hold_days": DEFAULT.exit.min_hold_days,
+                    "max_hold_days": DEFAULT.exit.max_hold_days,
+                    "snapshot": snap})
+    return EXIT_OK
 
 
 def mode_pos_list(store: Store, args) -> int:
@@ -843,8 +1639,7 @@ def mode_pos_list(store: Store, args) -> int:
                  for p in positions}
     # 상태 조회는 stdout(--json 이면 stderr)으로만 낸다. 토큰이 없어도
     # 실패하지 않아야 한다.
-    print(render_positions(positions, price_map),
-          file=sys.stderr if args.json else sys.stdout)
+    _say(render_positions(positions, price_map))
 
     SUMMARY["positions"] = len(positions)
     SUMMARY["open"] = [{"id": p.id, "ticker": p.ticker, "name": p.name,
@@ -853,14 +1648,13 @@ def mode_pos_list(store: Store, args) -> int:
                        for p in positions if p.status == "OPEN"]
 
     pending = store.pending_exits(days=args.catchup)
-    out = sys.stderr if args.json else sys.stdout
     if pending is not None and not pending.empty:
-        print("\n미체결 청산 신호:", file=out)
+        _say("\n미체결 청산 신호:")
         for _, r in pending.iterrows():
-            print(f"  log#{int(r['id'])} {r['name']}({r['ticker']}) "
-                  f"L{int(r['layer'])} {r['action']} {int(r['qty'])}주 "
-                  f"@ {float(r['signal_price']):,.0f} · {r['d']}", file=out)
-        print("  체결 반영: --mode fill --log-id N --fill-price 가격\n", file=out)
+            _say(f"  log#{int(r['id'])} {r['name']}({r['ticker']}) "
+                 f"L{int(r['layer'])} {r['action']} {int(r['qty'])}주 "
+                 f"@ {float(r['signal_price']):,.0f} · {r['d']}")
+        _say("  체결 반영: --mode fill --log-id N --fill-price 가격\n")
         SUMMARY["pending_exits"] = int(len(pending))
     else:
         SUMMARY["pending_exits"] = 0
@@ -871,21 +1665,25 @@ def mode_fill(store: Store, args) -> int:
     """체결 확인. 여기서만 잔량이 줄어든다."""
     if not args.log_id or args.fill_price is None:
         log.error("--log-id 와 --fill-price 가 필요합니다")
-        return 1
+        return EXIT_USAGE
     out = store.confirm_exit(int(args.log_id), float(args.fill_price),
                              int(args.fill_qty) if args.fill_qty else None)
     log.info("체결 반영: %s %d주 · 잔량 %d · %s",
              out["ticker"], out["filled_qty"], out["remaining"], out["status"])
-    return 0
+    SUMMARY.update({"ticker": out["ticker"], "filled_qty": out["filled_qty"],
+                    "remaining": out["remaining"], "status": out["status"],
+                    "log_id": int(args.log_id)})
+    return EXIT_OK
 
 
 def mode_pos_close(store: Store, args) -> int:
     if not args.id:
         log.error("--id 가 필요합니다")
-        return 1
+        return EXIT_USAGE
     store.close_position(int(args.id), args.note or "manual close")
     log.info("포지션 #%s 수동 종료", args.id)
-    return 0
+    SUMMARY.update({"closed_id": int(args.id), "status": "CLOSED"})
+    return EXIT_OK
 
 
 MODES = {
@@ -902,8 +1700,14 @@ MODES = {
     "brief-weekly": mode_brief_weekly,
     "flags": mode_flags,
     "credit": mode_credit,
+    "holidays": mode_holidays,
+    "credit-kiwoom": mode_credit_kiwoom,
+    "collect-dividends": mode_collect_dividends,
+    "dividend-report": mode_dividend_report,
     "credit-probe": mode_credit_probe,
+    "kiwoom-plan": mode_kiwoom_plan,
     "backtest": mode_backtest,
+    "runs": mode_runs,
     "export": mode_export,
     "exits": mode_exits,
     "pos-open": mode_pos_open,
@@ -932,6 +1736,9 @@ def main(argv=None) -> int:
     ap.add_argument("--catchup", type=int, default=7,
                     help="update 시 소급 확인할 일수")
     ap.add_argument("--week-days", type=int, default=5, help="주간 집계 거래일수")
+    ap.add_argument("--monthly", action="store_true",
+                    help="weekly 에 전월 회고를 강제로 붙인다 "
+                         "(기본: 매월 첫 금요일에만 자동)")
     ap.add_argument("--horizon", type=int, default=5,
                     help="자기검증 보유 가정 거래일수")
     ap.add_argument("--ignore-window", action="store_true",
@@ -954,6 +1761,8 @@ def main(argv=None) -> int:
     ap.add_argument("--price", type=float,
                     help="pos-open 진입가 (생략 시 최근 종가)")
     ap.add_argument("--date", help="pos-open 진입일 YYYY-MM-DD")
+    ap.add_argument("--year", type=int, default=None,
+                    help="holidays: 기준 연도 (그 해 + 다음 해 조회). 기본 올해")
     ap.add_argument("--track", choices=("VALUE", "TREND"),
                     help="pos-open 트랙 지정 (생략 시 점수로 자동 판정)")
     ap.add_argument("--note", help="포지션 메모")
@@ -980,6 +1789,15 @@ def main(argv=None) -> int:
     ap.add_argument("--offering-days", type=int, default=60,
                     help="flags: 증자/감사의견 공시 소급 일수")
     # ── 신용잔고 / 내보내기 ──
+    # ── 배당 (collect-dividends) ──
+    ap.add_argument("--div-years", type=int, default=5,
+                    help="수집할 최근 사업연도 수")
+    ap.add_argument("--div-year", type=int, default=0,
+                    help="기준 사업연도 (기본: 사업보고서가 나온 최신 연도)")
+    ap.add_argument("--div-ttl", type=int, default=30,
+                    help="이 일수 안에 받은 종목은 건너뛴다 (월 1회 갱신)")
+    ap.add_argument("--div-no-cashflow", action="store_true",
+                    help="현금흐름표 조회 생략 (FCF 없이 배당만)")
     ap.add_argument("--credit-file", default="data/credit_manual.csv",
                     help="credit: 수동 신용잔고 CSV 경로")
     ap.add_argument("--export-dir", default="data/export",
@@ -990,6 +1808,8 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true",
                     help="결과 요약을 stdout 에 JSON 한 줄로 출력 "
                          "(로그는 stderr 로 분리)")
+    ap.add_argument("--env-file",
+                    help="읽을 .env 경로 (기본: 저장소 루트의 .env)")
     ap.add_argument("--no-lock", action="store_true",
                     help="잡 락 사용하지 않음 (동시 실행 위험, 디버그용)")
     ap.add_argument("--lock-wait", type=int, default=0,
@@ -1005,6 +1825,33 @@ def main(argv=None) -> int:
     ap.add_argument("--bld", help="credit/credit-probe: KRX bld 코드 직접 지정")
     ap.add_argument("--no-krx", action="store_true",
                     help="credit: KRX 자동 수집 없이 수동 CSV 만 사용")
+    # ── 키움 (계획 + REST 수집) ──
+    ap.add_argument("--kw-limit", type=int, default=300,
+                    help="kiwoom-plan/credit-kiwoom: 수집 대상 상한 (기본 300)")
+    ap.add_argument("--kw-days", type=int, default=5,
+                    help="kiwoom-plan: 스캔/추천 이력 조회 일수 (기본 5)")
+    ap.add_argument("--write-targets",
+                    help="kiwoom-plan: 대상 종목코드를 이 파일에 기록")
+    ap.add_argument("--targets-file",
+                    help="credit-kiwoom: 대상 종목코드 목록 파일 "
+                         "(없으면 계획기가 직접 고름)")
+    ap.add_argument("--kiwoom-out", default=KIWOOM_CREDIT_CSV,
+                    help=f"credit-kiwoom: 결과 CSV 경로 "
+                         f"(기본 {KIWOOM_CREDIT_CSV})")
+    ap.add_argument("--kiwoom-mock", action="store_true",
+                    help="credit-kiwoom: 모의투자 도메인 사용 "
+                         "(KIWOOM_API_BASE 가 있으면 그쪽이 우선)")
+    ap.add_argument("--kw-pages", type=int, default=1,
+                    help="credit-kiwoom: ka10013 연속조회 페이지 상한 "
+                         "(기본 1. 늘리면 종목당 요청이 늘어남)")
+    ap.add_argument("--kw-retries", type=int, default=3,
+                    help="credit-kiwoom: TR 재시도 횟수 (기본 3)")
+    # ── 배치 이력 ──
+    ap.add_argument("--runs-days", type=int, default=14,
+                    help="runs: 조회 일수 (기본 14)")
+    ap.add_argument("--runs-mode", help="runs: 특정 모드만 조회")
+    ap.add_argument("--runs-limit", type=int, default=200,
+                    help="runs: 최대 행 수 (기본 200)")
     # ── 백테스트 ──
     ap.add_argument("--bt-step", type=int, default=5,
                     help="backtest: 평가 간격(거래일). 1이면 전수")
@@ -1023,6 +1870,48 @@ def main(argv=None) -> int:
     SUMMARY["mode"] = args.mode
     SUMMARY["started"] = now_kst().isoformat(timespec="seconds")
 
+    # 보존 기간이 지난 일자 로그 정리. 실행마다 한 번이면 충분하고,
+    # 파일 수가 적어 비용이 없다.
+    pruned = _prune_logs()
+    if pruned:
+        log.info("오래된 로그 %d개 정리 (%d일 보존): %s",
+                 len(pruned), LOG_RETENTION_DAYS,
+                 ", ".join(pruned[:5]) + ("..." if len(pruned) > 5 else ""))
+        SUMMARY["logs_pruned"] = len(pruned)
+
+    # ── 진입점 추적 ──
+    # nightly.cmd 와 nightly.py 가 자식 환경에 STOCKNEWS_ENTRY=nightly 를
+    # 넣는다. 없다면 누군가 run_screen.py 를 직접 부른 것이다.
+    #
+    # **차단하지 않는다.** 사람이 특정 모드를 지시하는 정당한 경로가 있고
+    # (AGENTS.md 1장의 예외), 여기서 막으면 그 경로까지 죽는다. 기록만
+    # 남겨서 나중에 '누가 직접 불렀나'를 추적할 수 있게 한다.
+    #
+    # 2026-09-07 에 파이프라인 진입점이 둘이라 사고가 났다. 그 뒤에도
+    # 에이전트가 개별 모드를 직접 부르는 경로가 남아 있었는데, 그 사실을
+    # runs 테이블을 뒤져서야 알았다. 이 로그가 있었으면 즉시 보였다.
+    # strip() 은 장식이 아니다. cmd 에서 `set VAR=nightly && ...` 로 쓰면
+    # 값에 후행 공백이 붙어 비교가 조용히 실패한다. 실측으로 겪었다.
+    entry = os.getenv("STOCKNEWS_ENTRY", "").strip()
+    SUMMARY["entry"] = entry or "direct"
+    if entry != "nightly":
+        log.warning(
+            "진입점 표시 없음 — run_screen.py 직접 호출 "
+            "(mode=%s pid=%s ppid=%s). 파이프라인 단계라면 "
+            "hermes\\nightly.cmd 를 쓰십시오 (AGENTS.md 1장).",
+            args.mode, os.getpid(), os.getppid())
+
+    # .env 를 환경변수로 올린다. 여기가 아니면 TELEGRAM_* / DART_API_KEY 를
+    # 읽는 시점에 이미 늦다. OS 환경변수가 이기므로 주입된 값은 보존된다.
+    env_rep = load_env(args.env_file)
+    SUMMARY["env_file"] = {"path": env_rep["path"], "exists": env_rep["exists"],
+                           "keys": env_rep["keys"]}
+    if not env_rep["exists"]:
+        log.debug(".env 없음 (%s) — OS 환경변수만 사용", env_rep["path"])
+    elif env_rep["unknown_keys"]:
+        log.warning(".env 에 알 수 없는 키: %s",
+                    ", ".join(sorted(env_rep["unknown_keys"])))
+
     if args.force_unlock:
         removed = clear_locks()
         log.warning("락 강제 해제: %s", removed or "없음")
@@ -1030,6 +1919,7 @@ def main(argv=None) -> int:
 
     store = Store(args.db)
     t0 = time.time()
+    started_at = now_kst().replace(tzinfo=None)
     lock = None
     try:
         # DB 쓰기 모드는 직렬화한다. 겹치면 database is locked 로 죽는다.
@@ -1061,10 +1951,31 @@ def main(argv=None) -> int:
             lock.release()
 
     elapsed = time.time() - t0
+    # 발송이 실패했는데 exit 0 이면 무음 장애를 아무도 모른다. 판정 자체는
+    # 성공했으므로 치명적 실패가 아니라 부분 실패로 알린다.
+    if SUMMARY.get("send_failed") and rc == EXIT_OK:
+        detail = ", ".join(
+            f"{f.get('chat', '????')}: {f.get('status') or '무응답'}"
+            for f in SUMMARY.get("send_failures", []))
+        log.error("텔레그램 발송 %d건 실패%s — 부분 실패로 보고합니다",
+                  SUMMARY["send_failed"], f" (수신자 {detail})" if detail else "")
+        rc = EXIT_PARTIAL
     SUMMARY["exit_code"] = int(rc)
     SUMMARY["elapsed_sec"] = round(elapsed, 1)
     SUMMARY["finished"] = now_kst().isoformat(timespec="seconds")
     log.info("[%s] 종료 rc=%d · 소요 %.1f초", args.mode, rc, elapsed)
+
+    # 배치 이력은 여기서 한 번만 남긴다. 모드 안에서 각자 부르면 빠뜨리는
+    # 모드가 생긴다 (실제로 22개 중 2개만 기록하고 있었다). 예외로 죽은
+    # 실행도 여기까지는 오므로 실패 이력이 남는다 — 그게 더 중요하다.
+    if args.mode != "runs":
+        ok_n, fail_n = _run_counts(rc)
+        try:
+            store.log_run(args.mode, started_at, ok_n, fail_n,
+                          note=_run_note(rc), elapsed=elapsed)
+        except Exception as exc:  # noqa: BLE001
+            # 이력 기록 실패가 배치 결과를 바꾸면 안 된다.
+            log.warning("runs 기록 실패: %s", exc)
 
     if args.json:
         payload = {k: v for k, v in SUMMARY.items() if not k.startswith("_")}

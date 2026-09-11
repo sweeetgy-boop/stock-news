@@ -7,15 +7,32 @@ parse_mode='HTML' 을 쓰므로 종목명/뉴스제목은 반드시 escape 한�
 from __future__ import annotations
 
 import html
+import unicodedata
 
-from .config import Config, DEFAULT
-from .contracts import ScreenResult
+from .config import Config, DEFAULT, WATCHLIST
+from .contracts import RULE_NAME, ScreenResult
+from .news import (canonical_source, cluster_items, normalize_url,
+                   representative_rank)
 
-__all__ = ["bar", "render_detail", "render_digest", "render_fib_list"]
+__all__ = ["bar", "render_detail", "render_digest", "render_fib_list",
+           "render_watchlist"]
 
 
 def _e(s) -> str:
     return html.escape(str(s), quote=False)
+
+
+def _display_width(s: str) -> int:
+    """등폭 폰트에서의 표시 폭. 전각(W/F) 문자는 2칸이다."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1
+               for ch in str(s))
+
+
+def _pad(text, width: int, align: str = ">") -> str:
+    """한글 섞인 표 정렬. `{:>4}` 는 글자 수로 채워 전각에서 어긋난다."""
+    s = str(text)
+    gap = max(0, width - _display_width(s))
+    return (s + " " * gap) if align == "<" else (" " * gap + s)
 
 
 def bar(r: float, n: int = 10) -> str:
@@ -271,12 +288,104 @@ def render_top10(picks: list, asof, trade_date: str, scanned: int,
     return "\n".join(head) + "\n\n".join(body) + "\n" + "\n".join(tail)
 
 
-def _audit_block(a: dict) -> list[str]:
+def render_reco_stored(rows, asof, send_dow_label: str = "일요일") -> str:
+    """DB 에 쌓인 추천으로 만드는 주간 10선.
+
+    발송 요일(기본 일요일)은 휴장일이라 그날 스캔이 돌지 않는다. 그래서
+    새로 스캔하지 않고 마지막 거래일에 이미 기록된 recos 를 그대로 낸다.
+    `render_top10` 은 `ScreenResult` 전체(피보/추세/유동성 객체)를 요구하지만
+    `recos` 테이블에는 그 원본이 없다. 없는 값을 추정해 채우면 발송된 숫자와
+    채점되는 숫자가 달라지므로, 저장된 열만 쓰는 별도 렌더러로 분리했다.
+
+    rows : store.reco_history(days=1) 결과 (DataFrame)
+    """
+    if rows is None or len(rows) == 0:
+        return ("🌙 <b>[주간 추천]</b>\n\n"
+                "• 기록된 추천이 없습니다. daily 를 먼저 실행하십시오.")
+
+    trade_date = str(rows.iloc[0]["d"])
+    head = [
+        f"🗓 <b>[주간 추천 {len(rows)}선]</b> 기준일 {trade_date}",
+        f"• 발송은 {send_dow_label} 1회 · 스캔과 기록은 매일 진행됩니다",
+        "",
+    ]
+    body = []
+    for _, r in rows.iterrows():
+        slot = str(r["slot"])
+        l1 = (f"{int(r['rank'])}. <b>{_e(str(r['name']))}</b> ({r['ticker']}) "
+              f"[{r['grade']}·{SLOT_LABEL.get(slot, slot)}]")
+        l2 = (f"   {float(r['price']):,.0f}원 · 매집 {float(r['value_score']):.1f}"
+              f" / 추세 {float(r['trend_score']):.1f}")
+        reason = str(r["reason"] or "").strip()
+        if len(reason) > 90:
+            reason = reason[:89] + "…"
+        l3 = f"   {_e(reason)}" if reason else ""
+        body.append("\n".join(x for x in (l1, l2, l3) if x))
+
+    tail = [
+        "",
+        "※ 매집=역추세 바닥 그물 / 추세=골든크로스 확증",
+        "※ 기준일 종가 기준입니다. 발송 시점 가격과 다릅니다.",
+        f"⏰ {asof:%Y-%m-%d %H:%M:%S}",
+    ]
+    return "\n".join(head) + "\n\n".join(body) + "\n" + "\n".join(tail)
+
+
+def render_daily_holdings(positions: list, price_map: dict | None, asof,
+                          trade_date: str, scanned: int, picks: int,
+                          send_dow_label: str = "일요일") -> str:
+    """발송 요일이 아닌 날의 daily 메시지. 보유 종목 상태만.
+
+    신규 추천 종목은 한 종목도 넣지 않는다. 개수만 알린다 — 파이프라인이
+    돌았는지는 알아야 하지만, 종목을 보여주면 주 1회 리듬이 무의미해진다.
+    """
+    out = [render_positions(positions, price_map), ""]
+    out.append("━━ 오늘 스캔 ━━")
+    out.append(f"• 기준일 {trade_date} · {scanned:,}종목 스캔 · "
+               f"추천 {picks}건 기록")
+    out.append(f"• 추천 목록은 {send_dow_label}에 발송됩니다")
+    out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
+    return "\n".join(out)
+
+
+def _paper_banner(a: dict) -> list[str]:
+    """종이거래 고정 문구. 리포트 맨 위에 붙는다.
+
+    검증 표본이 최소치에 닿기 전에 이 숫자를 실거래 판단에 쓰면 안 된다.
+    그 사실을 매번 명시한다 — 문서에만 적어두면 시간이 지나며 잊힌다.
+    """
+    n = int(a.get("total_recos") or 0)
+    need = int(a.get("min_sample") or 0)
+    return [f"📋 검증 기간 — 실거래 아님. alpha_win_rate 확보까지 "
+            f"기록만 누적 중 (현재 {n}건/최소 {need}건)"]
+
+
+def _progress_line(a: dict) -> list[str]:
+    """채점 진행률. 종이거래 문구 바로 아래에 붙는다.
+
+    배너의 '현재 N건'은 누적 추천이고, 이 줄의 '채점 완료'는 보유기간이
+    경과한 건수다. 둘은 다르다 — 추천 100건을 쌓아도 기간이 지나지
+    않았으면 성적은 0건이다. 그 차이를 한 줄에서 보여준다.
+    """
+    p = a.get("progress") or {}
+    if not p:
+        return []
+    hs = p.get("horizons") or []
+    scored = p.get("scored") or {}
+    done = " / ".join(
+        f"{h}d:{int(scored.get(h) or scored.get(str(h)) or 0)}건" for h in hs)
+    judge = p.get("judge_horizon")
+    return [f"📈 검증 진행: 누적 추천 {int(p.get('total_recos') or 0)}건"
+            f" | 채점 완료 {done or '-'}"
+            f" | 판단 기준({int(p.get('min_scored') or 0)}건, {judge}d)까지 "
+            f"{int(p.get('remaining') or 0)}건"]
+
+
+def _audit_single(a: dict) -> list[str]:
+    """단일 보유기간 블록 (audit_recos 반환 형태)."""
     if not a or a.get("n", 0) == 0:
-        return ["━━ ① 지난 추천 자기검증 ━━",
-                f"• {a.get('note', '데이터 부족')}"]
+        return [f"• {a.get('note', '데이터 부족')}"]
     lines = [
-        "━━ ① 지난 추천 자기검증 ━━",
         f"• 표본 {a['n']}건 · 보유 {a['horizon']}거래일 가정",
         f"• 승률: <b>{a['win_rate']:.0f}%</b>  "
         f"(시장 대비 초과 승률 {a['alpha_win_rate']:.0f}%)",
@@ -301,15 +410,168 @@ def _audit_block(a: dict) -> list[str]:
     return lines
 
 
+def _horizon_rows(a: dict) -> tuple[list[str], int]:
+    """보유기간 비교표의 본문 줄만. (줄 목록, 채점된 기간 수).
+
+    해석 문구가 붙지 않은 순수한 표다. 월간 회고가 이것만 쓴다.
+    """
+    by = a.get("by_horizon") or {}
+    hs = a.get("horizons") or sorted(by)
+    # 한글 헤더는 표시 폭으로 맞춘다. `{:>4}` 는 글자 수로 채워서 전각
+    # 문자에서 열이 어긋난다 (구분선 길이도 함께 틀어진다).
+    head = " ".join(_pad(t, w) for t, w in (
+        ("보유", 4), ("표본", 4), ("α승률", 6),
+        ("평균", 7), ("중앙", 7), ("최대", 7), ("최소", 7)))
+    rows = [head, "-" * _display_width(head)]
+    scored = 0
+    for h in hs:
+        d = by.get(h) or by.get(str(h)) or {}
+        n = int(d.get("n") or 0)
+        pend = int(d.get("pending") or 0)
+        # 첫 열에 '일'(전각)이 섞여 있으므로 헤더와 같은 폭 계산을 쓴다.
+        lbl = _pad(f"{h}일", 4)
+        if n == 0:
+            # 0%나 빈 숫자를 넣으면 '성적이 나쁘다'로 읽힌다. 채점이
+            # 아직 도래하지 않았다는 사실만 적는다.
+            rows.append(f"{lbl} 미도래 ({pend}건)")
+            continue
+        scored += 1
+        rows.append(
+            f"{lbl} {n:>4} {d['alpha_win_rate']:>5.0f}% "
+            f"{d['mean_alpha']:>+7.2f} {d['median_alpha']:>+7.2f} "
+            f"{d['max_alpha']:>+7.2f} {d['min_alpha']:>+7.2f}")
+    return rows, scored
+
+
+def _audit_table(a: dict) -> list[str]:
+    """보유기간별 성적을 나란히. 어느 기간에서 알파가 나는지 비교용.
+
+    표는 `<pre>` 로 감싼다. 텔레그램 HTML 파스모드에서 등폭이 유지되지
+    않으면 열이 어긋나 비교가 불가능해진다.
+    """
+    by = a.get("by_horizon") or {}
+    hs = a.get("horizons") or sorted(by)
+    if not hs:
+        return ["• 데이터 부족"]
+
+    rows, scored = _horizon_rows(a)
+    out = ["<pre>" + "\n".join(rows) + "</pre>",
+           "• 평균·중앙·최대·최소는 초과수익(알파, %p) 분포입니다"]
+    if scored == 0:
+        pend_total = sum(int((by.get(h) or {}).get("pending") or 0) for h in hs)
+        out.append(f"• 채점 가능한 표본이 없다 (미도래 {pend_total}건). "
+                   "보유기간이 경과해야 성적이 나온다.")
+        return out
+
+    # 가장 짧은 채점 가능 기간의 상세만 덧붙인다. 세 기간 전부 풀어쓰면
+    # 리포트가 표보다 길어져 비교라는 목적을 잃는다.
+    for h in hs:
+        d = by.get(h) or by.get(str(h)) or {}
+        if int(d.get("n") or 0) > 0:
+            out.append(f"• {h}거래일 상세")
+            out += ["  " + ln for ln in _audit_single(d)]
+            break
+    return out
+
+
+def _audit_block(a: dict) -> list[str]:
+    """자기검증 블록. 다중 기간(audit_multi)과 단일(audit_recos) 둘 다 받는다."""
+    head = ["━━ ① 지난 추천 자기검증 ━━"]
+    if not a:
+        return head + ["• 데이터 부족"]
+    if "by_horizon" in a:
+        return head + _audit_table(a)
+    return head + _audit_single(a)
+
+
+def _monthly_block(m: dict) -> list[str]:
+    """전월 회고. **숫자와 목록만.** 해석 문구를 넣지 않는다.
+
+    '개선됐다' / '양호하다' 같은 말은 표본이 20건도 안 되는 시점에
+    확신을 만들어낸다. 판단은 사람이 한다.
+    """
+    ent = m.get("entries") or []
+    ex = m.get("exits") or []
+    out = [
+        f"━━ 전월 회고 {m.get('month', '')} ━━",
+        f"• 기간 {m.get('start', '')} ~ {m.get('end', '')}",
+        f"• 추천 {m.get('recos', 0)}건 · 진입 {len(ent)}건 · 청산 {len(ex)}건",
+        "",
+        "보유기간별 성적",
+    ]
+    rows, _ = _horizon_rows(m)
+    out.append("<pre>" + "\n".join(rows) + "</pre>")
+    out.append("  평균·중앙·최대·최소는 초과수익(알파, %p)")
+
+    out.append(f"진입 ({len(ent)}건)")
+    if ent:
+        for p in ent:
+            sp = p.get("stop_price")
+            sps = f" · 손절 {float(sp):,.0f}" if sp else ""
+            out.append(f"  {str(p.get('entry_date', ''))[5:]} "
+                       f"{_e(str(p.get('name') or ''))}({p.get('ticker')}) "
+                       f"{p.get('track')} {float(p.get('entry_price') or 0):,.0f}원 "
+                       f"x {int(p.get('qty') or 0):,}주{sps} "
+                       f"[{p.get('status')}]")
+    else:
+        out.append("  없음")
+
+    out.append(f"청산 ({len(ex)}건)")
+    if ex:
+        for e in ex:
+            act = "전량" if e.get("action") == "EXIT_ALL" else \
+                f"{float(e.get('ratio') or 0) * 100:.0f}%"
+            done = "체결" if int(e.get("executed") or 0) else "미체결"
+            ret = e.get("ret_pct")
+            rs = f"{float(ret):+.2f}%" if ret is not None else "-"
+            out.append(f"  {str(e.get('d', ''))[5:]} "
+                       f"{_e(str(e.get('name') or ''))}({e.get('ticker')}) "
+                       f"L{int(e.get('layer') or 0)} {e.get('rule')} "
+                       f"{act} {int(e.get('qty') or 0):,}주 · {rs} · {done}")
+    else:
+        out.append("  없음")
+
+    c = m.get("compliance") or {}
+    out.append("규칙 준수")
+    out.append(f"  최소보유일({c.get('min_hold_days', '-')}거래일) 위반 "
+               f"{c.get('min_hold_violations', 0)}건")
+    for x in (c.get("min_hold_list") or [])[:10]:
+        out.append(f"    - {_e(x['name'])}({x['ticker']}) "
+                   f"{x['entry_date']}→{x['d']} {x['held']}거래일 {x['rule']}")
+    out.append(f"  손절 미이행 {c.get('stop_not_executed', 0)}건")
+    for x in (c.get("stop_not_executed_list") or [])[:10]:
+        out.append(f"    - {_e(x['name'])}({x['ticker']}) {x['d']} {x['rule']}")
+    out.append(f"  재진입 금지({c.get('cooldown_days', '-')}거래일) 위반 "
+               f"{c.get('reentry_violations', 0)}건")
+    for x in (c.get("reentry_list") or [])[:10]:
+        out.append(f"    - {_e(x['name'])}({x['ticker']}) "
+                   f"손절 {x['stop_date']} → 진입 {x['entry_date']} "
+                   f"({x['gap_bars']}거래일)")
+    out.append(f"  검증 불가(수동 종료) {c.get('unverifiable_closes', 0)}건")
+    pct = c.get("compliance_pct")
+    checks = int(c.get("checks") or 0)
+    if pct is None or checks == 0:
+        out.append("  준수율 — (검사 대상 0건)")
+    else:
+        out.append(f"  준수율 {checks - int(c.get('violations') or 0)}/{checks} "
+                   f"({pct:.1f}%)")
+    return out
+
+
 def render_weekly(rep: dict, asof, cfg: Config = DEFAULT) -> str:
     """금요일 주간 누적 분석 리포트."""
+    audit = rep.get("audit") or {}
     out: list[str] = [
         f"📅 <b>[주간 누적 분석]</b> {rep.get('trade_date')}",
+    ]
+    out += _paper_banner(audit)
+    out += _progress_line(audit)
+    out += [
         f"• 집계 {rep.get('days_covered', 0)}거래일 · "
         f"관측 {rep.get('universe_size', 0):,}종목",
         "",
     ]
-    out += _audit_block(rep.get("audit") or {})
+    out += _audit_block(audit)
     out.append("")
 
     mom = rep.get("momentum")
@@ -384,6 +646,11 @@ def render_weekly(rep: dict, asof, cfg: Config = DEFAULT) -> str:
     else:
         out.append("• 업종 정보 없음")
 
+    mon = rep.get("monthly")
+    if mon:
+        out.append("")
+        out += _monthly_block(mon)
+
     out.append("")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
     return "\n".join(out)
@@ -398,39 +665,144 @@ CATEGORY_ICON = {
 }
 
 
-def _news_line(row, tick_map: dict, show_source: bool = True) -> str:
-    """뉴스 1건 1~2줄. 클러스터 크기와 종목 태그를 붙인다."""
+def _display_title(row) -> str:
+    """표시용 제목. 끝에 붙은 ' - 매체명' 을 뗀다.
+
+    Google News 는 제목에 매체명을 붙여 준다. 2026-09-09 아침 브리핑에는
+    '… - digitaltoday.co.kr', '… - v.daum.net' 처럼 **도메인이 제목에
+    그대로** 찍혔다. 수집 단계(news_sources.collect_google)에서 떼도록
+    고쳤지만, 그 전에 저장된 행이 DB 에 남아 있다. 브리핑은 최근 16시간을
+    읽으므로 고친 직후 한동안은 옛 행이 섞인다. 그래서 여기서도 막는다.
+
+    꼬리표가 **그 행의 매체명과 정확히 같을 때만** 뗀다. 정규식으로 끝을
+    자르면 '… - 종합' 같은 실제 제목 일부를 잘라낼 수 있다.
+    """
+    title = str(row["title"] or "").strip()
+    src = str(row.get("source") or "").strip()
+    if src and title.endswith(f" - {src}"):
+        return title[: -(len(src) + 3)].strip() or title
+    return title
+
+
+def _news_line(row, tick_map: dict, show_source: bool = True,
+               cluster_n: int | None = None) -> str:
+    """뉴스 1건 1~2줄. 클러스터 크기와 종목 태그를 붙인다.
+
+    URL 은 제목에 <a href> 로 감는다. 본문에 주소를 찍지 않는다 —
+    Google News RSS 주소는 한 건이 400자를 넘어 메시지를 잡아먹는다.
+    """
     icon = CATEGORY_ICON.get(row["category"], "•")
-    n = int(row.get("cluster_n") or 1)
+    n = int((cluster_n if cluster_n is not None else row.get("cluster_n")) or 1)
     multi = f" <i>({n}개 매체)</i>" if n >= 2 else ""
-    title = _e(str(row["title"])[:110])
+    title = _e(_display_title(row)[:110])
     line = f"{icon} <a href=\"{_e(row['url'] or '')}\">{title}</a>{multi}"
     tags = tick_map.get(row["id"]) or []
     sub = []
     if tags:
         sub.append("· " + " ".join(f"<b>{_e(t)}</b>" for t in tags[:4]))
-    if show_source and row.get("source"):
-        sub.append(f"({_e(row['source'])})")
+    src = canonical_source(row.get("source"))
+    if show_source and src:
+        sub.append(f"({_e(src)})")
     if row.get("summary"):
         sub.insert(0, "· " + _e(str(row["summary"])[:120]))
     return line + ("\n   " + " ".join(sub) if sub else "")
 
 
-def _dedup_clusters(df, limit: int):
-    """클러스터당 대표 1건만 남긴다. 같은 사건이 반복 노출되는 걸 막는다."""
+def _group_events(df, tick_map: dict | None = None, cfg=None) -> list[list]:
+    """창 안의 기사를 **사건 단위**로 묶는다. 각 묶음의 0번이 대표다.
+
+    DB 의 cluster_id 를 그대로 믿지 않고 여기서 다시 묶는 이유가 둘이다.
+
+      1. 브리핑 창(16시간)에는 수집 실행이 두세 번 들어간다. 고치기 전에
+         쌓인 행은 실행마다 다른 cluster_id 를 달고 있어서, cluster_id 만
+         보면 같은 기사가 그대로 두 번 나온다.
+      2. 화면에 찍는 '(N개 매체)' 는 **실제로 화면에서 묶인 것**과 같아야
+         한다. 적재 시점의 집계를 그대로 쓰면 창 밖 기사까지 세게 된다.
+
+    대표 선정은 `news.representative_rank` 를 따른다 —
+    내 종목 언급 > 주요 매체 > 먼저 수집된 것.
+    """
     if df is None or df.empty:
         return []
-    seen: set = set()
+    tick_map = tick_map or {}
+    rows = [r for _, r in df.iterrows()]
+
+    # cluster_items 는 dict 를 기대한다. 판정에 필요한 열만 넘긴다.
+    probe = [{"id": r["id"], "title": r.get("title"),
+              "title_norm": r.get("title_norm"),
+              "source": r.get("source"),
+              "tickers": [(c, c) for c in tick_map.get(r["id"], ())]}
+             for r in rows]
+    cluster_items(probe, cfg=cfg)
+    cid_of = {p["id"]: p["cluster_id"] for p in probe}
+
+    # 1층 — 같은 URL 은 유사도를 볼 것도 없이 같은 기사다. 클러스터가
+    # 갈려 있어도 URL 로 다시 붙인다 (추적 파라미터는 normalize_url 이 뗀다).
+    parent: dict = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_url: dict = {}
+    for r in rows:
+        key = cid_of.get(r["id"]) or r["id"]
+        find(key)
+        url = normalize_url(r.get("url"))
+        if url:
+            if url in by_url:
+                union(by_url[url], key)
+            else:
+                by_url[url] = key
+
+    groups: dict = {}
+    order: list = []
+    for r in rows:
+        key = find(cid_of.get(r["id"]) or r["id"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
     out = []
-    for _, r in df.iterrows():
-        cid = r.get("cluster_id") or r["id"]
-        if cid in seen:
-            continue
-        seen.add(cid)
-        out.append(r)
-        if len(out) >= limit:
-            break
+    for k in order:
+        g = groups[k]
+        g.sort(key=lambda r: representative_rank(
+            r, has_ticker=bool(tick_map.get(r["id"]))))
+        out.append(g)
     return out
+
+
+def _assign_sections(groups: list[list], priority: tuple,
+                     per_section: int) -> dict:
+    """사건 하나를 **가장 잘 맞는 섹션 하나에만** 넣는다 (1층).
+
+    브리핑의 섹션 필터는 서로 겹친다 — 미국 매크로 기사는 지역으로도
+    카테고리로도 걸리고, 중요한 공시는 '내 종목'에도 '공시'에도 걸린다.
+    예전에는 섹션마다 따로 걸러서 같은 URL 이 두 섹션에 그대로 찍혔다
+    (2026-09-09 실측: 매크로 5건 중 4건이 해외 섹션과 같은 URL).
+
+    priority 는 **배정 우선순위 순서**의 `(라벨, 판정함수)` 튜플이다.
+    화면 표시 순서와는 별개다.
+    """
+    picked: dict = {label: [] for label, _ in priority}
+    for g in groups:
+        rep = g[0]
+        for label, match in priority:
+            if len(picked[label]) >= per_section:
+                continue
+            if match(rep):
+                picked[label].append((rep, len({canonical_source(x.get("source"))
+                                                for x in g if x.get("source")})))
+                break
+    return picked
 
 
 def _tick_map(store, rows) -> dict:
@@ -454,28 +826,30 @@ def render_morning_brief(store, asof, hours: int = 16,
         return (f"☀️ <b>[아침 브리핑]</b> {asof:%m/%d}\n\n"
                 "• 수집된 뉴스가 없습니다. 수집 배치를 확인하십시오.")
 
-    overseas = df[df["region"].isin(["US", "GLOBAL"])]
-    macro = df[df["category"].isin(["매크로", "정책"])]
-    mine = df[df["importance"] >= 5.0]
-    disclosure = df[df["category"] == "공시"]
+    tm = _tick_map(store, [r for _, r in df.iterrows()])
+    groups = _group_events(df, tm)
 
     out = [f"☀️ <b>[아침 브리핑]</b> {asof:%Y-%m-%d %H:%M}",
-           f"• 최근 {hours}시간 {len(df)}건 · "
-           f"사건 {df['cluster_id'].nunique()}건", ""]
+           f"• 최근 {hours}시간 {len(df)}건 · 사건 {len(groups)}건", ""]
 
-    sections = (
-        ("🌏 밤사이 해외", overseas),
-        ("🏛 매크로·정책", macro),
-        ("🎯 내 종목·고중요도", mine),
-        ("📄 주요 공시", disclosure),
+    # 배정 우선순위 — 한 기사는 여기서 처음 걸리는 섹션 하나로만 간다.
+    priority = (
+        ("🎯 내 종목·고중요도", lambda r: float(r.get("importance") or 0.0) >= 5.0),
+        ("📄 주요 공시", lambda r: r.get("category") == "공시"),
+        ("🏛 매크로·정책", lambda r: r.get("category") in ("매크로", "정책")),
+        ("🌏 밤사이 해외", lambda r: r.get("region") in ("US", "GLOBAL")),
     )
-    for label, sub in sections:
-        rows = _dedup_clusters(sub, per_section)
+    # 표시 순서는 예전 그대로 둔다. 배정과 표시는 다른 문제다.
+    display = ("🌏 밤사이 해외", "🏛 매크로·정책",
+               "🎯 내 종목·고중요도", "📄 주요 공시")
+
+    picked = _assign_sections(groups, priority, per_section)
+    for label in display:
+        rows = picked.get(label) or []
         if not rows:
             continue
-        tm = _tick_map(store, rows)
         out.append(f"━━ {label} ({len(rows)}건) ━━")
-        out += [_news_line(r, tm) for r in rows]
+        out += [_news_line(r, tm, cluster_n=n) for r, n in rows]
         out.append("")
 
     out.append("※ 뉴스에는 점수를 매기지 않습니다. 중요도는 '몇 개 매체가")
@@ -492,24 +866,25 @@ def render_evening_brief(store, asof, picks: list | None = None,
         out.append("\n• 국내 뉴스 수집분이 없습니다.")
         return "\n".join(out)
 
-    out.append(f"• 최근 {hours}시간 {len(df)}건 · "
-               f"사건 {df['cluster_id'].nunique()}건")
+    tm = _tick_map(store, [r for _, r in df.iterrows()])
+    groups = _group_events(df, tm)
+    out.append(f"• 최근 {hours}시간 {len(df)}건 · 사건 {len(groups)}건")
     out.append("")
 
-    disclosure = df[df["category"] == "공시"]
-    flow = df[df["category"] == "수급"]
-    theme = df[df["category"].isin(
-        ["반도체", "2차전지", "방산조선", "바이오", "전력AI"])]
-    market = df[df["category"].isin(["국내시황", "실적"])]
-
-    for label, sub in (("📄 공시", disclosure), ("💧 수급", flow),
-                       ("🏭 테마·업종", theme), ("📊 시황·실적", market)):
-        rows = _dedup_clusters(sub, per_section)
+    themes = ("반도체", "2차전지", "방산조선", "바이오", "전력AI")
+    priority = (
+        ("📄 공시", lambda r: r.get("category") == "공시"),
+        ("💧 수급", lambda r: r.get("category") == "수급"),
+        ("🏭 테마·업종", lambda r: r.get("category") in themes),
+        ("📊 시황·실적", lambda r: r.get("category") in ("국내시황", "실적")),
+    )
+    picked = _assign_sections(groups, priority, per_section)
+    for label, _ in priority:
+        rows = picked.get(label) or []
         if not rows:
             continue
-        tm = _tick_map(store, rows)
         out.append(f"━━ {label} ({len(rows)}건) ━━")
-        out += [_news_line(r, tm) for r in rows]
+        out += [_news_line(r, tm, cluster_n=n) for r, n in rows]
         out.append("")
 
     # 추천 10선과 뉴스 교차 — 뉴스가 붙은 추천 종목을 표시한다
@@ -532,7 +907,76 @@ def render_evening_brief(store, asof, picks: list | None = None,
             out.append("• 추천 종목 관련 뉴스 없음 (조용한 바닥일 수 있음)")
         out.append("")
 
+    out.append(render_watchlist(store))
+    out.append("")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
+    return "\n".join(out)
+
+
+# 배제 플래그 표시명. store.load_flags 의 한글 키 그대로 쓴다.
+_WATCH_FLAG_KEYS = ("관리종목", "투자주의환기", "감사의견거절", "자본잠식",
+                    "대규모증자", "거래정지이력", "동전주위험", "재진입금지")
+
+
+def render_watchlist(store) -> str:
+    """📌 관심종목 현황 — 섹터별 · 당일 등락률 · 스캔 등급 · 배제 플래그.
+
+    **팩트만 찍는다. 해석은 없다.** 점수·추천 로직은 읽기만 하고 건드리지
+    않는다 — 이 함수는 scans/flags/prices 를 조회할 뿐 어디에도 쓰지 않는다.
+
+    '스캔 제외' 는 최근 스캔일 스냅샷에 그 종목이 없다는 뜻이다(유동성
+    필터 탈락, 데이터 부족 등). 이유는 여기서 판단하지 않는다.
+    """
+    out = ["━━ 📌 관심종목 현황 ━━"]
+    if not WATCHLIST:
+        out.append("• 등록된 관심종목 없음")
+        return "\n".join(out)
+
+    # 스냅샷·플래그는 한 번만 읽는다. 종목마다 쿼리하면 43회가 된다.
+    grade: dict = {}
+    scan_d = None
+    try:
+        sc = store.scan_history(days=1)
+        if sc is not None and not sc.empty:
+            scan_d = str(sc["d"].max())
+            last = sc[sc["d"] == scan_d]
+            grade = dict(zip(last["ticker"].astype(str), last["grade"].astype(str)))
+    except Exception:  # noqa: BLE001 - 스캔 이력이 없어도 섹션은 나가야 한다
+        grade = {}
+    try:
+        flags = store.load_flags()
+    except Exception:  # noqa: BLE001
+        flags = {}
+
+    def _chg(code: str) -> str:
+        try:
+            df = store.load_ohlcv(code, days=5)
+        except Exception:  # noqa: BLE001
+            df = None
+        if df is None or len(df) < 2:
+            return "시세 없음"
+        c = df["종가"].astype(float)
+        prev, last = float(c.iloc[-2]), float(c.iloc[-1])
+        if prev <= 0:
+            return "시세 없음"
+        return _pct((last / prev - 1.0) * 100.0)
+
+    for sector, items in WATCHLIST.items():
+        out.append(f"[{_e(sector)}]")
+        for code, name in items:
+            bits = [_chg(code)]
+            if code in grade:
+                g = grade[code]
+                bits.append(f"등급 {_e(g) if g and g != 'NONE' else '—'}")
+            else:
+                bits.append("스캔 제외")
+            f = flags.get(code) or {}
+            hit = [k for k in _WATCH_FLAG_KEYS if f.get(k)]
+            if hit:
+                bits.append("⚑ " + "·".join(hit))
+            out.append(f"• <b>{_e(name)}</b>  " + "  ".join(bits))
+    if scan_d:
+        out.append(f"(스캔 기준일 {scan_d} · 등락률은 마지막 두 봉 종가 기준)")
     return "\n".join(out)
 
 
@@ -583,10 +1027,22 @@ LAYER_LABEL = {
 }
 
 
+def _dec_label(dec) -> str:
+    """계층 이름. 계층 0 은 무효화와 보유기간 만료가 공유하므로 규칙을 본다."""
+    return RULE_NAME.get(getattr(dec, "rule", ""),
+                         LAYER_LABEL.get(dec.layer, str(dec.layer)))
+
+
+def _dec_icon(dec) -> str:
+    if getattr(dec, "rule", "") == "hold:expired":
+        return "🗓"
+    return LAYER_ICON.get(dec.layer, "•")
+
+
 def render_exit_alert(dec, cfg: Config = DEFAULT) -> str:
     """청산 신호 1건. 무효화·손절은 즉시 나가야 하므로 단건 발송한다."""
-    icon = LAYER_ICON.get(dec.layer, "•")
-    label = LAYER_LABEL.get(dec.layer, str(dec.layer))
+    icon = _dec_icon(dec)
+    label = _dec_label(dec)
     act = "전량" if dec.action == "EXIT_ALL" else f"{dec.ratio * 100:.0f}% 부분"
     head = "🚨🚨 " if dec.urgent else ""
     lines = [
@@ -627,15 +1083,15 @@ def render_exit_digest(res: dict, asof, cfg: Config = DEFAULT) -> str:
     out = [f"🗂 <b>[청산 판정 {len(decs)}건]</b> {res.get('trade_date') or ''}",
            f"• 보유 {n_pos}건{mtxt}", ""]
     for d in decs:
-        icon = LAYER_ICON.get(d.layer, "•")
-        label = LAYER_LABEL.get(d.layer, str(d.layer))
+        icon = _dec_icon(d)
+        label = _dec_label(d)
         act = "전량" if d.action == "EXIT_ALL" else f"{d.ratio * 100:.0f}%"
         out.append(f"{icon} <b>{_e(d.name)}</b> [{label}] {act} {d.qty:,}주")
         out.append(f"   {d.signal_price:,.0f}원 · {d.ret_pct:+.2f}%")
         out.append(f"   {_e(d.reason[:90])}")
     out.append("")
-    out.append("※ 우선순위: 무효화 > 손절 > 트레일링 > 목표3차 > 목표2차")
-    out.append("  > 목표1차 > 시간 > 순환매. 포지션당 1건만 집행합니다.")
+    out.append("※ 우선순위: 무효화 > 보유만료 > 손절 > 트레일링 > 목표3차")
+    out.append("  > 목표2차 > 목표1차 > 시간 > 순환매. 포지션당 1건만 집행합니다.")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
     return "\n".join(out)
 
@@ -657,8 +1113,12 @@ def render_positions(positions: list, price_map: dict | None = None) -> str:
         out.append(f"   진입 {p.entry_date} @ {p.entry_price:,.0f}원 "
                    f"· 잔량 {p.remaining:,}/{p.qty:,}주 · {ret}")
         stops = []
+        # 손절선은 진입 시 기록된 stop_price 다. 밴드 하단을 '손절' 로
+        # 표시하면 실제 판정 기준과 다른 값을 보게 된다.
+        if p.stop_price:
+            stops.append(f"손절 {float(p.stop_price):,.0f}")
         if p.entry_band_lo:
-            stops.append(f"손절 {float(p.entry_band_lo):,.0f}")
+            stops.append(f"밴드하단 {float(p.entry_band_lo):,.0f}")
         if p.entry_band_hi:
             stops.append(f"목표 {float(p.entry_band_hi):,.0f}")
         if p.entry_fib_0382:
@@ -668,3 +1128,139 @@ def render_positions(positions: list, price_map: dict | None = None) -> str:
     out.append("")
     out.append("※ 청산선은 진입 시점 스냅샷으로 고정됩니다 (재계산 안 함).")
     return "\n".join(out)
+
+
+# ══════════════════════════ 월간 배당 리포트 ══════════════════════════
+# 하단 고정 문구. **문자열을 여기 한 곳에만 둔다.**
+# 리포트마다 다시 쓰면 어느 날 한쪽에서 빠지고, 빠진 것을 아무도 모른다.
+DIVIDEND_FOOTER = ("📋 배당 팩트 리포트 — 매수 추천 아님. "
+                   "수치는 과거 공시 기준이며 올해 배당은 확정 전임.")
+
+# 이 표에 금지된 어휘. 스모크 테스트가 부재를 검사한다.
+# '목표 수량'·'매수 계획'·'추천' 이 붙으면 팩트 표가 지시문으로 읽힌다.
+DIVIDEND_BANNED = ("목표 수량", "매수 계획", "추천", "매수하십시오", "비중")
+
+
+def _d10(v) -> str:
+    """날짜를 YYYY-MM-DD 로. 없으면 '-'."""
+    if v is None:
+        return "-"
+    s = str(v)[:10]
+    return s if len(s) == 10 else "-"
+
+
+def _num_or_dash(v, fmt: str) -> str:
+    try:
+        if v is None or v != v:
+            return "-"
+        return format(float(v), fmt)
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _recovery_cell(rec) -> str:
+    """과거 배당락 회복일수 요약 한 칸. `평균/최대` 또는 '미회복' 또는 '-'.
+
+    미회복을 큰 숫자로 채우지 않는다. 평균이 그 숫자에 좌우된다.
+    """
+    if not rec:
+        return "-"
+    n = int(rec.get("samples") or 0)
+    unrec = int(rec.get("unrecovered") or 0)
+    if n == 0:
+        return "미회복" if unrec else "-"
+    avg, mx = rec.get("avg"), rec.get("max")
+    cell = f"{avg:.0f}/{mx}일({n})"
+    if unrec:
+        cell += f"+미회복{unrec}"
+    return cell
+
+
+def render_dividend_report(rep: dict, asof, cfg: Config = DEFAULT) -> str:
+    """월간 배당 팩트 리포트.
+
+    **숫자와 날짜만 낸다.** 해석·권유 문구를 붙이지 않는다. 배당주는
+    '안정적'이라는 말이 가장 쉽게 붙는 자리라, 그 말이 붙으면 표가
+    판단을 대신하기 시작한다.
+
+    기준일·최종 매수일은 **추정**이다. 컬럼명에 그 사실을 박아 넣는다
+    (`dividend_calendar` 독스트링 참조). 확정 날짜처럼 보이면 사람이
+    그 날짜에 주문을 낸다.
+    """
+    rows = rep.get("rows") or []
+    head = [
+        "💰 <b>[월간 배당 팩트]</b>",
+        "",
+        f"• 기준일 {_e(rep.get('trade_date') or '-')} 종가 · "
+        f"사업연도 {_e(rep.get('base_year') or '-')} 확정 배당",
+        f"• 필터 평가 {rep.get('evaluated', 0):,}종목 · "
+        f"통과 {rep.get('passed', 0):,}종목",
+    ]
+    fun = rep.get("funnel") or {}
+    if fun:
+        bits = [f"{k} {v.get('failed', 0)}" for k, v in sorted(fun.items())]
+        head.append("• 탈락 " + " · ".join(bits))
+
+    if not rows:
+        head += ["", "• 전 필터를 통과한 종목이 없습니다.",
+                 f"• {rep.get('reason') or ''}".rstrip(), "", DIVIDEND_FOOTER]
+        return "\n".join(x for x in head if x is not None)
+
+    w = (7, 12, 9, 7, 7, 7, 8, 8, 12, 12, 14)
+    hdr = ("코드", "종목명", "현재가", "DPS", "수익률", "성향",
+           "5yr성장", "총환원율", "기준일(추정)", "최종매수(추정)",
+           "과거회복일수(참고)")
+    table = ["".join(_pad(h, wi) for h, wi in zip(hdr, w))]
+    for r in rows:
+        cells = (
+            r.get("code") or "-",
+            (str(r.get("name") or "")[:6]),
+            _num_or_dash(r.get("price"), ",.0f"),
+            _num_or_dash(r.get("dps"), ",.0f"),
+            _num_or_dash(r.get("div_yield"), ".2f") + "%",
+            _num_or_dash(r.get("payout"), ".1f") + "%",
+            (_num_or_dash(r.get("cagr"), "+.1f") + "%"
+             if r.get("cagr") is not None else "-"),
+            (_num_or_dash(r.get("total_return"), ".2f") + "%"
+             if r.get("total_return") is not None else "-"),
+            _d10(r.get("record_date")),
+            _d10(r.get("last_buy")),
+            _recovery_cell(r.get("recovery")),
+        )
+        table.append("".join(_pad(c, wi) for c, wi in zip(cells, w)))
+
+    n_conf = sum(1 for r in rows if r.get("calendar_confirmed"))
+    body = [
+        "",
+        f"━━ 상위 {len(rows)}종목 (배당수익률순) ━━",
+        "<pre>" + "\n".join(table) + "</pre>",
+        "• 연속연수: " + " · ".join(
+            f"{_e(str(r.get('name') or '')[:6])} {r.get('years_paid') or 0}년"
+            for r in rows[:8]),
+        "",
+        "━━ 날짜에 관하여 ━━",
+        "• 기준일·최종매수일은 <b>추정</b>입니다. 공시된 날짜가 아닙니다.",
+        "• 결산기말일을 기준일로 가정하고 결제 T+"
+        f"{int(cfg.dividend.settle_days)}(영업일)로 역산했습니다.",
+        "• 2024년 배당절차 개선 이후 배당액 확정 뒤에 기준일을 잡는 회사가 "
+        "늘었습니다. 그런 종목은 12월이 아니라 이듬해 2~4월입니다.",
+        f"• 달력 실측 확인 {n_conf}/{len(rows)}종목 "
+        "(미확인은 주말·기지정 휴장일만 반영한 추정 달력입니다)",
+        "",
+        f"• 5yr성장 = 최근 {int(cfg.dividend.cagr_years)}개 사업연도 DPS "
+        "연평균 성장률. 시작 연도가 무배당이면 '-' 입니다.",
+        "• 총환원율 = (현금배당총액 + 자사주 취득액) / 시가총액. "
+        f"자사주 확인 {rep.get('buyback_known', 0)}/{len(rows)}종목.",
+        "",
+        "━━ 과거회복일수(참고) ━━",
+        f"• 표기 `평균/최대일(표본수)`. 과거 {int(cfg.dividend.recovery_years)}"
+        "년 배당락일 이후 락 전 종가를 회복하기까지의 거래일수입니다.",
+        "• <b>과거 통계이고 예측이 아닙니다.</b> 표본이 3건도 되지 않고 "
+        "그 사이 시장 국면이 달랐습니다.",
+        "• 회복하지 못한 사례는 '미회복'으로 셉니다 (평균에 넣지 않습니다).",
+        f"• 표본 합계 {rep.get('recovery_samples', 0)}건 — 시세 적재 범위를 "
+        "벗어난 해는 계산되지 않습니다.",
+        "",
+        DIVIDEND_FOOTER,
+    ]
+    return "\n".join(head + body)

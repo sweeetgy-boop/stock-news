@@ -36,22 +36,35 @@ __all__ = ["JobLock", "LockBusy", "MODE_TIMEOUTS", "clear_locks"]
 
 # 모드별 예상 최대 소요(초). 이 시간이 지난 락은 죽은 것으로 보고 빼앗는다.
 # 실제 소요보다 넉넉히 준다. 짧으면 정상 실행 중인 잡의 락을 빼앗는다.
+#
+# **락을 잡는 모드만 넣는다.** 읽기 전용 모드(fib/weekly/brief-weekly/
+# export/backtest/pos-list/credit-probe/kiwoom-plan/runs)는 애초에 락을
+# 잡지 않으므로 여기 값이 있어도 도달하지 않는다. 예전에는 fib/weekly/
+# brief-weekly/export 항목이 있었고(도달 불가), 정작 락을 잡는
+# pos-open/fill/pos-close 는 빠져 있어 기본값 900초로 떨어졌다.
+# 스모크 테스트가 `run_screen._WRITE_MODES` 와 이 키 집합의 일치를 강제한다.
 MODE_TIMEOUTS: dict[str, int] = {
     "backfill": 7200,     # 2시간 (2,800종목 x 0.35초 + 재시도)
-    "daily": 1800,        # 30분
-    "fib": 1800,
-    "flash": 1200,
+    "credit-kiwoom": 5400,   # 90분 (유량 제한이 걸리면 스스로 느려진다)
+    # 전종목 배당 수집. 종목당 DART 2~3회 x 2,500종목.
+    "collect-dividends": 7200,
+    # 배당 리포트. 네트워크 없이 로컬 DB 만 읽고 필터 판정을 적재한다.
+    "dividend-report": 600,
     "flags": 3600,        # DART 조회가 종목당 0.25초
-    "weekly": 900,
-    "news": 900,
-    "brief-morning": 900,
-    "brief-evening": 900,
-    "brief-weekly": 600,
+    "daily": 1800,        # 30분
+    "flash": 1200,
+    "holidays": 120,
     "master": 900,
     "update": 900,
     "exits": 900,
+    "news": 900,
+    "brief-morning": 900,
+    "brief-evening": 900,
     "credit": 300,
-    "export": 600,
+    # 사람이 직접 치는 명령. 즉시 끝난다.
+    "pos-open": 120,
+    "fill": 120,
+    "pos-close": 120,
 }
 DEFAULT_TIMEOUT = 900
 
@@ -169,7 +182,18 @@ class JobLock:
             self.acquired = False
 
     def __enter__(self) -> "JobLock":
-        self.acquire()
+        """락을 못 잡으면 `LockBusy` 를 낸다.
+
+        예전에는 `acquire()` 의 반환값을 버렸다. 그래서 `with JobLock(...)`
+        은 락을 못 잡아도 조용히 블록 안으로 들어갔다 — 동시 실행을 막는
+        것이 목적인 코드가 정반대로 동작했다. `LockBusy` 는 이 경우를
+        위해 정의돼 있었지만 아무도 던지지 않았다.
+
+        `acquire()` 의 bool API 는 그대로 둔다. `run_screen.main()` 은
+        예외가 아니라 exit 3 을 내야 하므로 그쪽이 맞다.
+        """
+        if not self.acquire():
+            raise LockBusy(self.name, self.holder)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:

@@ -28,7 +28,10 @@ stocknews/
   news.py        뉴스 정리 (중복제거 · 사건 클러스터 · 종목태깅 · 중요도)
   exits.py       청산 규칙 엔진 (8계층 우선순위)
   flags.py       배제 플래그 공급원 (FDR 관리종목 · DART · 로컬 · 수동)
-  krx_credit.py  종목별 신용잔고 수집 (bld 코드 미확정 — 아래 '신용잔고' 절)
+  krx_credit.py  KRX 신용잔고 수집 가능성 진단 (결론: 불가 — 아래 절)
+  kiwoom.py      키움 대상선정·호출제한·환경진단 (OCX 미접촉)
+  kiwoom_rest.py 키움 REST (au10001 토큰 + ka10013 신용잔고) ★ 자동 경로
+  env.py         .env 로더 (dotenv 위임 + stdlib 폴백)
   backtest.py    워크포워드 이벤트 스터디 (운영 코드 절단 호출)
   trading_day.py 거래일 판정 (주말 · 공휴일 자기학습 캐시)
   joblock.py     잡 단위 파일 락
@@ -36,7 +39,8 @@ stocknews/
   notify.py      4중 게이트 + 발송
   data.py        pykrx / FinanceDataReader 로더
 run_screen.py    실행부
-smoke_test.py    스모크 테스트 135건 (네트워크·실DB 미사용)
+kiwoom_bridge.py 키움 OCX 브릿지 (대체 경로 · 32비트 전용 · 사람이 실행)
+smoke_test.py    스모크 테스트 218건 (네트워크·실DB 미사용)
 verify_env.py    requirements.txt 핀 대조 + 런타임 기능 점검
 hermes/run.cmd   실행 래퍼 (에이전트는 반드시 이걸 쓴다)
 ```
@@ -85,7 +89,7 @@ ElementTree) · 미선언 전이 의존성 경고를 확인한다.
 반드시 먼저 돌리십시오.
 
 ```bash
-hermes\run.cmd smoke        # 135건 검사 (권장 — 인코딩·인터프리터 처리됨)
+hermes\run.cmd smoke        # 218건 검사 (권장 — 인코딩·인터프리터 처리됨)
 hermes\run.cmd smoke -v     # 실패 시 트레이스백까지
 ```
 
@@ -148,7 +152,9 @@ copy data\flags_manual.csv.example data\flags_manual.csv
 
 ```bash
 python run_screen.py --mode update          # 당일 시세 증분 (요청 2회, 수초)
-python run_screen.py --mode credit          # 수동 신용잔고 주입 (주 1회면 충분)
+python run_screen.py --mode credit-kiwoom   # 신용잔고 REST 실측 (앱키 필요)
+python run_screen.py --mode credit          # 신용잔고 CSV 적재 (자동 -> 수동)
+python run_screen.py --mode runs            # 배치 이력 + 스케줄 공백 점검
 python run_screen.py --mode export          # 전종목 점수표 CSV (협업용)
 python run_screen.py --mode daily           # 전종목 스캔 + 추천 10선
 python run_screen.py --mode weekly          # 금요일 주간 누적 분석
@@ -182,14 +188,16 @@ python run_screen.py --mode pos-close --id 1   # 수동 종료
 배치 등록 (Linux cron)
 
 ```
-20  8   * * 1-5  ... run_screen.py --mode news            # 수집 선행
-30  8   * * 1-5  ... run_screen.py --mode brief-morning --no-collect
+0   6   * * 1-5  ... run_screen.py --mode news            # 수집 선행
+20  6   * * 1-5  ... run_screen.py --mode brief-morning --no-collect
 */5 9,10,14,15 * * 1-5  ... run_screen.py --mode flash   # 4대 시간창
 #   창 밖에서 돌아도 즉시 빈손으로 끝난다. 5분 간격이면 창을 놓치지 않는다.
 0   12  * * 1-5  ... run_screen.py --mode news            # 장중 1회 보강
 30  15  * * 1-5  ... run_screen.py --mode master
 40  15  * * 1-5  ... run_screen.py --mode update
 50  15  * * 1-5  ... run_screen.py --mode flags --dart-limit 400
+35  16  * * 1-5  ... run_screen.py --mode credit-kiwoom      # 신용잔고 실측
+40  18  * * 1-5  ... run_screen.py --mode runs               # 배치 이력 점검
 55  15  * * 1    ... run_screen.py --mode credit             # 주 1회 신용잔고
 15  16  * * 5    ... run_screen.py --mode export             # 금요일 협업 CSV
 0   18  * * 1-5  ... run_screen.py --mode daily
@@ -199,7 +207,12 @@ python run_screen.py --mode pos-close --id 1   # 수동 종료
 40  18  * * 5    ... run_screen.py --mode brief-weekly
 ```
 
-`brief-morning`에 `--no-collect`를 붙인 이유는 08:20 수집 배치가 이미 돌았기
+잡 하나만 dry-run 으로 돌리려면 `STOCKNEWS_DRY_JOBS=flash` (콤마 구분) 를
+설정한다. `STOCKNEWS_SEND=1` 이어도 지목된 잡만 `--dry-run` 이 붙는다 —
+flash 를 첫날 로그만 보고 켜는 용도다. flash 에 `--no-update` 등을 넘기려면
+`nightly.py` 의 `FLASH_EXTRA_ARGS` 를 바꾼다 (기본 비어 있음).
+
+`brief-morning`에 `--no-collect`를 붙인 이유는 06:00 수집 배치가 이미 돌았기
 때문이다. 수집과 발송을 분리하면 한 소스가 느려도 브리핑 시각이 밀리지 않는다.
 
 Windows 작업 스케줄러를 쓴다면 같은 시각에 동일 명령을 등록하면 된다.
@@ -225,8 +238,10 @@ Windows 작업 스케줄러를 쓴다면 같은 시각에 동일 명령을 등�
 ```
 [하루 2~3회] news → 수집 → 정규화 → 사건 클러스터 → 종목태깅 → 중요도
                   └─ news / news_tickers 테이블
-[08:30] brief-morning  밤사이 해외 + 매크로 + 내 종목 + 주요 공시
+[06:20] brief-morning  밤사이 해외 + 매크로 + 내 종목 + 주요 공시
 [18:20] brief-evening  국내 공시·수급·테마·시황 + 추천 10선 교차
+                       + 📌 관심종목 현황 (config.WATCHLIST · 표시·뉴스태깅 전용,
+                         점수·추천·청산 어디에도 안 쓰임. 보유 아님)
 [금 18:40] brief-weekly 이번 주 vs 지난 주 테마 건수 변화
 ```
 
@@ -237,12 +252,66 @@ Windows 작업 스케줄러를 쓴다면 같은 시각에 동일 명령을 등�
 
 ```
 ① 정규화   제목에서 매체 꼬리표 · 대괄호 태그 · [단독][종합] 제거
-② 중복제거 정규화 제목 + 매체 해시로 같은 기사를 합침
-③ 클러스터 토큰 자카드 0.55 이상이면 같은 사건으로 묶음
-④ 종목매핑 제목에서 유니버스 종목명 검색 (긴 이름 우선, 우선주 제외)
-⑤ 분류     키워드 룰 13개 카테고리 (공시/수급/실적/매크로/반도체/…)
-⑥ 중요도   매체 수 + 내 종목 여부 + 키워드 강도 + 신선도
+② 중복제거 3층 (아래)
+③ 종목매핑 제목에서 유니버스 종목명 검색 (긴 이름 우선, 우선주 제외)
+④ 분류     키워드 룰 13개 카테고리 (공시/수급/실적/매크로/반도체/…)
+⑤ 중요도   매체 수 + 내 종목 여부 + 키워드 강도 + 신선도
 ```
+
+### 중복 제거 3층
+
+같은 뉴스가 브리핑에 여러 번 나오는 이유가 하나가 아니라서 층을 나눴다.
+
+```
+1층  같은 URL          정규화 URL(추적 파라미터 제거)로 접는다.
+                       섹션 필터가 겹쳐 한 기사가 두 섹션에 찍히던 것도
+                       여기서 막는다 — 사건 하나는 섹션 하나에만 들어간다.
+                       배정 우선순위: 내 종목 > 공시 > 매크로 > 해외
+
+2층  같은 기사·다른 매체명
+                       'digitaltoday.co.kr' 과 '디지털투데이' 는 한 매체다.
+                       config.MEDIA_ALIASES (도메인 -> 표시명) 로 통일한다.
+                       표는 같은 URL 을 공유한 source 짝에서 도출했다.
+
+3층  같은 사건·다른 기사
+                       제목 토큰 유사도. 조사를 떼고 순수 숫자를 버린 뒤
+                         ① 자카드 >= 0.50  또는
+                         ② 공통 토큰 >= 3 이고 짧은 쪽 포함도 >= 0.40
+                       대표 기사 하나만 내보내고 "(N개 매체)" 를 붙인다.
+                       대표 선정: 내 종목 언급 > 주요 매체 > 먼저 수집된 것
+```
+
+**왜 통로가 둘인가.** 실측 사례다.
+
+```
+A  "중동 확전 우려 뉴욕증시 하락…유가 100달러 육박·엔화 급등"
+B  "뉴욕증시, 국제 유가 상승에 하락 출발…다우, 0.88%↓"
+```
+
+사람이 보면 같은 사건인데 토큰 자카드는 **0.214**다. 공통 토큰이
+`{뉴욕증시, 유가, 하락}` 3개인데 합집합이 14개라 분모가 커진다. 이걸
+묶으려고 임계값을 0.21까지 내리면 관계없는 기사가 줄줄이 붙는다. 그래서
+'공통 토큰이 충분히 많고 짧은 쪽 제목의 상당 부분이 겹치면' 이라는
+두 번째 통로를 뒀다 (위 사례는 포함도 3/7 = 0.429로 통과).
+
+**오병합 가드.** 유사도를 보기 전에 자른다.
+
+```
+회차 가드  '제22회 전환사채' 와 '제25회 전환사채' 는 다른 공시다.
+           문구가 거의 같아 포함도 0.625로 붙지만 회차가 다르면 안 묶는다.
+종목 가드  태깅된 종목이 겹치지 않으면 같은 사건으로 보지 않는다.
+```
+
+임계값은 `config.NewsDedupConfig` 에 있고, 회귀는 실측 픽스처
+`tests/fixtures/news_brief_20260909.json` (2026-09-09 06:20 브리핑이 실제로
+읽은 187건) 으로 건다. 값을 만지면 `smoke_test.py` 의 `[dedup]` 검사가
+먼저 깨진다 — 압축은 늘리되 다른 사건을 붙이지 않았는지 한 곳에서 본다.
+실측: **187건 -> 152 사건**.
+
+LLM 은 쓰지 않는다. 전부 규칙 기반이다.
+
+중요도 산정 방식은 3층 도입 전후로 바뀌지 않았다. 매체 수가 정확해졌을
+뿐이다 — 표기가 갈려 한 매체를 둘로 세던 것을 고쳤다.
 
 중요도 설계에서 **1순위 신호는 헤드라인의 자극성이 아니라 '몇 개 매체가
 같은 사건을 다뤘는가'**다. 단독 기사는 낮게, 여러 매체가 붙은 사건은 높게
@@ -329,6 +398,34 @@ python run_screen.py --mode flags --no-dart          # 키 없이 FDR+로컬만
 `corpCode.xml`(종목코드 → DART corp_code 매핑)은 `data/dart_corp_codes.json`에
 7일 캐시된다.
 
+### DART 조회 시장 — 코스닥 확장 (2026-09-10 ON)
+
+증자·감사의견 공시 스캔(`list.json`)은 2026-09-09까지 **코스피(corp_cls=Y)만**
+봤다. 유니버스에는 코스닥 1,724종목이 이미 들어 있고 자본잠식(corp_code 기준)도
+코스닥까지 계산됐지만, 증자·감사의견 플래그만 코스닥이 0이었다.
+**2026-09-10 부터 `("Y", "K")` 로 켰다** (`DART_KOSDAQ_ENABLED_ON`).
+
+**켜는 절차 (한 줄):** `config.DART_MARKETS = ("Y", "K")` 로 바꾸고
+`config.DART_KOSDAQ_ENABLED_ON = "YYYY-MM-DD"` 에 켠 날짜를 적어 커밋하면
+다음 nightly(21:30)부터 적용된다. 켠 날짜가 채점 데이터를 나누는 기준일이다 —
+그 전 스냅샷은 코스닥 증자·감사의견 플래그가 빈 채로 채점된 것이다.
+코넥스(N)는 어떤 설정에도 넣지 않는다.
+
+2026-09-09 실측 (60일 소급, 100건/페이지):
+
+```
+corp_cls=Y  10,474건  105페이지   1.2초/호출
+corp_cls=K  11,266건  113페이지   0.9초/호출
+Y(20페이지)+K(170페이지) 실행: 133회 호출 · 176초 · 약 45회/분  (한도 1,000회/분)
+코스닥 플래그  감사의견 0 → 39종목 · 증자/CB 0 → 259종목   (코스피는 불변)
+```
+
+★ 2026-09-09까지 `DART_LIST_MAX_PAGES["Y"]` 는 20 이었다 — 실측 필요량(105)의
+1/5 라 최근 약 11일치만 읽었다. 코스닥 확장 중 발견한 기존 결함이며 코스닥 ON과
+같은 날(2026-09-10) 160 으로 정상화했다. 따라서 **기준일 이전 스냅샷은 코스피
+증자·감사의견 플래그도 11일치 기준**이다. 상한에 닿으면 flags 로그에
+`페이지 상한 도달` 경고가 남는다.
+
 ### 동전주 배제의 근거
 
 2026년 상장폐지 규정이 강화되어 1,000원 미만이 30거래일 이어지면 관리종목
@@ -410,6 +507,7 @@ DELETE FROM prices WHERE ticker='123456';
 10:00~10:25  방향확정    전 트랙 허용       예산 3   ★ 최우선 · 휩쏘 종료 후
 14:00~14:25  오후눌림    매집(V)·시퀀스만   예산 2   실망매물 스위칭 준비
 15:20~15:35  종가확정    전 트랙 허용       예산 2   오버나이트 판단
+                                    합 9 = 일일 상한 (별도 전역 예산 없음)
 ```
 
 **09시와 10시를 나눈 이유가 핵심이다.** 09:00은 반대매매가 동시호가에
@@ -467,7 +565,10 @@ data/export/recos_20260824.csv          추천 10선 이력
 data/export/flags_20260824.csv          배제 플래그 현황
 data/export/positions_20260824.csv      보유 포지션
 data/export/exit_log_20260824.csv       청산 신호 이력
-data/export/credit_manual_20260824.csv  주입된 신용잔고
+data/export/credit_manual_20260824.csv  주입된 신용잔고 (출처 포함)
+data/export/runs_20260824.csv           배치 이력 (모드·성공·실패·소요)
+data/export/news_20260824.csv           뉴스 (중요도·클러스터)
+data/export/news_tickers_20260824.csv   뉴스-종목 태깅
 data/export/tickers_20260824.csv        종목 마스터
 ```
 
@@ -482,6 +583,11 @@ data/export/tickers_20260824.csv        종목 마스터
 
 ## 주의
 
+- pykrx 가 드물게 OHLC 가 0 인 봉을 준다. 2026-08-27 백필 실측 435,263행
+  중 1행(`시가=고가=저가=0, 종가=18,000, 거래량=199,329`). 거래량이 0이
+  아니라 기존 필터를 통과했다. 저가 0 이 파동 저점으로 잡히면 그 종목의
+  피보 레벨·매물대 POC·ATR 이 전부 망가지므로 `Store._price_ok` 가
+  적재 시점에 거른다. 적재 경로 둘 다에 걸려 있다.
 - 신용잔고는 익영업일, 공매도 잔고는 T+2 공시다. `CreditConfig.credit_shift` /
   `short_shift` 로 지연을 반영하며, 백테스트에서 이를 빼면 승률이 실제보다
   높게 나온다.
@@ -502,12 +608,24 @@ data/export/tickers_20260824.csv        종목 마스터
 
 ## 미완성 항목
 
-- 종목별 신용잔고 자동 수집은 **코드는 있고 bld 코드가 미확정**이다.
-  `krx_credit.py` 가 KRX 정보데이터시스템을 호출하지만 '신용거래융자
-  종목별 잔고'의 bld 값을 확인하지 못했다. `--mode credit-probe` 로 후보를
-  탐침한 뒤 `.env` 의 `KRX_CREDIT_BLD` 에 고정해야 동작한다. 확정 전까지는
-  수동 CSV 경로를 쓰고, 넣지 않은 종목은 평균단가 P0 를 매물대 POC 로
-  추정하므로 청산 밴드의 정확도가 떨어진다.
+- 종목별 신용잔고는 **무료 공개 소스로는 자동 수집이 불가능하다.** 데이터가
+  공개되지 않는다(아래 '신용잔고' 절의 실측 근거 참조). 자동 경로는 키움
+  REST(`--mode credit-kiwoom`) 하나이고, **앱키/시크릿이 필요하다.**
+  규격(au10001 / ka10013)은 키움증권 공식 예제 저장소에서 확정했고
+  가짜 서버를 물린 스모크 테스트 28건이 토큰·유량·재시도·응답해석 경로를
+  검증한다. 다만 **실제 앱키로 조회한 적은 아직 없다** — 앱키가 없다.
+  키를 넣기 전까지는 수동 CSV 경로를 쓰고, 넣지 않은 종목은 평균단가 P0 를
+  매물대 POC 로 추정하므로 청산 밴드 정확도가 떨어진다.
+- 키움 REST 는 **실제 앱키로 검증됐다** (2026-08-27, 기준 종목 3개).
+  토큰 발급 → ka10013 조회 → CSV → DB 적재까지 rc=0. `remn` 단위도
+  주(株)로 확정됐다. 남은 미검증 항목은 유량 제한 상한(수치가 공개되지
+  않아 실제로 걸려봐야 안다)과 대량 조회(300종목) 시의 동작이다.
+- 섹터 분산 제한은 **동작한다** (2026-08-27 실측 2,527/2,527종목, 158업종).
+  출처는 `fdr.StockListing("KRX-DESC")` 의 `Industry` 컬럼이다.
+  주의: 같은 목록의 `Sector` 컬럼은 업종이 아니라 코스닥 **소속부**다
+  (우량기업부·벤처기업부·관리종목 등 9종). 그걸 섹터로 쓰면 '우량기업부'
+  안의 반도체와 제약이 서로 경쟁한다. `StockListing("KRX")` 에는 업종
+  컬럼이 아예 없다 — 예전에 이 목록만 조회해서 커버리지가 0% 였다.
 - 감사의견 판정은 공시 **제목** 키워드 스캔이라 취약하다. 의견거절이 제목에
   드러나지 않는 경우가 많다. 다만 그런 종목은 대개 관리종목으로 지정되어
   ①에서 잡힌다. 확실히 하려면 `flags_manual.csv`로 직접 지정하십시오.
@@ -604,11 +722,35 @@ PC 가 절전/최대 절전으로 들어가면 cron 이 돌지 않는다. 전원
 매년 바뀌고 임시 휴장도 있다. 세 단계로 판정한다.
 
 ```
-주말            요일로 확정                    CLOSED_WEEKEND
-알려진 휴장일   DB 캐시(non_trading_days)      CLOSED_HOLIDAY
-시세가 있는 날  거래일 확정                    TRADING
-그 외 평일      미확인                         UNKNOWN
+주말            요일로 확정                                   CLOSED_WEEKEND
+공휴일          holidays 테이블(천문연구원 API) 또는           CLOSED_HOLIDAY
+                config.EXTRA_MARKET_HOLIDAYS → 프로브 생략
+알려진 휴장일   DB 캐시(non_trading_days)                     CLOSED_HOLIDAY
+시세가 있는 날  거래일 확정                                   TRADING
+그 외 평일      미확인                                        UNKNOWN
 ```
+
+### 공휴일 사전 필터 (2026-09-09 추가)
+
+한국천문연구원 특일정보 API(`getRestDeInfo`, `isHoliday == "Y"` 만)로
+1년치 공휴일을 `holidays` 테이블에 넣어 두고, 공휴일이면 기준 종목 프로브를
+부르지 않는다. **거래일을 확정하는 데는 쓰지 않는다** — 임시휴장·조기폐장은
+API 에 없으므로 그 판정은 종전대로 프로브가 한다. 테이블이 비어 있거나 API 가
+죽어도 판정은 막히지 않고 그냥 프로브로 간다.
+
+```bash
+python run_screen.py --mode holidays          # 올해 + 내년, 분기 1회 수동
+python run_screen.py --mode holidays --year 2027
+```
+
+키는 `.env` 의 `DATA_GO_KR_KEY`. nightly 에 넣지 않는다. 공휴일 API 가 못
+잡는 증시 휴장(근로자의 날 5/1, 12/31 폐장)은 `config.EXTRA_MARKET_HOLIDAYS`
+로 보완한다. `getHoliDeInfo`(국경일)는 제헌절이 `isHoliday=N` 으로 섞여
+쓰지 않는다.
+
+평일인데 공휴일 테이블에 없고 기준 종목이 '데이터 없음'이면 로그에
+`소스 장애 의심` 을 남긴다. 판정(휴장 기록)은 종전 그대로지만, 그 줄이
+보이면 `non_trading_days` 를 의심하고 재요청하라는 뜻이다.
 
 `UNKNOWN` 은 차단하지 않는다. 장중에는 아직 시세가 적재되지 않았을 수
 있으므로, 확실히 휴장인 경우만 막아야 한다. 이걸 반대로 하면 매일 아침
@@ -642,7 +784,7 @@ PC 가 절전/최대 절전으로 들어가면 cron 이 돌지 않는다. 전원
 
 **4. 월요일 아침 브리핑이 주말 뉴스를 놓쳤다**
 
-`hours=16` 이면 월요일 08:30 에 일요일 16:30 이후만 본다. 금요일 장 마감
+`hours=16` 이면 월요일 06:20 에 일요일 14:20 이후만 본다. 금요일 장 마감
 이후 뉴스가 통째로 빠진다. 마지막 거래일 마감 이후를 전부 덮도록 자동
 확장한다(상한 120시간).
 
@@ -725,34 +867,257 @@ python run_screen.py --mode backtest --bt-no-controls --bt-no-exits  # 빠른 �
 
 **결과는 실제보다 낙관적입니다.** 리포트 하단에 이 경고가 항상 출력됩니다.
 
-## 신용잔고 자동 수집
+## 신용잔고 — 무료 공개 소스로는 불가능합니다
+
+결론부터 적습니다. **종목별 신용거래융자 잔고는 무료로 공개되지 않습니다.**
+자동 경로는 키움 REST 하나이고 앱키가 필요합니다(다음 절).
+bld 코드를 못 찾은 게 아니라 공개 데이터가 없습니다. 2026-08-24 에 후보
+소스를 전부 직접 두드려 확인했습니다.
+
+```
+KRX 정보데이터시스템   통계 메뉴 464개 전량 덤프 후 검색
+                       '융자' -> "인프라투융자회사 시세" 1건. 무관.
+                       '신용' -> 6건 전부 채권 발행사 신용등급
+                                 (13210 13211 14023 14024)
+                       '잔고' -> 5건 전부 공매도 순보유잔고 (33001~33004)
+                       신용거래융자 잔고 화면 자체가 없음
+
+KRX getJsonData.cmd    알려진 bld(MDCSTAT01501/01701)에도
+                       HTTP 400, 본문 "LOGOUT"
+                       로더 페이지로 JSESSIONID 받아도 동일
+                       익명 조회 경로가 닫혔음
+
+네이버 금융            main.naver / frgn.naver 에서 '신용' 0건 '융자' 0건
+
+FinanceDataReader      StockListing 키는 KRX / KRX-DELISTING /
+                       KRX-ADMINISTRATIVE 뿐. 신용 컬럼 없음
+```
+
+그래서 후보 bld 목록을 **비웠습니다**. 찾을 대상이 없는데 후보를 돌리면
+영원히 실패하고, 더 나쁘게는 빈 응답을 '신용잔고 0'으로 오해합니다.
+스모크 테스트가 `CANDIDATE_BLDS == ()` 를 확인해 추측이 다시 들어오는 것을
+막습니다.
+
+### 실제로 쓸 수 있는 경로
 
 ```bash
-python run_screen.py --mode credit-probe    # bld 코드 탐침 (최초 1회)
-python run_screen.py --mode credit          # KRX 자동 + 수동 CSV 덮어쓰기
-python run_screen.py --mode credit --no-krx # 수동 CSV 만
+hermes\run.cmd --mode credit-probe    # 위 판정을 실행 시점에 재검증
+hermes\run.cmd --mode credit-kiwoom   # 키움 REST 실측 (앱키 필요)
+hermes\run.cmd --mode credit          # CSV 체인 적재 (자동 -> 수동)
 ```
 
-KRX 정보데이터시스템의 통계 조회는 `getJsonData.cmd` 엔드포인트에 `bld`
-파라미터로 접근합니다. 다만 **'신용거래융자 종목별 잔고'의 정확한 bld 코드는
-확인되지 않았습니다.** 추측을 코드에 박으면 조용히 빈 결과가 나오고 그걸
-'신용잔고 0'으로 오해하게 됩니다. 그래서 탐침 도구를 함께 넣었습니다.
-
-`credit-probe` 가 후보를 시험하고 어느 코드가 어떤 컬럼을 주는지 보고합니다.
-전부 실패하면 직접 찾는 절차를 안내합니다.
+`--mode credit` 은 세 출처를 **순서대로** 병합합니다. 뒤가 앞을 덮으므로
+사람이 넣은 값이 항상 이깁니다.
 
 ```
-1. https://data.krx.co.kr 접속
-2. [통계] > [주식] 에서 신용융자 잔고 화면을 연다
-3. F12 > Network 탭 > 조회 버튼 클릭
-4. getJsonData.cmd 요청의 Payload 에서 bld 값 복사
-5. --mode credit-probe --bld <복사한값> 으로 재확인
-6. .env 에 KRX_CREDIT_BLD= 로 고정
+KRX 자동  ->  data/credit_kiwoom.csv (source=kiwoom)
+          ->  data/credit_manual.csv (source=manual)
 ```
 
-응답 컬럼명도 하드코딩하지 않고 패턴으로 탐색합니다. KRX 는 컬럼명을 자주
-바꿉니다. 확정 전까지는 `data/credit_manual.csv` 수동 주입이 그대로 유효하고,
-수동 값이 항상 자동 수집을 덮어씁니다.
+어떤 출처가 몇 종목을 채웠는지는 `--json` 의 `by_source` 로 나옵니다.
+예전에는 `credit_manual.csv` 하나만 읽어서, 키움이 만든
+`credit_kiwoom.csv` 가 아무도 읽지 않는 채로 남아 있었습니다.
+
+`credit-probe` 는 엔드포인트 응답과 KRX 메뉴를 매번 다시 확인합니다.
+결론을 문서에만 적어두면 KRX 가 정책을 바꿨을 때 아무도 모릅니다.
+메뉴에 신용거래융자 화면이 생기면 `credit_hits` 에 잡히고, 그때
+`--bld` 로 확인한 뒤 `.env` 의 `KRX_CREDIT_BLD` 에 고정하면 코드 수정 없이
+살아납니다.
+
+`KRX_CREDIT_BLD` 를 지정하지 않으면 **네트워크 요청조차 하지 않습니다.**
+수동 값은 항상 자동 수집을 덮어씁니다.
+
+## 키움 REST — 신용잔고 실측 자동화
+
+종목별 신용잔고를 실제로 주는 유일한 자동 경로다. **REST 를 쓴다.**
+
+```
+권장   REST   --mode credit-kiwoom     앱키만 있으면 무인 실행
+대체   OCX    kiwoom_bridge.py         32비트 + 로그인 창. 사람이 실행
+```
+
+### 왜 REST 로 옮겼는가
+
+OCX(OpenAPI+) 는 **32비트 COM** 이다. 본체는 64비트 파이썬이고, 64비트
+프로세스는 32비트 OCX 를 인프로세스로 로드할 수 없다. 레지스트리 실측:
+`InprocServer32` 가 `WOW6432Node` 아래에만 있다(32비트 전용 등록).
+그래서 별도 venv · pywin32 · PyQt5 · **로그인 창**이 필요하다. 사람이
+앉아 있어야 돌아간다.
+
+REST 는 앱키/시크릿만 있으면 그 전부가 필요 없다. 게다가 응답 필드명이
+공개돼 있어 `--discover` 탐침도 필요 없다.
+
+```bash
+# 1) https://openapi.kiwoom.com 에서 앱 등록 -> 앱키 / 시크릿
+# 2) .env 에 KIWOOM_APP_KEY / KIWOOM_APP_SECRET 입력
+hermes\run.cmd --mode kiwoom-plan            # 준비 상태 + 대상 계획
+hermes\run.cmd --mode credit-kiwoom --json   # 실측 수집 + DB 적재
+```
+
+### 규격 (공식 예제 저장소에서 확정)
+
+```
+POST /oauth2/token                      au10001
+     {grant_type:"client_credentials", appkey, secretkey}
+  -> {token, token_type, expires_dt, return_code, return_msg}
+     expires_dt = YYYYMMDDHHMMSS, KST     <- naive 로 두면 9시간 어긋난다
+
+POST /api/dostk/stkinfo                 header api-id: ka10013
+     {stk_cd, dt:YYYYMMDD, qry_tp}         qry_tp 1:융자 2:대주
+  -> {crd_trde_trend:[{dt, cur_prc, ..., remn, remn_rt, ...}], ...}
+     remn    잔고        <- 단위가 문서에 없다. 런타임에 역산해 판정한다
+     remn_rt 잔고율(%)   <- 단위 모호성이 없다. 이게 1순위다
+```
+
+**`remn` 은 주(株) 단위다** (2026-08-27 실측). 문서에 없으므로 코드는 계속
+런타임에 검증한다 — `remn_rt × 상장주식수 ÷ remn` 배율을 여러 종목에서 재고
+중위값이 후보(1 / 1000)에서 벗어나면 주식수를 비운다. 실측 확인값:
+
+```
+기준일 2026-08-26 · 중위배율 0.984 -> 주 단위
+  005930  25,540,695주  0.43%     (상장 59.7억주 -> 0.428%)
+  000660   3,227,524주  0.43%     (상장 7.28억주 -> 0.443%)
+  005380   1,631,887주  0.79%     (상장 2.09억주 -> 0.779%)
+```
+
+기준일이 실행일(08-27)보다 하루 이르다. 신용잔고는 익영업일 공시라
+정상이다(`CreditConfig.credit_shift = 1`).
+
+토큰은 `data/kiwoom_token.json` 에 캐시한다. 유효기간은 발급 후 24시간
+(실측: 발급 17:21 → 만료 익일 17:21 KST). **앱키와 시크릿은 저장하지
+않는다** — sha256 지문 앞 16자만 남겨 '키가 바뀌었는지'만 판정한다.
+앱키가 바뀌거나 실전↔모의를 전환하면 캐시를 버린다.
+
+빈 문자열과 `0` 을 구분한다. 키움은 값이 없는 날을 `""` 로 준다. 그걸
+0 으로 읽으면 신용 과열 종목이 깨끗한 종목으로 보인다.
+
+### 호출 제한 — 수치가 공개되지 않았다
+
+REST 가이드에 유량 제한 수치가 없다. OCX 문서에는 있다. 그 차이를
+숨기지 않는다.
+
+```
+OCX (문서에 있음)    초당 5 / 분당 100 / 시간당 1,000
+REST (공개 안 됨)    보수적 기본 초당 3 / 분당 60 / 시간당 900
+```
+
+REST 는 초과를 `return_code` 1700/1701/1702 로 알려준다. 그 코드나
+HTTP 429 를 받으면 **속도를 절반으로 줄이고** 백오프한다. 실제 제한을
+알게 되면 `.env` 의 `KIWOOM_REST_PER_SECOND` / `_PER_MINUTE` /
+`_PER_HOUR` 만 고치면 된다. 코드에 박힌 '공식값'은 없다.
+
+**시간당 한도가 지배적이다.** 시간당 900 기준 실측 계산:
+
+```
+  300종목  ->    3.1분     <- 이걸 쓴다
+  900종목  ->    9.4분
+1,000종목  ->   61.0분     <- 시간 절벽
+2,874종목  ->  3.02시간    <- 전종목. 매일 불가
+```
+
+900건을 넘는 순간 첫 요청이 창을 벗어날 때까지 최대 1시간을 기다린다.
+
+그래서 전수조사를 하지 않는다. 대상은 이 값이 판정을 바꾸는 종목만
+고른다.
+
+```
+1순위  보유 포지션      청산 계층 6(신용 재급증)이 여기서만 작동한다
+2순위  최근 추천 종목    진입 전에 실측이 있어야 한다
+3순위  밴드 근처 종목    band_pos 낮은 순. 다음 후보군
+```
+
+나머지는 지금처럼 매물대 POC 프록시로 남는다. 그게 정직하다.
+
+### 대상 목록을 직접 주기
+
+```bash
+hermes\run.cmd --mode kiwoom-plan --write-targets data/kiwoom_targets.txt
+hermes\run.cmd --mode credit-kiwoom --targets-file data/kiwoom_targets.txt
+```
+
+### 검증 상태
+
+가짜 서버를 물린 스모크 테스트 28건이 토큰 캐시·만료·지문 불일치, 유량
+초과 감속, HTTP 429, 토큰 거부 재발급, 자격증명 오류 즉시 포기, 없는
+종목 격리, 전송 오류 재시도, 빈 문자열과 0 구분, 잔고 단위 역산, CSV
+왕복, 주문 경로 부재를 확인한다.
+
+**실제 앱키로 조회한 적은 없다.** 앱키가 없다. 그래서 `remn` 단위도
+아직 실측으로 확정되지 않았다.
+
+### 주의
+
+- **실서버로 쓰라.** 모의투자만 3개월 접속하면 서비스가 자동 해지된다.
+  모의 도메인은 KRX 만 지원한다.
+- 조회 TR 만 쓴다. 주문 엔드포인트와 주문 TR 은 코드에 등장하지 않으며,
+  스모크 테스트가 그 문자열의 부재를 회귀 가드로 검사한다. 이 시스템은
+  주문을 내지 않는다.
+- 키움 규정상 OpenAPI 사용 계좌는 한국거래소에 **알고리즘 계좌로 등록될
+  수 있다.** 조회만 해도 해당된다.
+- 토큰은 비밀이다. 로그에 남기지 않으며 `data/kiwoom_token.json` 은
+  `.gitignore` 대상 디렉터리에 있다.
+
+### OCX 경로 (대체 · 사람이 실행)
+
+TR 규격은 `C:\OpenAPI` 의 키움 정의 파일에서 직접 확인했다(추측 아님).
+
+```
+OPT10013  신용매매동향요청   화면 0141
+          입력: 종목코드 / 일자(YYYYMMDD) / 조회구분(1:융자, 2:대주)
+OPT10033  신용비율상위요청   상위 랭킹. 요청 1회로 과열 종목
+OPT10014  공매도추이요청     화면 0142. 죽은 pykrx 공매도 경로 대체 가능
+OPW20016  신용융자 가능종목요청
+```
+
+출처: `koatrinputlegend.ini`(입력 필드), `koascreentrmap.ini`(화면↔TR).
+
+```bash
+py -3.12-32 -m venv venv32                 # 32비트 파이썬 필요
+venv32\Scripts\pip install pywin32 PyQt5
+venv32\Scripts\python kiwoom_bridge.py --check
+venv32\Scripts\python kiwoom_bridge.py --discover
+venv32\Scripts\python kiwoom_bridge.py --plan-file data/kiwoom_targets.txt
+hermes\run.cmd --mode credit               # 결과 CSV 적재
+```
+
+`--discover` 가 필요한 이유: OPT10013 의 **출력** 필드명이
+`C:\OpenAPI\data\opt10013.enc` 로 암호화돼 있어 오프라인으로 읽을 수
+없다. 후보를 실제 응답에 대보고 맞는 것만 `data/kiwoom_fields.json` 에
+고정한다. REST 에는 이 문제가 없다.
+
+브릿지는 **로그인 창이 뜨는 대화형 프로그램**이다. 자동화 에이전트가
+실행하면 안 된다(`AGENTS.md` 11장).
+
+## 전종목 시세 소스 — KRX 엔드포인트 중단 대응
+
+2026-08 에 KRX 전종목 계열 엔드포인트가 로그인 뒤로 들어갔습니다.
+pykrx 가 이 엔드포인트를 쓰기 때문에 전종목 함수들이 빈 결과를 줍니다.
+
+```
+동작함   stock.get_market_ohlcv(start, end, ticker)      종목 1개 시계열
+동작함   fdr.StockListing('KRX')                         전종목 스냅샷
+동작함   fdr.StockListing('KRX-ADMINISTRATIVE')          관리종목
+중단     stock.get_market_ohlcv_by_ticker(date, ...)     일자별 전종목
+중단     stock.get_market_ticker_list(date, ...)         종목 목록
+중단     stock.get_market_cap_by_ticker(date, ...)       시총
+중단     stock.get_market_trading_value_by_investor(...) 투자자별
+중단     stock.get_shorting_balance_by_ticker(...)       공매도 잔고
+```
+
+전종목 경로를 FinanceDataReader 스냅샷으로 바꿨습니다. 요청 1회로 약
+2,900종목의 시가·고가·저가·종가·거래량·거래대금·시가총액·상장주식수가
+들어옵니다.
+
+**주의: 스냅샷에는 날짜 파라미터가 없습니다.** 항상 '최신'을 주므로 장중에
+부르면 종가가 아닌 현재가가 섞입니다. 그 값을 그날의 종가로 적재하면 DB 가
+조용히 오염됩니다. 그래서 기준 종목(삼성전자·SK하이닉스·현대차)의 종가를
+종목별 엔드포인트로 받아 대조하고, **일치한 경우에만** 적재합니다.
+확인이 안 되면 종목별 폴백으로 내려갑니다(2,800종목 × 0.3초 ≈ 15분).
+
+`--mode update` 가 0건일 때 휴장일로 기록하던 동작도 고쳤습니다. 소스
+장애로도 0건이 나오는데, 그 상태로 기록하면 실제 거래일이 영구히 휴장일로
+박혀 그 날짜를 두 번 다시 받지 못합니다. 지금은 기준 종목을 따로 조회해
+'거래일인지'를 독립 판정한 뒤에만 기록합니다.
 
 ## 라이선스
 

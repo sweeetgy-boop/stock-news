@@ -21,12 +21,40 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+from .data import (REF_PROBE_RETRIES, REF_TICKERS, close_on,
+                   close_on_status, market_snapshot, verify_snapshot_date)
+from .holidays import holiday_name
+from .trading_day import is_definitely_closed, market_status_reason
 from .trading_day import now_kst as _now_kst
 
 log = logging.getLogger(__name__)
 
 __all__ = ["EXCLUDE_KEYWORDS", "is_tradable_name", "refresh_master",
-           "fetch_day", "backfill_one", "liquidity_filter"]
+           "fill_sectors", "sector_source", "SECTOR_LISTINGS",
+           "fetch_day", "backfill_one", "liquidity_filter",
+           "MARKETS_WANTED", "probe_refs", "load_floor",
+           "DAY_MIN_EXPECTED", "DAY_SHRINK_TOLERANCE", "JUDGE_AFTER_HOUR"]
+
+# 하루치 적재량 하한. refresh_master 의 (min_expected, shrink_tolerance) 와
+# 같은 논리다 — 직전 수준의 절반, 또는 절대 하한 중 큰 쪽.
+DAY_MIN_EXPECTED = 500
+DAY_SHRINK_TOLERANCE = 0.5
+# 하한을 적용하려면 비교 대상이 있어야 한다. 표본이 이보다 적으면
+# 판정을 보류한다(백필 초기에 모든 날을 '소스 장애'로 만들지 않기 위함).
+DAY_FLOOR_MIN_SAMPLE = 3
+
+# '오늘'을 휴장일로 판정해도 되는 가장 이른 시각(KST). 장 마감은 15:30 이고
+# 시세 반영에 여유를 둔다.
+#
+# 이게 없으면 자정~오전에 도는 catch-up 이 **오늘을 휴장일로 박는다.**
+# 그 시각에는 기준 종목이 정상적으로 '데이터 없음'을 응답하기 때문에
+# 네트워크가 멀쩡해도 CLOSED 판정이 나온다. 아직 열리지도 않은 장을
+# 두고 휴장이라고 단정할 수는 없다.
+JUDGE_AFTER_HOUR = 16
+
+# 스냅샷의 Market 값. KONEX 는 유동성이 없어 제외한다.
+MARKETS_WANTED = {"KOSPI": "KOSPI", "KOSDAQ": "KOSDAQ",
+                  "KOSDAQ GLOBAL": "KOSDAQ"}
 
 # 종목명 기반 배제 키워드
 EXCLUDE_KEYWORDS = (
@@ -57,37 +85,93 @@ def refresh_master(store, on_date: str | None = None,
 
     상장폐지된 종목은 active=0 으로 내려 스캔 대상에서 자동 제외된다.
 
+    ★ 데이터 소스
+    -------------
+    KRX 전종목 엔드포인트가 로그인 뒤로 들어가면서 pykrx 의
+    `get_market_ticker_list` / `get_market_cap_by_ticker` 가 빈 결과를
+    준다(2026-08 실측). 그래서 FinanceDataReader 스냅샷을 1순위로 쓴다.
+    스냅샷 한 번에 종목명·시장·시가총액·상장주식수가 다 들어온다.
+
     ★ 휴장일 안전장치
     ----------------
-    공휴일에는 종목 목록 조회가 빈 결과를 돌려준다. 그 상태로
-    mark_inactive(빈집합) 을 호출하면 **전 종목이 비활성화되어** 이후
-    모든 배치가 멈춘다. 스케줄에 매일 master 가 있으므로 공휴일마다
-    터진다.
+    목록 조회가 비면 mark_inactive(빈집합) 이 **전 종목을 비활성화**해
+    이후 모든 배치가 멈춘다. 그래서 목록이 비정상적으로 적으면 마스터를
+    갱신하지 않고 그대로 둔다.
 
-    그래서 목록이 비정상적으로 적으면 마스터를 갱신하지 않고 그대로
-    둔다. 조회 실패를 '상장폐지'로 오해하는 것보다 갱신을 미루는 쪽이
-    언제나 안전하다.
+    **조회 실패를 휴장일로 기록하지 않는다.** 예전에는 목록이 적으면
+    `mark_non_trading_day` 를 불렀는데, 소스 장애로 빈 결과가 오면 실제
+    거래일이 영구히 휴장일로 박혀서 그 날짜를 두 번 다시 받지 못했다.
+    휴장 판정은 주말/기지정 공휴일 같은 **적극적 근거**가 있을 때만 한다.
     """
-    from pykrx import stock
-
-    # 조회 기준일. 휴장일이면 pykrx 가 빈 결과를 주는 게 정상이다.
     ds = on_date or _now_kst().strftime("%Y%m%d")
+    iso = f"{ds[:4]}-{ds[4:6]}-{ds[6:8]}"
     rows: list[dict] = []
     alive: set[str] = set()
 
+    _, meta = market_snapshot()
+
+    if not meta.empty and "종목명" in meta.columns:
+        for code, r in meta.iterrows():
+            code = str(code).zfill(6)
+            if not include_preferred and not _is_common_share(code):
+                continue
+            mk = MARKETS_WANTED.get(str(r.get("시장", "")).strip().upper())
+            if mk is None:
+                continue
+            name = str(r.get("종목명") or code).strip()
+            if not is_tradable_name(name):
+                continue
+            alive.add(code)
+            mc = r.get("시가총액")
+            shares = r.get("상장주식수")
+            rows.append({
+                "ticker": code, "name": name, "market": mk, "sector": None,
+                "market_cap": float(mc) if pd.notna(mc) else None,
+                "shares": float(shares) if pd.notna(shares) else None,
+            })
+    else:
+        rows, alive = _refresh_master_pykrx(ds, include_preferred)
+
+    # ── 휴장일/조회실패 방어 ──
+    prev = len(store.active_tickers())
+    floor = max(min_expected, int(prev * shrink_tolerance))
+    if len(alive) < floor:
+        if is_definitely_closed(store, iso):
+            log.info("%s 는 휴장일입니다. 마스터를 갱신하지 않습니다.", iso)
+        else:
+            log.error(
+                "종목 목록이 비정상적으로 적습니다 (%d개, 하한 %d). "
+                "소스 장애로 판단해 마스터를 갱신하지 않고 기존 %d종목을 "
+                "유지합니다. 휴장일로 기록하지 않으므로 다음 실행에서 "
+                "다시 시도합니다.", len(alive), floor, prev)
+        return 0
+
+    n = store.upsert_tickers(rows)
+    dead = store.mark_inactive(alive)
+    log.info("마스터 갱신: 활성 %d종목, 비활성 처리 %d종목", n, dead)
+    return n
+
+
+def _refresh_master_pykrx(ds: str, include_preferred: bool
+                          ) -> tuple[list[dict], set[str]]:
+    """구 경로 폴백. KRX 가 전종목 조회를 다시 열면 이쪽이 살아난다."""
+    from pykrx import stock
+
+    log.warning("스냅샷 실패 → pykrx 전종목 경로로 폴백 "
+                "(현재 KRX 가 막아둔 상태일 수 있음)")
+    rows: list[dict] = []
+    alive: set[str] = set()
     for market in ("KOSPI", "KOSDAQ"):
         try:
             cap = stock.get_market_cap_by_ticker(ds, market=market)
         except Exception as exc:  # noqa: BLE001
             log.warning("시총 조회 실패 %s: %s", market, exc)
             cap = pd.DataFrame()
-
         try:
             codes = stock.get_market_ticker_list(ds, market=market)
         except Exception as exc:  # noqa: BLE001
             log.error("종목목록 조회 실패 %s: %s", market, exc)
             continue
-
         for code in codes:
             code = str(code).zfill(6)
             if not include_preferred and not _is_common_share(code):
@@ -105,63 +189,228 @@ def refresh_master(store, on_date: str | None = None,
                 shares = float(cap.loc[code].get("상장주식수", float("nan")))
             rows.append({"ticker": code, "name": name, "market": market,
                          "sector": None, "market_cap": mc, "shares": shares})
+    return rows, alive
 
-    # ── 휴장일/조회실패 방어 ──
-    prev = len(store.active_tickers())
-    floor = max(min_expected, int(prev * shrink_tolerance))
-    if len(alive) < floor:
-        store.mark_non_trading_day(
-            f"{ds[:4]}-{ds[4:6]}-{ds[6:8]}",
-            f"ticker list {len(alive)} < {floor}")
-        log.error("종목 목록이 비정상적으로 적습니다 (%d개, 하한 %d). "
-                  "휴장일 또는 조회 실패로 판단해 마스터를 갱신하지 않습니다. "
-                  "기존 %d종목을 그대로 유지합니다.",
-                  len(alive), floor, prev)
+
+def probe_refs(trade_date: str, refs: tuple[str, ...] = REF_TICKERS,
+               retries: int = REF_PROBE_RETRIES) -> tuple[str, str]:
+    """기준 종목으로 그 날이 거래일인지 독립 판정한다.
+
+    반환 (verdict, detail)
+
+        "TRADING"  하나라도 종가가 있다          -> 거래일 확정
+        "CLOSED"   전부 '데이터 없음'으로 응답   -> 휴장일 확정
+        "OUTAGE"   하나라도 조회 자체가 실패     -> 아무것도 확정 못 함
+
+    ★ OUTAGE 를 CLOSED 로 접으면 안 된다
+    ----------------------------------
+    2026-09-08(화) 실측. 21:30 회차가 PC 종료로 밀려 부팅 직후 23:58 에
+    catch-up 으로 돌았는데, DNS 가 아직 올라오지 않아 기준 종목 3개가
+    전부 예외로 죽었다. 예전 코드는 그것을 '데이터 없음'과 같이 취급해
+    정상 거래일을 `non_trading_days` 에 박았고, 그 테이블은 자기학습
+    캐시라 이후 update 가 그 날짜를 두 번 다시 요청하지 않았다.
+    실패는 답이 아니다. 답이 아닌 것으로 하루를 버리지 않는다.
+
+    빈 응답은 재시도하지 않는다. 같은 답이 온다. 예외만 재시도한다
+    (`close_on_status` 가 처리).
+    """
+    statuses = {t: close_on_status(t, trade_date, retries=retries)[0]
+                for t in refs}
+    detail = " ".join(f"{k}={v}" for k, v in statuses.items())
+    seen = set(statuses.values())
+    if "DATA" in seen:
+        return "TRADING", detail
+    if "ERROR" in seen:
+        return "OUTAGE", detail
+    return "CLOSED", detail
+
+
+def load_floor(store, since: str | None = None) -> int:
+    """하루치 적재량 하한. 표본이 모자라면 0(=검사 안 함).
+
+    `refresh_master` 가 종목 목록에 거는 가드와 같은 논리를 시세 적재에
+    건다. 소스가 반쯤 죽어서 몇십 종목만 넘어오는 날이 '적재 완료'로
+    굳으면, flags 가 그 날을 거래일로 믿고 나머지 전 종목을 거래정지로
+    오탐한다(2026-09 실측: 스냅샷 883행 -> 37행).
+    """
+    counts = store.date_counts(since=since)
+    if len(counts) < DAY_FLOOR_MIN_SAMPLE:
         return 0
+    ordered = sorted(counts.values())
+    median = ordered[len(ordered) // 2]
+    if median <= 0:
+        return 0
+    return max(DAY_MIN_EXPECTED, int(median * DAY_SHRINK_TOLERANCE))
 
-    n = store.upsert_tickers(rows)
-    dead = store.mark_inactive(alive)
-    log.info("마스터 갱신: 활성 %d종목, 비활성 처리 %d종목", n, dead)
-    return n
 
-
-def fetch_day(store, trade_date: str) -> int:
+def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
+              throttle: float = 0.3,
+              ref_retries: int = REF_PROBE_RETRIES,
+              report: dict | None = None) -> int:
     """'특정 일자 전종목' 시세 1판을 받아 적재. 일일 증분 경로.
 
     trade_date : 'YYYYMMDD'
+
+    ★ 0건의 두 가지 의미를 구분한다
+    ------------------------------
+    예전 구현은 0건이면 무조건 휴장일로 기록했다. 그런데 KRX 전종목
+    엔드포인트가 막히면서(2026-08) 실제 거래일에도 0건이 나온다. 그
+    상태로 휴장일에 박아버리면 **그 날짜를 두 번 다시 받지 못한다.**
+    스케줄이 매일 도니까 영업일이 하루씩 영구 소실된다.
+
+    그래서 이렇게 판정한다.
+
+        주말/기지정 공휴일        -> 조회하지 않고 생략 (근거 있음)
+        기준 종목이 '없다'고 응답 -> 휴장일로 기록 (근거 있음)
+        기준 종목 조회가 실패     -> 소스 장애. 기록하지 않는다
+        기준 종목은 데이터 있음   -> 거래일. 종목별로 받는다
+
+    기준 종목(삼성전자 등)은 종목별 엔드포인트로 조회한다. 전종목이
+    막혀도 이쪽은 동작하므로 '거래일인지'를 독립적으로 판정할 수 있다.
+    판정은 `probe_refs()` 에 있다 — '데이터 없음'과 '물어보지 못했음'을
+    가르는 것이 이 함수의 전부다.
+
+    report : 호출부에 판정 근거를 돌려줄 dict. 실행에는 영향이 없다.
+             {"verdict","detail","rows","floor","path"} 가 채워진다.
     """
-    from pykrx import stock
-
-    total = 0
-    for market in ("KOSPI", "KOSDAQ"):
-        df = None
-        for attempt in range(3):
-            try:
-                # pykrx 버전에 따라 '일자별 전종목' 진입점이 다르다.
-                if hasattr(stock, "get_market_ohlcv_by_ticker"):
-                    df = stock.get_market_ohlcv_by_ticker(trade_date, market=market)
-                else:
-                    df = stock.get_market_ohlcv(trade_date, market=market)
-                break
-            except Exception as exc:  # noqa: BLE001
-                log.warning("일자 시세 조회 실패 %s %s (%d/3): %s",
-                            trade_date, market, attempt + 1, exc)
-                time.sleep(2 ** attempt + random.random())
-        if df is None or df.empty:
-            continue
-        ds = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-        total += store.upsert_cross_section(ds, df)
-        time.sleep(0.5)
-
+    rep = report if report is not None else {}
+    rep.update({"verdict": None, "detail": "", "rows": 0,
+                "floor": 0, "path": None})
     iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-    if total == 0:
-        # 휴장일로 기록한다. 이게 없으면 catchup 기간 내내 같은 공휴일을
-        # 매번 다시 요청한다(성공하지만 0건이므로 have 에 안 들어간다).
-        store.mark_non_trading_day(iso, "cross-section returned 0 rows")
-        log.info("%s 적재 0건 → 휴장일로 기록 (이후 재요청하지 않음)", iso)
+
+    # ── 1) 근거 있는 휴장일이면 네트워크를 쓰지 않는다 ──
+    #    주말 · 공휴일(천문연구원 API / 증시 전용 보완) · non_trading_days.
+    #    공휴일 사전 필터가 여기서 프로브를 건너뛰게 한다.
+    if is_definitely_closed(store, iso):
+        _, why = market_status_reason(store, iso)
+        log.info("%s 휴장일 (%s) → 시세 조회·프로브 생략", iso, why)
+        store.mark_non_trading_day(iso, why)
+        rep.update({"verdict": "CLOSED", "path": "known", "detail": why})
+        return 0
+
+    # ── 2) 전종목 스냅샷 (요청 1회). 날짜를 반드시 대조한다 ──
+    floor = load_floor(store)
+    rep["floor"] = floor
+    prices, _ = market_snapshot()
+    ok, why = verify_snapshot_date(prices, trade_date)
+    if ok:
+        total = store.upsert_cross_section(iso, prices)
+        log.info("%s 시세 적재 %d건 (스냅샷, %s)", iso, total, why)
+        if floor and 0 < total < floor:
+            # 소스가 반쯤 살아 있는 상태다. 이 날짜를 완료로 굳히지 않고
+            # 종목별 경로로 넘어가 채운다. 부분 적재로 남으면
+            # `store.partial_dates()` 가 다음 실행에서 재요청한다.
+            log.error("%s 스냅샷 적재 %d건 (하한 %d) — 소스 장애로 판단해 "
+                      "종목별 경로로 보완합니다.", iso, total, floor)
+        elif total:
+            rep.update({"verdict": "TRADING", "path": "snapshot",
+                        "rows": total, "detail": why})
+            return total
     else:
-        log.info("%s 시세 적재 %d건", iso, total)
+        log.info("%s 스냅샷 사용 불가: %s", iso, why)
+
+    # ── 3) 그 날이 거래일인지 독립 판정 ──
+    verdict, detail = probe_refs(trade_date, retries=ref_retries)
+    rep.update({"verdict": verdict, "detail": detail})
+    is_weekday = datetime.strptime(trade_date, "%Y%m%d").weekday() < 5
+
+    if verdict == "OUTAGE":
+        # 물어보지 못했다. 기록하지 않는다 — 다음 실행에서 다시 시도한다.
+        log.error("%s 기준 종목 조회가 재시도 %d회까지 실패했습니다 (%s). "
+                  "소스/네트워크 장애로 판단해 휴장일로 기록하지 않습니다. "
+                  "다음 실행에서 다시 요청합니다.",
+                  iso, ref_retries + 1, detail)
+        rep["path"] = "outage"
+        return 0
+
+    if verdict == "CLOSED":
+        now = _now_kst()
+        if iso == now.strftime("%Y-%m-%d") and now.hour < JUDGE_AFTER_HOUR:
+            log.warning("%s 는 아직 장 마감 전입니다 (%02d:%02d, 판정 기준 "
+                        "%02d:00). 휴장 판정을 보류합니다.",
+                        iso, now.hour, now.minute, JUDGE_AFTER_HOUR)
+            rep.update({"verdict": "PENDING", "path": "too_early"})
+            return 0
+        if not is_weekday:
+            # 여기까지 올 수 없다(1단계에서 걸러진다). 방어적으로 남긴다.
+            log.warning("%s 는 주말입니다 — 1단계에서 걸러졌어야 합니다", iso)
+        if is_weekday and not holiday_name(store, iso):
+            # 공휴일 테이블에 없는 평일인데 기준 종목이 '데이터 없음'이다.
+            # 임시휴장일 수도 있지만 소스 장애일 가능성이 크다. 판정(CLOSED
+            # 기록)은 종전 그대로 두고 — 프로브 로직을 약화하지 않는다 —
+            # 근거를 남겨 사람이 non_trading_days 를 의심할 수 있게 한다.
+            log.warning("%s 공휴일 아님 + 기준 종목 데이터 없음 = 소스 장애 의심. "
+                        "임시휴장이 아니라면 non_trading_days 에서 지우고 "
+                        "재요청하십시오 (%s)", iso, detail)
+            rep["suspect_outage"] = True
+        store.mark_non_trading_day(
+            iso, f"reference tickers report no data ({detail}, "
+                 f"retries={ref_retries + 1})")
+        log.info("%s 기준 종목 %s 전부 '데이터 없음' 응답 → 휴장일로 기록 "
+                 "(%s)", iso, "/".join(REF_TICKERS), detail)
+        rep["path"] = "closed"
+        return 0
+
+    # ── 4) 거래일이다. 종목별로 받는다 (느리지만 정확) ──
+    codes = list(store.active_tickers())
+    if not codes:
+        log.error("%s 활성 종목이 없습니다. 먼저 --mode master 를 "
+                  "실행하십시오.", iso)
+        return 0
+
+    log.warning("%s 전종목 경로가 막혀 종목별 폴백으로 진행합니다 "
+                "(%d종목 x %.2fs ≈ %.0f분)",
+                iso, min(len(codes), per_ticker_limit), throttle,
+                min(len(codes), per_ticker_limit) * throttle / 60)
+
+    total = failed = 0
+    for i, code in enumerate(codes[:per_ticker_limit]):
+        c = close_on(code, trade_date)
+        if c is None:
+            failed += 1
+        else:
+            total += _upsert_one_day(store, code, trade_date, iso)
+        time.sleep(throttle + random.random() * 0.1)
+        if (i + 1) % 250 == 0:
+            log.info("  ... %d/%d 적재 %d 실패 %d",
+                     i + 1, min(len(codes), per_ticker_limit), total, failed)
+
+    rep.update({"rows": total, "path": "per_ticker"})
+    if total == 0:
+        # 기준 종목은 데이터가 있는데 전 종목이 0건이다. 휴장일이 아니라
+        # 소스 장애다. 기록하지 않는다.
+        log.error("%s 기준 종목은 데이터가 있으나 적재 0건입니다. "
+                  "소스 장애로 판단하고 휴장일로 기록하지 않습니다.", iso)
+        rep["verdict"] = "OUTAGE"
+    elif floor and total < floor:
+        log.error("%s 적재 %d건 (하한 %d) — 소스 장애로 판단합니다. "
+                  "부분 적재로 남겨 다음 실행에서 재요청합니다. (실패 %d)",
+                  iso, total, floor, failed)
+        rep["verdict"] = "OUTAGE"
+    else:
+        log.info("%s 시세 적재 %d건 (종목별 폴백, 실패 %d)",
+                 iso, total, failed)
     return total
+
+
+def _upsert_one_day(store, ticker: str, trade_date: str, iso: str) -> int:
+    """종목 1개의 특정 거래일 1행을 적재."""
+    from pykrx import stock
+    try:
+        df = stock.get_market_ohlcv(trade_date, trade_date, ticker)
+    except Exception:  # noqa: BLE001
+        return 0
+    if df is None or df.empty:
+        return 0
+    need = ("시가", "고가", "저가", "종가", "거래량")
+    if any(c not in df.columns for c in need):
+        return 0
+    try:
+        if float(df["거래량"].iloc[-1]) <= 0:
+            return 0
+    except (IndexError, ValueError, TypeError):
+        return 0
+    return store.upsert_prices(ticker, df.tail(1))
 
 
 def backfill_one(store, ticker: str, days: int = 420,
@@ -173,7 +422,9 @@ def backfill_one(store, ticker: str, days: int = 420,
     """
     from pykrx import stock
 
-    end = datetime.now()
+    # KST 기준. UTC 호스트에서 datetime.now() 를 쓰면 조회 종료일이 하루
+    # 뒤처져 최신 봉이 조용히 빠진다.
+    end = _now_kst()
     start = end - timedelta(days=int(days * 1.7))
     for attempt in range(3):
         try:
@@ -220,24 +471,87 @@ def liquidity_filter(store, tickers: dict, min_amt_20d: float = 5e8,
     return keep
 
 
+# 업종 컬럼이 있는 FDR 상장목록. 순서가 우선순위다.
+#
+# 2026-08 실측: `StockListing("KRX")` 에는 업종 컬럼이 **없다**.
+#   KRX       Code ISU_CD Name Market Dept Close ... Marcap Stocks MarketId
+#   KRX-DESC  Code Name Market Sector Industry Products ListingDate ...
+#
+# 그동안 KRX 만 조회해서 매번 "업종 컬럼 없음" 경고를 내고 0을 반환했고,
+# 그 결과 전 종목 sector 가 NULL 이라 추천 10선의 섹터 분산 제한
+# (per_sector=2) 이 조용히 비활성 상태였다. `sec and ...` 조건이라
+# 에러 없이 통과해서 아무도 몰랐다.
+SECTOR_LISTINGS: tuple[str, ...] = ("KRX-DESC", "KRX")
+SECTOR_CODE_COLS = ("Code", "Symbol", "종목코드")
+
+# **`Industry` 가 1순위다. `Sector` 는 업종이 아니다.**
+#
+# 이름이 헷갈리는데 KRX-DESC 의 `Sector` 는 코스닥 **소속부**다
+# (`KRX` 목록의 `Dept` 와 같은 값). 2026-08-27 실측 분포:
+#
+#   Sector    9종      중견기업부 513 / 우량기업부 466 / 벤처기업부 343 /
+#                      기술성장기업부 256 / 관리종목(소속부없음) 122 / ...
+#   Industry  158종    소프트웨어 개발 및 공급업 191 / 특수 목적용 기계
+#                      제조업 169 / 전자부품 제조업 136 / ...
+#
+# 소속부를 섹터로 쓰면 분산 제한이 엉뚱하게 걸린다. '우량기업부' 안에는
+# 반도체와 제약과 은행이 같이 있는데 `per_sector=2` 가 그 셋을 서로
+# 경쟁시킨다. 게다가 관리종목·투자주의환기는 섹터가 아니라 배제 플래그다.
+SECTOR_NAME_COLS = ("Industry", "업종", "Sector")
+
+
+def sector_source(listings: tuple[str, ...] = SECTOR_LISTINGS) -> dict:
+    """업종을 실제로 주는 상장목록을 찾는다. 조회 결과를 근거로 낸다.
+
+    반환: {"listing","code_col","sector_col","rows","tried":[...]}
+    못 찾으면 listing 이 None 이다.
+    """
+    rep: dict = {"listing": None, "code_col": None, "sector_col": None,
+                 "rows": 0, "tried": []}
+    try:
+        import FinanceDataReader as fdr
+    except Exception as exc:  # noqa: BLE001
+        rep["error"] = f"FinanceDataReader 임포트 실패: {exc}"
+        return rep
+
+    for name in listings:
+        try:
+            lst = fdr.StockListing(name)
+        except Exception as exc:  # noqa: BLE001
+            rep["tried"].append({"listing": name,
+                                 "error": f"{type(exc).__name__}: {exc}"[:120]})
+            continue
+        cols = list(lst.columns)
+        code_col = next((c for c in SECTOR_CODE_COLS if c in cols), None)
+        sec_col = next((c for c in SECTOR_NAME_COLS if c in cols), None)
+        rep["tried"].append({"listing": name, "cols": cols[:12],
+                             "code_col": code_col, "sector_col": sec_col})
+        if code_col and sec_col:
+            rep.update({"listing": name, "code_col": code_col,
+                        "sector_col": sec_col, "rows": int(len(lst)),
+                        "_frame": lst})
+            return rep
+    return rep
+
+
 def fill_sectors(store) -> int:
     """업종 정보 보강. 추천 10선의 섹터 편중을 막는 데 쓴다.
 
     pykrx 에는 업종 API 가 없어서 FinanceDataReader 의 상장목록을 쓴다.
-    실패하면 섹터 없이 진행하고, 그 경우 섹터 분산 제한만 비활성된다.
+    업종 컬럼이 있는 목록을 순서대로 찾는다 (`SECTOR_LISTINGS` 주석 참조).
+    전부 실패하면 섹터 없이 진행하고, 그 경우 섹터 분산 제한만 비활성된다.
+    그 사실을 로그에 명시한다 — 조용히 비활성되면 아무도 모른다.
     """
-    try:
-        import FinanceDataReader as fdr
-        lst = fdr.StockListing("KRX")
-    except Exception as exc:  # noqa: BLE001
-        log.warning("업종 정보 조회 실패, 섹터 분산 제한 비활성: %s", exc)
+    rep = sector_source()
+    lst = rep.pop("_frame", None)
+    if lst is None:
+        log.warning("업종 정보를 주는 상장목록이 없습니다. 섹터 분산 제한 "
+                    "비활성. 시도: %s", rep.get("tried") or rep.get("error"))
         return 0
 
-    code_col = next((c for c in ("Code", "Symbol", "종목코드") if c in lst.columns), None)
-    sec_col = next((c for c in ("Sector", "Industry", "업종") if c in lst.columns), None)
-    if not code_col or not sec_col:
-        log.warning("업종 컬럼 없음: %s", list(lst.columns)[:10])
-        return 0
+    code_col, sec_col = rep["code_col"], rep["sector_col"]
+    log.info("업종 출처 %s (%s / %s) · %d행",
+             rep["listing"], code_col, sec_col, rep["rows"])
 
     existing = store.active_tickers()
     rows = []
@@ -248,5 +562,9 @@ def fill_sectors(store) -> int:
                          "sector": str(r[sec_col])[:40]})
     if rows:
         store.upsert_tickers(rows)
-    log.info("업종 정보 %d종목 반영", len(rows))
+    cov = len(rows) / max(1, len(existing)) * 100.0
+    log.info("업종 정보 %d/%d종목 반영 (%.1f%%)", len(rows), len(existing), cov)
+    if cov < 50.0:
+        log.warning("업종 커버리지가 %.1f%% 입니다. 섹터 분산 제한이 "
+                    "대부분의 종목에 걸리지 않습니다.", cov)
     return len(rows)

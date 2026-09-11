@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
@@ -22,7 +24,11 @@ from .contracts import ScreenResult
 from .trading_day import is_definitely_closed, trading_days_between
 
 __all__ = ["AlertWindow", "WINDOWS", "AlertGate", "send_telegram", "now_kst",
-           "TelegramNotConfigured"]
+           "TelegramNotConfigured", "DOW_KR", "reco_send_allowed",
+           "reco_send_dow_label", "parse_chat_ids", "mask_chat_id",
+           "SendFailure", "SendReport"]
+
+log = logging.getLogger("notify")
 
 
 class TelegramNotConfigured(RuntimeError):
@@ -43,6 +49,40 @@ def now_kst() -> datetime:
     09:00 KST 시간창이 영원히 열리지 않고, 에러도 없이 조용히 무음이 된다.
     """
     return datetime.now(KST).replace(tzinfo=None)
+
+
+# `datetime.weekday()` 순서 (월=0 … 일=6)
+DOW_KR = ("월", "화", "수", "목", "금", "토", "일")
+
+
+def reco_send_dow_label(cfg: Config = DEFAULT) -> str:
+    """설정된 발송 요일의 한글 이름. 사람이 읽는 문구에만 쓴다."""
+    return DOW_KR[int(cfg.gate.reco_send_dow) % 7] + "요일"
+
+
+def reco_send_allowed(now: datetime | None = None, cfg: Config = DEFAULT,
+                      force: bool = False) -> tuple[bool, str]:
+    """추천 10선을 오늘 내보내도 되는가. (허용여부, 사유코드).
+
+    G5(요일). 기존 G1~G4 와 독립이며, 오직 요일만 본다.
+
+    시각을 보지 않는 것이 의도다. `WINDOWS`/`AlertGate` 의 4대 시간창은
+    장중 즉시 속보(flash)의 유량 조절 장치이고, 이 게이트는 장 마감 후
+    배치(daily)의 발송 리듬이다. 둘을 한 판정에 섞으면 daily 를 몇 시에
+    돌리느냐에 따라 주간 발송이 조용히 사라진다 — 16:05 는 어느 창에도
+    속하지 않기 때문이다. 그래서 서로 참조하지 않는다.
+
+    사유코드
+      force     --force 로 요일 무시
+      send_dow  오늘이 발송 요일
+      off_dow   발송 요일이 아님 (보유 요약만 나간다)
+    """
+    now = now or now_kst()
+    if force:
+        return True, "force"
+    if now.weekday() == int(cfg.gate.reco_send_dow) % 7:
+        return True, "send_dow"
+    return False, "off_dow"
 
 
 @dataclass(frozen=True)
@@ -73,6 +113,7 @@ class AlertWindow:
 #   14:00~14:25  단타 실망 매물로 멀쩡한 주가가 인위적으로 눌리는 구간.
 #                스위칭 매수 준비이므로 매집 트랙.
 #   15:20~15:35  종가 확정. 익일 갭을 노린 오버나이트 판단용으로 전 트랙.
+# 일일 상한 = 아래 budget 의 합 (2+3+2+2 = 9). 별도의 전역 일일 예산은 없다.
 WINDOWS: tuple[AlertWindow, ...] = (
     AlertWindow("반대매매", dtime(9, 0), dtime(9, 35),
                 ("VALUE", "BOTH"), 2, "D+2 하한가 투매 진행 중"),
@@ -86,7 +127,7 @@ WINDOWS: tuple[AlertWindow, ...] = (
 
 
 class AlertGate:
-    """G1 점수 · G2 시간창 · G3 종목 쿨다운 · G4 일일 예산."""
+    """G1 점수 · G2 시간창 · G3 종목 쿨다운 · G4 창별 예산 (합 = 일일 상한 9건)."""
 
     def __init__(self, state_path: str | Path = "data/alert_state.json",
                  cfg: Config = DEFAULT, store=None):
@@ -237,36 +278,186 @@ def _split(text: str, limit: int = TELEGRAM_MAX - 128) -> list[str]:
     return chunks
 
 
+# 재시도해도 낫지 않는 응답. 400 은 chat not found(오타이거나 상대가
+# 봇에게 /start 를 누른 적이 없음), 403 은 차단·추방, 401 은 토큰 자체가
+# 틀린 것이다. 셋 다 2초 뒤에 다시 두드린다고 달라지지 않는다.
+_PERMANENT = frozenset({400, 401, 403, 404})
+
+
+def mask_chat_id(chat_id: str) -> str:
+    """로그·알림에 남길 표시용 ID. 마지막 4자리만 남긴다.
+
+    채팅방 ID 는 그 자체로 발송 대상을 특정하는 식별자다. 로그 파일과
+    텔레그램 요약문은 사람 눈에 그대로 노출되므로 전체를 적지 않는다.
+    뒤 4자리만 있어도 "둘 중 어느 쪽이 막혔나"는 구분된다.
+    """
+    s = str(chat_id).strip()
+    return f"****{s[-4:]}" if len(s) >= 4 else "****"
+
+
+def parse_chat_ids(raw: str | None) -> list[str]:
+    """쉼표/세미콜론/공백으로 나열된 수신자 목록. 순서 유지, 중복 제거.
+
+    중복을 지우는 이유는 같은 사람에게 같은 메시지가 두 번 가는 것이
+    설정 오타의 흔한 결과이기 때문이다.
+    """
+    if not raw:
+        return []
+    out: list[str] = []
+    for tok in re.split(r"[,;\s]+", raw.strip()):
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
+@dataclass(frozen=True)
+class SendFailure:
+    """수신자 한 명의 발송 실패."""
+
+    chat: str            # 마스킹된 표시용 ID (****1234)
+    status: int | None   # None = 응답을 받지 못함 (네트워크·타임아웃)
+    error: str
+
+    def label(self) -> str:
+        return f"{self.chat}: {self.status or '무응답'}"
+
+
+@dataclass(frozen=True)
+class SendReport:
+    """발송 결과.
+
+    기존 호출부가 `ok = send_telegram(text)` 로 쓰고 있으므로 bool 로도
+    동작하게 둔다(실패가 하나도 없을 때 참). 수신자별 상세는 .failures
+    로 꺼낸다 — 이게 없으면 "몇 명 중 누가 왜 못 받았나"가 사라진다.
+    """
+
+    sent: int
+    failures: tuple[SendFailure, ...] = ()
+
+    def __bool__(self) -> bool:
+        return not self.failures
+
+    def summary(self) -> str:
+        """'발송 실패 2건 (수신자 ****1234: 400, ****5678: 403)'."""
+        if not self.failures:
+            return ""
+        detail = ", ".join(f.label() for f in self.failures)
+        return f"발송 실패 {len(self.failures)}건 (수신자 {detail})"
+
+    def as_dicts(self) -> list[dict]:
+        """--json 요약에 실을 형태. 마스킹된 ID 만 나간다."""
+        return [{"chat": f.chat, "status": f.status, "error": f.error}
+                for f in self.failures]
+
+
+def _describe(res) -> str:
+    """텔레그램이 준 description. JSON 이 아니면 본문 앞부분."""
+    try:
+        body = res.json()
+    except ValueError:
+        return res.text[:200].replace("\n", " ").strip()
+    if isinstance(body, dict) and body.get("description"):
+        return str(body["description"])[:200]
+    return str(body)[:200]
+
+
+def _retry_after(res, attempt: int) -> int:
+    """429 가 지시한 대기 초. 없으면 지수 백오프로 떨어진다."""
+    try:
+        given = res.json().get("parameters", {}).get("retry_after")
+    except (ValueError, AttributeError):
+        given = None
+    try:
+        return int(given) + 1
+    except (TypeError, ValueError):
+        return 2 ** attempt + 1
+
+
+def _send_one(token: str, chat_id: str, chunks: list[str],
+              retries: int) -> SendFailure | None:
+    """수신자 한 명에게 분할된 청크를 순서대로 보낸다.
+
+    성공하면 None, 실패하면 SendFailure 를 돌려준다. 응답 코드와
+    텔레그램이 준 description 을 그대로 로그에 남긴다 — 이게 없으면
+    400(방을 못 찾음)과 403(차단됨)을 구분할 수 없고, 그 둘은 사람이
+    해야 할 조치가 완전히 다르다.
+
+    영구 실패는 즉시 포기한다. 세 번 더 두드려서 얻는 것이 없다.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    who = mask_chat_id(chat_id)
+    for idx, chunk in enumerate(chunks, 1):
+        status: int | None = None
+        desc = ""
+        for attempt in range(retries):
+            try:
+                res = requests.post(
+                    url,
+                    json={"chat_id": chat_id, "text": chunk,
+                          "parse_mode": "HTML",
+                          "disable_web_page_preview": True},
+                    timeout=10,
+                )
+            except requests.RequestException as exc:
+                status, desc = None, f"{type(exc).__name__}: {exc}"
+                log.warning("텔레그램 %s 요청 실패 (%d/%d): %s",
+                            who, attempt + 1, retries, desc)
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                continue
+
+            status = res.status_code
+            if status == 200:
+                log.info("텔레그램 %s 발송 200 (청크 %d/%d)",
+                         who, idx, len(chunks))
+                break
+            desc = _describe(res)
+            if status == 429:
+                wait = _retry_after(res, attempt)
+                log.warning("텔레그램 %s 발송 429 — %d초 후 재시도: %s",
+                            who, wait, desc)
+                time.sleep(wait)
+                continue
+            log.error("텔레그램 %s 발송 실패 %d: %s", who, status, desc)
+            if status in _PERMANENT:
+                return SendFailure(who, status, desc)
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+        else:
+            # 재시도를 다 쓰고도 200 을 못 봤다.
+            log.error("텔레그램 %s 재시도 소진 (마지막 %s)",
+                      who, status or "무응답")
+            return SendFailure(who, status, desc or "재시도 소진")
+        time.sleep(0.4)  # 연속 발송 시 flood 방지
+    return None
+
+
 def send_telegram(text: str, chat_id: str | None = None,
-                  token: str | None = None, retries: int = 3) -> bool:
-    """HTML 모드 발송. 429 재시도 및 4096자 분할 처리."""
+                  token: str | None = None, retries: int = 3) -> SendReport:
+    """HTML 모드 발송. 429 재시도 및 4096자 분할 처리.
+
+    chat_id 는 쉼표로 여러 명을 나열할 수 있다. 한 명이 실패해도 나머지
+    수신자에게는 계속 보낸다 — 한 사람의 차단이 전체 무음이 되면 안 된다.
+
+    반환값은 SendReport 다. `if send_telegram(...)` 처럼 bool 로 써도
+    되고, 수신자별 실패 상세가 필요하면 .failures 를 본다.
+    """
     token = token or os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
+    targets = parse_chat_ids(chat_id or os.getenv("TELEGRAM_CHAT_ID"))
+    if not token or not targets:
         raise TelegramNotConfigured(
             "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정 — "
             ".env 를 만드십시오 (.env.example 참조)")
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    ok = True
-    for chunk in _split(text):
-        for attempt in range(retries):
-            res = requests.post(
-                url,
-                json={"chat_id": chat_id, "text": chunk,
-                      "parse_mode": "HTML", "disable_web_page_preview": True},
-                timeout=10,
-            )
-            if res.status_code == 200:
-                break
-            if res.status_code == 429:
-                wait = int(res.json().get("parameters", {})
-                           .get("retry_after", 2 ** attempt)) + 1
-                time.sleep(wait)
-                continue
-            if attempt == retries - 1:
-                ok = False
-            else:
-                time.sleep(2 ** attempt)
-        time.sleep(0.4)  # 연속 발송 시 flood 방지
-    return ok
+    chunks = _split(text)
+    sent = 0
+    failures: list[SendFailure] = []
+    for target in targets:
+        fail = _send_one(token, target, chunks, retries)
+        if fail is None:
+            sent += 1
+        else:
+            failures.append(fail)
+    if failures:
+        log.error("텔레그램 %d명 중 %d명 실패", len(targets), len(failures))
+    return SendReport(sent=sent, failures=tuple(failures))

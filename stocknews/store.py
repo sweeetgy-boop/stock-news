@@ -19,12 +19,18 @@ pandas 연산만 한다. 2,800종목 채점이 수 분 안에 끝난다.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+
+from .config import COOLDOWN_DAYS
+from .contracts import COOLDOWN_REASON
+
+log = logging.getLogger(__name__)
 
 __all__ = ["Store"]
 
@@ -44,6 +50,50 @@ def _now_kst() -> datetime:
 
 def _now_str() -> str:
     return _now_kst().isoformat(timespec="seconds")
+
+
+# 정규장 마감. 이 시각 전에는 '오늘' 봉이 아직 완성되지 않았다.
+KRX_CLOSE_HOUR, KRX_CLOSE_MIN = 15, 30
+# 마감 직후 몇 분은 시세가 확정되지 않는다. 여유를 둔다.
+CLOSE_SETTLE_MIN = 20
+
+
+def in_progress_date(now: datetime | None = None) -> str | None:
+    """지금 적재하면 '진행 중인 봉'이 되는 날짜. 없으면 None.
+
+    장중(09:00~15:50)에는 오늘 봉이 미완성이다. pykrx 종목별 조회는
+    장중에도 당일 행을 주는데, 그 종가는 현재가다. 그걸 종가로 적재하면
+    그날 채점 전체가 틀어진다.
+
+    2026-08-28 실측으로 잡은 규칙이다. 백필이 08:54 에 시작해 09:04 에
+    끝났고 장은 09:00 에 열렸다. 09:00 이후 처리된 252종목이 개장 직후
+    몇 분치만 담긴 봉을 받았고, 그중 246종목(98%)의 거래량이 8월 평균의
+    30% 미만이었다. `daily` 는 `last_price_date()` 로 기준일을 잡으므로
+    그 오염된 날짜를 그날의 거래일로 골랐다.
+
+    주말·공휴일은 여기서 판정하지 않는다 (`trading_day` 의 몫이다).
+    이 함수는 '오늘 장이 아직 안 끝났는가'만 본다.
+    """
+    now = now or _now_kst()
+    if now.weekday() >= 5:          # 주말엔 오늘 봉이 애초에 없다
+        return None
+    settle = now.replace(hour=KRX_CLOSE_HOUR,
+                         minute=KRX_CLOSE_MIN + CLOSE_SETTLE_MIN,
+                         second=0, microsecond=0)
+    if now >= settle:
+        return None
+    return now.strftime("%Y-%m-%d")
+
+
+def _as_kst_naive(value: datetime) -> datetime:
+    """호출자가 준 시각을 DB 표준(naive KST)으로 맞춘다.
+
+    aware 면 KST 로 변환하고 tz 를 뗀다. naive 는 이미 KST 로 본다.
+    이 정규화가 없으면 aware 와 naive 를 빼다가 TypeError 가 난다.
+    """
+    if value.tzinfo is not None:
+        return value.astimezone(KST).replace(tzinfo=None)
+    return value
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -106,6 +156,15 @@ CREATE TABLE IF NOT EXISTS non_trading_days (
   detected TEXT
 );
 
+-- 공휴일 (한국천문연구원 API). 휴장일 판정의 사전 필터. 비어 있어도 된다 —
+-- 그러면 그냥 기준 종목 프로브로 판정한다. --mode holidays 가 채운다.
+CREATE TABLE IF NOT EXISTS holidays (
+  d          TEXT PRIMARY KEY,
+  name       TEXT,
+  source     TEXT,
+  fetched_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS credit_manual (
   ticker  TEXT PRIMARY KEY,
   ratio   REAL,          -- 신용잔고율(%) = 신용잔고주식수 / 상장주식수 x 100
@@ -126,6 +185,7 @@ CREATE TABLE IF NOT EXISTS positions (
   qty            INTEGER NOT NULL,
   remaining      INTEGER NOT NULL,
   -- 진입 시점 스냅샷. 절대 재계산하지 않는다.
+  stop_price     REAL,              -- 진입 시 확정. 청산 판정은 이 값만 본다
   entry_p0       REAL,
   entry_band_hi  REAL,
   entry_band_mid REAL,
@@ -217,8 +277,148 @@ CREATE TABLE IF NOT EXISTS flags (
   updated        TEXT,
   -- 자본잠식만 별도 타임스탬프를 둔다. updated 는 행 전체 기준이라
   -- 로컬 판정이 매일 갱신되면 DART TTL 이 영원히 만료되지 않는다.
-  capital_impair_at TEXT
+  capital_impair_at TEXT,
+  -- 손절 청산 후 재진입 금지. 만료일이 아니라 '시작한 거래일'을 저장하고
+  -- 경과 거래일을 조회 시점에 센다. 만료일을 저장하면 20거래일 뒤가
+  -- 며칠인지 미리 알아야 하는데, 그건 미래 휴장일을 알아야 한다는 뜻이다.
+  cooldown_from   TEXT,
+  cooldown_reason TEXT
 );
+
+-- 추천 시점의 시장 상태. **기록 전용이다.**
+-- 점수·추천·게이트 어디에도 쓰지 않는다. 채점 데이터가 쌓인 뒤
+-- '어떤 장에서 통했나'를 되짚기 위한 것이고, 지금 이 값을 판단에 쓰면
+-- 표본 20건도 안 되는 시점에 국면 필터를 넣는 셈이 된다.
+--
+-- recos 는 건드리지 않는다. scan_date 로 조인하면 되므로 스키마를
+-- 바꿀 이유가 없다.
+-- 섹터 지표. **기록 전용이다.** market_context 와 같은 취급이다.
+-- 점수·추천·스크리닝·알림 어디에도 쓰지 않는다.
+CREATE TABLE IF NOT EXISTS sector_metrics (
+  scan_date          TEXT NOT NULL,
+  sector             TEXT NOT NULL,
+  n_stocks           INTEGER,
+  rs_5d              REAL,
+  rs_20d             REAL,
+  rs_rank            INTEGER,
+  momentum_persist   INTEGER,
+  breadth_ma20       REAL,
+  turnover_share     REAL,
+  turnover_share_chg REAL,
+  new_high_cnt       INTEGER,
+  new_high_pct       REAL,
+  created_at         TEXT,
+  PRIMARY KEY (scan_date, sector)
+);
+CREATE INDEX IF NOT EXISTS ix_secmet_date ON sector_metrics(scan_date);
+
+-- 뉴스 테마 언급 빈도. **기록 전용이다.**
+--
+-- `scan_date` 는 **거래일이 아니라 달력일**이다 (`news.d` 와 같은 축).
+-- 뉴스는 휴장일에도 나므로 거래일로 강제하면 주말 뉴스가 사라지거나
+-- 다음 거래일에 몰린다. 그래서 sector_metrics/recos 의 scan_date(거래일)
+-- 와는 축이 다르다 — 조인할 때 주의해야 한다.
+--
+-- `sector` 는 KRX 업종이 아니라 뉴스 테마 10종이다
+-- (`config.NEWS_THEME_KEYWORDS` 의 키). sector_metrics.sector(업종 158종)
+-- 와 이름만 같고 값 집합이 다르다.
+CREATE TABLE IF NOT EXISTS news_freq (
+  scan_date       TEXT NOT NULL,
+  sector          TEXT NOT NULL,
+  mention_cnt     INTEGER,
+  mention_cnt_ma7 REAL,
+  chg_vs_ma7      REAL,
+  created_at      TEXT,
+  PRIMARY KEY (scan_date, sector)
+);
+CREATE INDEX IF NOT EXISTS ix_newsfreq_date ON news_freq(scan_date);
+
+CREATE TABLE IF NOT EXISTS market_context (
+  scan_date         TEXT PRIMARY KEY,
+  kospi_close       REAL,
+  kospi_ma200       REAL,
+  kospi_above_ma200 INTEGER,
+  kospi_ret_5d      REAL,
+  kospi_ret_20d     REAL,
+  kosdaq_close      REAL,
+  kosdaq_ret_5d     REAL,
+  created_at        TEXT
+);
+
+-- 배당 실적. DART 사업보고서 '배당에 관한 사항' + 현금흐름표 실측이다.
+--
+-- 축이 **사업연도(fiscal_year)** 다. 다른 테이블은 전부 거래일이나
+-- 달력일이라 scan_date 로 조인할 수 없다. 결산일은 `settle_dt` 가 준다 —
+-- 12월 결산이 아닌 회사가 있어서 사업연도만으로 날짜를 유추하면 틀린다.
+--
+-- `status` 가 무배당과 누락을 구분한다. 이 구분이 없으면 조회 실패한
+-- 종목이 '배당 0원'으로 채점된다.
+--     paid       주당 현금배당금 > 0
+--     none       그 연도를 보고했고 배당금이 '-' — 무배당 확정
+--     no_report  그 연도 칸이 비어 있다 (상장 전 · 공시 없음)
+-- 조회가 실패한 종목은 행 자체를 쓰지 않는다.
+--
+-- 금액 단위는 전부 **원**이다. DART 는 백만원으로 주므로 적재 전에
+-- 환산한다. ocf/capex 가 NULL 이면 미조회이고, fcf 는 둘 중 하나라도
+-- 없으면 NULL 이다 (CAPEX 를 0 으로 가정하면 커버 판정이 무조건 통과한다).
+CREATE TABLE IF NOT EXISTS dividends (
+  code           TEXT NOT NULL,
+  fiscal_year    INTEGER NOT NULL,
+  dps            REAL,      -- 주당 현금배당금(원). 보통주.
+  total_dividend REAL,      -- 현금배당금총액(원)
+  net_income     REAL,      -- 당기순이익(원). 연결 우선, 없으면 별도.
+  payout_ratio   REAL,      -- 배당성향(%) = 총액/순이익 x 100
+  ocf            REAL,      -- 영업활동현금흐름(원)
+  capex          REAL,      -- 유형+무형자산 취득(원). 절대값 합.
+  fcf            REAL,      -- ocf - capex
+  buyback        REAL,      -- 자사주 취득액(원). CF 를 읽었고 행이 없으면 0.
+  status         TEXT,      -- paid / none / no_report
+  settle_dt      TEXT,      -- 결산일 YYYY-MM-DD
+  collected_at   TEXT,
+  PRIMARY KEY (code, fiscal_year)
+);
+CREATE INDEX IF NOT EXISTS ix_div_year ON dividends(fiscal_year);
+
+-- 배당주 필터 판정. **통과와 탈락을 모두 남긴다.**
+--
+-- 통과 종목만 저장하면 '필터가 빡빡한가'를 판단할 근거가 없다.
+-- `failed_at` 은 처음 걸린 필터(F1~F6)이고 통과면 NULL 이다. 필터는
+-- 순차 단락이므로 종목마다 칸이 하나뿐이고, 그래서 깔때기 합계가 맞는다.
+--
+-- `reason` 이 '조건 미달'과 '판정 불가(데이터 없음)'를 구분한다. 둘을
+-- 섞으면 '수집이 덜 됐다'와 '조건이 빡빡하다'를 구분할 수 없다.
+--
+-- `skipped` 는 적용하지 못한 조건이다. PBR 은 이 저장소에서 구할 수
+-- 없어 항상 F6-PBR 이 들어간다 (자본총계가 없고 FDR 스냅샷에 BPS·PBR
+-- 컬럼이 없다). 스킵을 통과로 적으면 근거가 거짓이 된다.
+--
+-- `scan_date` 는 **거래일**이다 (price 의 기준일). fiscal_year 는 배당
+-- 실적의 사업연도이고 축이 다르다.
+CREATE TABLE IF NOT EXISTS dividend_screen (
+  scan_date         TEXT NOT NULL,
+  code              TEXT NOT NULL,
+  name              TEXT,
+  fiscal_year       INTEGER,
+  price             REAL,
+  dps               REAL,
+  div_yield         REAL,     -- %
+  years_paid        INTEGER,
+  payout            REAL,     -- %
+  fcf               REAL,
+  total_dividend    REAL,
+  per               REAL,
+  sector            TEXT,
+  sector_per_median REAL,
+  passed            INTEGER,  -- 1 통과
+  failed_at         TEXT,     -- F1..F6 / 통과면 NULL
+  reason            TEXT,
+  no_data           INTEGER,  -- 1 이면 조건 미달이 아니라 판정 불가
+  skipped           TEXT,
+  rank              INTEGER,  -- 통과 종목만. 수익률 내림차순
+  created_at        TEXT,
+  PRIMARY KEY (scan_date, code)
+);
+CREATE INDEX IF NOT EXISTS ix_divscr_date ON dividend_screen(scan_date);
 """
 
 _COLS = {"o": "시가", "h": "고가", "l": "저가", "c": "종가",
@@ -246,6 +446,12 @@ class Store:
     # 않는다. 스키마가 늘어날 때마다 여기에 한 줄씩 넣는다.
     _MIGRATIONS = (
         ("flags", "capital_impair_at", "TEXT"),
+        ("positions", "stop_price", "REAL"),
+        ("flags", "cooldown_from", "TEXT"),
+        ("flags", "cooldown_reason", "TEXT"),
+        # 자사주 취득액(총주주환원율). dividends 는 이미 만들어진 DB 가
+        # 있으므로 CREATE TABLE IF NOT EXISTS 로는 컬럼이 붙지 않는다.
+        ("dividends", "buyback", "REAL"),
     )
 
     def _init(self) -> None:
@@ -259,19 +465,61 @@ class Store:
             con.commit()
 
     # ────────────────────────── 시세 ──────────────────────────
-    def upsert_prices(self, ticker: str, df: pd.DataFrame) -> int:
-        """한 종목의 OHLCV 적재. 컬럼은 한글 규격을 기대한다."""
+    @staticmethod
+    def _price_ok(o, h, l, c) -> bool:
+        """OHLC 가 전부 양수인가. 하나라도 0/음수/NaN 이면 버린다.
+
+        2026-08-27 실측으로 잡은 규칙이다. 백필 435,263행 중 1행이
+        `o=h=l=0, c=18,000, v=199,329` 였다(아이에스동서 2026-08-13).
+        거래량이 0이 아니라서 기존 필터(`거래량 > 0`)를 통과했다.
+
+        한 행이지만 영향이 크다. 저가 0 이 파동 저점으로 잡히면 그
+        종목의 피보나치 레벨이 전부 망가지고, 매물대 POC 와 ATR 도
+        0 범위로 계산된다. 조용히 한 종목의 채점이 무의미해진다.
+
+        거래된 주식의 가격은 0 일 수 없다. 이건 데이터 오류다.
+        """
+        try:
+            vals = (float(o), float(h), float(l), float(c))
+        except (TypeError, ValueError):
+            return False
+        return all(v > 0 and v == v for v in vals)   # v == v : NaN 배제
+
+    def upsert_prices(self, ticker: str, df: pd.DataFrame,
+                      allow_today: bool = False) -> int:
+        """한 종목의 OHLCV 적재. 컬럼은 한글 규격을 기대한다.
+
+        장중이면 오늘 행을 버린다. 미완성 봉을 종가로 적재하면 그날
+        채점이 전부 틀어진다 (`in_progress_date` 주석 참조).
+        `allow_today=True` 는 마감 후 재적재나 테스트용이다.
+        """
         if df is None or df.empty:
             return 0
+        skip_d = None if allow_today else in_progress_date()
         rows = []
+        dropped = 0
+        partial = 0
         has_amt = "거래대금" in df.columns
         for idx, r in df.iterrows():
+            ds = _d(idx)
+            if skip_d and ds == skip_d:
+                partial += 1
+                continue
+            if not self._price_ok(r["시가"], r["고가"], r["저가"], r["종가"]):
+                dropped += 1
+                continue
             rows.append((
-                ticker, _d(idx),
+                ticker, ds,
                 float(r["시가"]), float(r["고가"]), float(r["저가"]),
                 float(r["종가"]), float(r["거래량"]),
                 float(r["거래대금"]) if has_amt and pd.notna(r["거래대금"]) else None,
             ))
+        if dropped:
+            log.warning("%s: OHLC 가 0/결측인 %d행 제외", ticker, dropped)
+        if partial:
+            log.debug("%s: 장중 미완성 봉 %s 제외", ticker, skip_d)
+        if not rows:
+            return 0
         with closing(self._conn()) as con:
             con.executemany(
                 "INSERT INTO prices(ticker,d,o,h,l,c,v,amt) VALUES(?,?,?,?,?,?,?,?) "
@@ -283,21 +531,31 @@ class Store:
             con.commit()
         return len(rows)
 
-    def upsert_cross_section(self, trade_date, df: pd.DataFrame) -> int:
+    def upsert_cross_section(self, trade_date, df: pd.DataFrame,
+                             allow_today: bool = False) -> int:
         """'특정 일자 전종목' 한 판을 통째로 적재.
 
         df : index=종목코드, columns=['시가','고가','저가','종가','거래량','거래대금']
         일일 증분 업데이트의 핵심 경로다. 요청 1회로 2,800종목이 들어온다.
+
+        `upsert_prices` 와 같은 이유로 장중 오늘 날짜는 거부한다. 적재
+        경로가 둘이므로 한쪽만 막으면 다른 쪽으로 새 들어온다.
         """
         if df is None or df.empty:
             return 0
         ds = _d(trade_date)
+        if not allow_today and ds == in_progress_date():
+            log.warning("%s 는 장중이라 적재하지 않습니다 (미완성 봉)", ds)
+            return 0
         has_amt = "거래대금" in df.columns
         rows = []
         for code, r in df.iterrows():
             try:
                 if float(r["거래량"]) <= 0:
                     continue  # 거래정지/휴장 종목은 지표를 왜곡한다
+                if not self._price_ok(r["시가"], r["고가"], r["저가"],
+                                      r["종가"]):
+                    continue  # 거래량이 있어도 OHLC 가 0 이면 데이터 오류다
                 rows.append((
                     str(code).zfill(6), ds,
                     float(r["시가"]), float(r["고가"]), float(r["저가"]),
@@ -335,13 +593,52 @@ class Store:
             out = out.drop(columns=["거래대금"])
         return out[out["거래량"] > 0]
 
-    def last_price_date(self) -> str | None:
+    # 마지막 날짜가 이 비율 미만으로만 채워져 있으면 '부분 적재'로 본다.
+    PARTIAL_DAY_RATIO = 0.5
+
+    def last_price_date(self, allow_partial: bool = False) -> str | None:
+        """스캔 기준일. **부분적으로만 채워진 날짜는 건너뛴다.**
+
+        `MAX(d)` 를 그대로 쓰면 안 된다. 적재가 중간에 끊기거나 장중에
+        일부 종목만 들어오면 그 날짜가 최신이 되고, `daily` 가 그걸
+        거래일로 잡아 전종목을 그 날짜로 채점한다. 데이터가 있는 종목이
+        일부뿐이라 결과가 무의미해진다.
+
+        2026-08-28 실측: 08-25~27 은 각 2,400여 종목인데 08-28 은
+        252종목뿐이었다(장중 백필). 그 상태로 `daily` 가 1,196종목을
+        08-28 기준으로 채점하기 시작했다.
+
+        직전 거래일 대비 절반도 안 채워진 날짜는 아직 완성되지 않은
+        것으로 보고 그 앞 날짜를 준다.
+        """
         with closing(self._conn()) as con:
-            row = con.execute("SELECT MAX(d) FROM prices").fetchone()
-        return row[0] if row and row[0] else None
+            rows = con.execute(
+                "SELECT d, COUNT(*) n FROM prices GROUP BY d "
+                "ORDER BY d DESC LIMIT 6").fetchall()
+        if not rows:
+            return None
+        if allow_partial or len(rows) == 1:
+            return rows[0][0]
+
+        # 비교 기준은 그 아래 날짜들의 중위 종목수다. 하루만 보면 그
+        # 하루도 부분 적재일 수 있다.
+        counts = sorted(n for _, n in rows[1:])
+        median = counts[len(counts) // 2]
+        for d, n in rows:
+            if median <= 0 or n >= median * self.PARTIAL_DAY_RATIO:
+                return d
+            log.warning("%s 는 %d종목만 적재돼 기준일에서 제외합니다 "
+                        "(직전 중위 %d종목)", d, n, median)
+        return rows[-1][0]
 
     def existing_dates(self, since: str | None = None) -> set[str]:
-        """이미 적재된 거래일 집합. 증분 업데이트에서 중복 요청을 막는다."""
+        """적재 행이 **하나라도** 있는 거래일 집합.
+
+        주의: 이 집합은 '그 날짜를 다 받았는가'에 답하지 않는다. 3종목만
+        들어온 날도 여기 들어온다. 적재 완료 여부를 물어야 하는 자리에서는
+        `complete_dates()` 를 쓰십시오 — 왜 그래야 하는지는 그쪽 docstring
+        에 실측 사고가 적혀 있다.
+        """
         q = "SELECT DISTINCT d FROM prices"
         params: tuple = ()
         if since:
@@ -349,6 +646,70 @@ class Store:
             params = (since,)
         with closing(self._conn()) as con:
             return {d for (d,) in con.execute(q, params).fetchall()}
+
+    def date_counts(self, since: str | None = None) -> dict[str, int]:
+        """날짜별 적재 종목 수."""
+        q = "SELECT d, COUNT(*) FROM prices"
+        params: tuple = ()
+        if since:
+            q += " WHERE d>=?"
+            params = (since,)
+        q += " GROUP BY d"
+        with closing(self._conn()) as con:
+            return dict(con.execute(q, params).fetchall())
+
+    def _split_by_completeness(self, since: str | None = None
+                               ) -> tuple[set[str], dict[str, int]]:
+        """(온전한 날짜, {부분적재 날짜: 종목수}) 로 가른다.
+
+        기준은 `last_price_date()` 와 같은 `PARTIAL_DAY_RATIO` 다. 같은
+        창 안의 종목수 중위값 대비 그 비율에 못 미치면 부분 적재로 본다.
+
+        표본이 3일 미만이면 중위값을 신뢰할 수 없으므로 판정을 보류하고
+        전부 온전한 것으로 돌린다. 백필 초기에 모든 날짜를 '미적재'로
+        만들어 무한 재요청에 빠지는 것을 막는다.
+        """
+        counts = self.date_counts(since=since)
+        if len(counts) < 3:
+            return set(counts), {}
+        ordered = sorted(counts.values())
+        median = ordered[len(ordered) // 2]
+        if median <= 0:
+            return set(counts), {}
+        floor = median * self.PARTIAL_DAY_RATIO
+        full = {d for d, n in counts.items() if n >= floor}
+        part = {d: n for d, n in counts.items() if n < floor}
+        return full, part
+
+    def complete_dates(self, since: str | None = None) -> set[str]:
+        """**온전히** 적재된 거래일 집합. 부분 적재일은 빼고 준다.
+
+        `existing_dates()` 는 행이 1개라도 있으면 그 날짜를 준다. 증분
+        적재(`--mode update`)가 그것을 '적재 완료'로 읽는 바람에, 장중에
+        돌아 3종목만 받아온 날짜가 영구히 그 상태로 굳었다.
+
+        2026-09 실측 — update 가 개장 직후에 돌면서 이렇게 남았다.
+
+            2026-08-28      13종목
+            2026-09-02       3종목   (기준 종목 3개뿐)
+            2026-09-04      39종목
+            2026-09-03   1,546종목
+            (정상일은 2,400종목대)
+
+        이 날짜들이 `existing_dates()` 에 들어 있으니 update 는 두 번 다시
+        요청하지 않았고(`if ds in have: continue`), `flags.scan_local_flags`
+        는 같은 집합을 '시장 거래일'로 믿어서 그날 데이터가 없는 종목
+        2,463개를 거래정지 이력으로 오탐했다. 배제 종목이 2,484개가 되면서
+        daily 스냅샷이 883행에서 37행으로 무너졌다.
+
+        구멍 하나가 늘 때마다 오탐이 커지는 자기증폭 구조였다.
+        실측: 300 -> 323 -> 1,007 -> 2,463 종목.
+        """
+        return self._split_by_completeness(since)[0]
+
+    def partial_dates(self, since: str | None = None) -> dict[str, int]:
+        """{부분 적재 날짜: 적재된 종목 수}. 재적재 대상 보고용."""
+        return self._split_by_completeness(since)[1]
 
     def has_price_date(self, d) -> bool:
         """그 날짜의 시세가 적재돼 있는가. 거래일 확정 판정에 쓴다."""
@@ -373,6 +734,34 @@ class Store:
             row = con.execute(
                 "SELECT 1 FROM non_trading_days WHERE d=?", (ds,)).fetchone()
         return row is not None
+
+    # ────────────────────────── 공휴일 (사전 필터) ──────────────────────────
+    def upsert_holidays(self, rows: list[dict]) -> int:
+        """[{d, name, source}] 적재. 같은 날짜는 덮어쓴다."""
+        if not rows:
+            return 0
+        now = _now_str()
+        with closing(self._conn()) as con:
+            con.executemany(
+                "INSERT INTO holidays(d,name,source,fetched_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(d) DO UPDATE SET name=excluded.name,"
+                "source=excluded.source,fetched_at=excluded.fetched_at",
+                [(_d(r["d"]), r.get("name"), r.get("source"), now) for r in rows])
+            con.commit()
+        return len(rows)
+
+    def holiday_name(self, d) -> str | None:
+        """그 날짜가 공휴일 테이블에 있으면 명칭, 없으면 None."""
+        with closing(self._conn()) as con:
+            row = con.execute("SELECT name FROM holidays WHERE d=?",
+                              (_d(d),)).fetchone()
+        return (row[0] or "공휴일") if row else None
+
+    def holidays_in_year(self, year: int) -> list[tuple[str, str]]:
+        with closing(self._conn()) as con:
+            return con.execute(
+                "SELECT d,name FROM holidays WHERE d LIKE ? ORDER BY d",
+                (f"{int(year):04d}-%",)).fetchall()
 
     def known_non_trading_days(self, since: str | None = None) -> set[str]:
         q = "SELECT d FROM non_trading_days"
@@ -537,6 +926,17 @@ class Store:
                 "SELECT * FROM scans WHERE d>=? ORDER BY d", con,
                 params=(ds["d"].min(),))
 
+    def reco_count(self) -> int:
+        """전체 누적 추천 건수.
+
+        `reco_history` 는 최근 N일만 본다. 종이거래 표시에 쓰는 건
+        '지금까지 몇 건 쌓였나' 이므로 전체를 센다. 표본이 최소치에
+        닿기 전에는 성적을 신뢰하지 않는다는 표시다.
+        """
+        with closing(self._conn()) as con:
+            row = con.execute("SELECT COUNT(*) FROM recos").fetchone()
+        return int(row[0]) if row else 0
+
     def reco_history(self, days: int = 10) -> pd.DataFrame:
         with closing(self._conn()) as con:
             ds = pd.read_sql_query(
@@ -566,7 +966,7 @@ class Store:
     # ────────────────────────── 포지션 ──────────────────────────
     _POS_COLS = (
         "id", "ticker", "name", "track", "entry_date", "entry_price", "qty",
-        "remaining", "entry_p0", "entry_band_hi", "entry_band_mid",
+        "remaining", "stop_price", "entry_p0", "entry_band_hi", "entry_band_mid",
         "entry_band_lo", "entry_fib_0382", "entry_fib_0618", "entry_cross_low",
         "entry_credit_ratio", "exits_done", "peak_close", "band_break_streak",
         "ma_break_streak", "defer_until", "status", "opened_by", "note",
@@ -574,6 +974,7 @@ class Store:
 
     def open_position(self, ticker: str, name: str, track: str,
                       entry_date, entry_price: float, qty: int,
+                      stop_price: float,
                       snapshot: dict | None = None,
                       opened_by: str = "manual", note: str = "") -> int:
         """포지션 개시. snapshot 의 밴드/피보 값이 청산선의 기준이 된다.
@@ -581,21 +982,39 @@ class Store:
         여기서 저장한 값은 이후 절대 갱신하지 않는다. 매일 P0 를 다시
         계산하면 주가 하락에 맞춰 손절선도 내려가 손절이 영원히 발동하지
         않는다. 계좌를 녹이는 전형적인 방식이다.
+
+        `stop_price` 는 필수다. 기본값을 주지 않은 것은 의도다. 손절선
+        없는 포지션을 만들 수 있으면 언젠가 만들게 되고, 그 포지션은
+        계층 1 판정에서 조용히 빠진다. 값은 `exits.stop_price_for()` 로
+        계산한다(진입가 대비 `STOP_LOSS_PCT`).
         """
+        if stop_price is None:
+            raise ValueError(
+                "stop_price 는 필수입니다. 진입 시 손절선을 기록하지 않으면 "
+                "청산 판정에서 그 포지션이 조용히 빠집니다.")
+        sp = float(stop_price)
+        ep = float(entry_price)
+        if not (sp > 0):
+            raise ValueError(f"stop_price 가 양수가 아닙니다: {sp}")
+        if sp >= ep:
+            raise ValueError(
+                f"stop_price({sp:,.0f}) 가 진입가({ep:,.0f}) 이상입니다. "
+                f"진입 즉시 손절이 발동합니다.")
+
         s = snapshot or {}
         with closing(self._conn()) as con:
             cur = con.execute(
                 "INSERT INTO positions(ticker,name,track,entry_date,entry_price,"
-                "qty,remaining,entry_p0,entry_band_hi,entry_band_mid,"
+                "qty,remaining,stop_price,entry_p0,entry_band_hi,entry_band_mid,"
                 "entry_band_lo,entry_fib_0382,entry_fib_0618,entry_cross_low,"
                 "entry_credit_ratio,exits_done,peak_close,status,opened_by,"
-                "note,updated) VALUES(" + ",".join("?" * 21) + ")",
-                (ticker, name, track, _d(entry_date), float(entry_price),
-                 int(qty), int(qty),
+                "note,updated) VALUES(" + ",".join("?" * 22) + ")",
+                (ticker, name, track, _d(entry_date), ep,
+                 int(qty), int(qty), sp,
                  s.get("p0"), s.get("band_hi"), s.get("band_mid"),
                  s.get("band_lo"), s.get("fib_0382"), s.get("fib_0618"),
                  s.get("cross_low"), s.get("credit_ratio"),
-                 0, float(entry_price), "OPEN", opened_by, note, _now_str()))
+                 0, ep, "OPEN", opened_by, note, _now_str()))
             con.commit()
             return int(cur.lastrowid)
 
@@ -713,6 +1132,161 @@ class Store:
                 "updated=? WHERE id=?", (note, _now_str(), int(pos_id)))
             con.commit()
 
+    def positions_between(self, start, end) -> pd.DataFrame:
+        """진입일이 구간 안인 포지션 (상태 무관). 월간 회고용."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT id,ticker,name,track,entry_date,entry_price,qty,"
+                "remaining,stop_price,status,opened_by FROM positions "
+                "WHERE entry_date>=? AND entry_date<=? ORDER BY entry_date,id",
+                con, params=(_d(start), _d(end)))
+
+    def exit_log_between(self, start, end) -> pd.DataFrame:
+        """청산 신호일이 구간 안인 이력 + 진입 정보.
+
+        규칙 준수율은 '언제 들어가서 언제 신호가 났는지'를 함께 봐야
+        계산된다. 그래서 positions 를 조인해서 준다.
+        """
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT e.id,e.position_id,e.d,e.ticker,e.name,e.layer,e.rule,"
+                "e.action,e.ratio,e.qty,e.signal_price,e.ret_pct,e.net_ret_pct,"
+                "e.executed,e.fill_price,e.filled_at,"
+                "p.entry_date,p.entry_price,p.stop_price,p.track "
+                "FROM exit_log e LEFT JOIN positions p ON p.id=e.position_id "
+                "WHERE e.d>=? AND e.d<=? ORDER BY e.d,e.id",
+                con, params=(_d(start), _d(end)))
+
+    def recos_between(self, start, end) -> pd.DataFrame:
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT d,rank,ticker,name,price,slot,grade,value_score,"
+                "trend_score,reason FROM recos WHERE d>=? AND d<=? "
+                "ORDER BY d,rank", con, params=(_d(start), _d(end)))
+
+    def price_dates(self) -> list[str]:
+        """적재된 거래일 전체(오름차순). 거래일 간격 계산의 기준."""
+        return self._price_dates()
+
+    # ────────────────── 시장 상태 (기록 전용) ──────────────────
+    _MKT_COLS = ("scan_date", "kospi_close", "kospi_ma200",
+                 "kospi_above_ma200", "kospi_ret_5d", "kospi_ret_20d",
+                 "kosdaq_close", "kosdaq_ret_5d")
+
+    def has_market_context(self, d) -> bool:
+        """그 거래일 시장 상태가 이미 있는가. 하루 1회만 조회하려고 본다."""
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM market_context WHERE scan_date=?",
+                (_d(d),)).fetchone()
+        return row is not None
+
+    def upsert_market_context(self, row: dict) -> None:
+        """시장 상태 1행. 같은 거래일은 덮어쓴다."""
+        vals = [row.get(c) for c in self._MKT_COLS]
+        vals[0] = _d(vals[0])
+        marks = ",".join("?" * (len(self._MKT_COLS) + 1))
+        sets = ",".join(f"{c}=excluded.{c}" for c in self._MKT_COLS[1:])
+        with closing(self._conn()) as con:
+            con.execute(
+                f"INSERT INTO market_context({','.join(self._MKT_COLS)},"
+                f"created_at) VALUES({marks}) "
+                f"ON CONFLICT(scan_date) DO UPDATE SET {sets},"
+                f"created_at=excluded.created_at",
+                (*vals, _now_str()))
+            con.commit()
+
+    def market_context(self, d) -> dict | None:
+        """그 거래일 시장 상태 1행. 없으면 None."""
+        cols = self._MKT_COLS + ("created_at",)
+        with closing(self._conn()) as con:
+            row = con.execute(
+                f"SELECT {','.join(cols)} FROM market_context "
+                f"WHERE scan_date=?", (_d(d),)).fetchone()
+        return dict(zip(cols, row)) if row else None
+
+    def market_context_history(self, days: int = 60) -> pd.DataFrame:
+        """최근 거래일 시장 상태. 채점 결과와 조인해 국면별로 볼 때 쓴다."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM market_context ORDER BY scan_date DESC LIMIT ?",
+                con, params=(int(days),))
+
+    # ────────────────── 섹터 지표 (기록 전용) ──────────────────
+    _SEC_COLS = ("scan_date", "sector", "n_stocks", "rs_5d", "rs_20d",
+                 "rs_rank", "momentum_persist", "breadth_ma20",
+                 "turnover_share", "turnover_share_chg",
+                 "new_high_cnt", "new_high_pct")
+
+    def has_sector_metrics(self, d) -> bool:
+        """그 거래일 섹터 지표가 이미 있는가. 하루 1회만 계산하려고 본다."""
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM sector_metrics WHERE scan_date=? LIMIT 1",
+                (_d(d),)).fetchone()
+        return row is not None
+
+    def upsert_sector_metrics(self, rows: list[dict]) -> int:
+        """섹터 지표 다건. 같은 (거래일, 섹터) 는 덮어쓴다."""
+        if not rows:
+            return 0
+        now = _now_str()
+        payload = []
+        for r in rows:
+            vals = [r.get(c) for c in self._SEC_COLS]
+            vals[0] = _d(vals[0])
+            payload.append((*vals, now))
+        marks = ",".join("?" * (len(self._SEC_COLS) + 1))
+        sets = ",".join(f"{c}=excluded.{c}" for c in self._SEC_COLS[2:])
+        with closing(self._conn()) as con:
+            con.executemany(
+                f"INSERT INTO sector_metrics({','.join(self._SEC_COLS)},"
+                f"created_at) VALUES({marks}) "
+                f"ON CONFLICT(scan_date,sector) DO UPDATE SET {sets},"
+                f"created_at=excluded.created_at", payload)
+            con.commit()
+        return len(payload)
+
+    def sector_metrics_on(self, d) -> pd.DataFrame:
+        """그 거래일 섹터 지표 전체."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM sector_metrics WHERE scan_date=? "
+                "ORDER BY rs_rank", con, params=(_d(d),))
+
+    def sector_rs_ranks(self, d) -> dict:
+        """{섹터: rs_rank} — 모멘텀 지속성 판정에 쓸 과거 스냅샷."""
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT sector,rs_rank FROM sector_metrics "
+                "WHERE scan_date=? AND rs_rank IS NOT NULL",
+                (_d(d),)).fetchall()
+        return {s: int(r) for s, r in rows}
+
+    def field_matrix(self, field: str, days: int = 30) -> pd.DataFrame:
+        """임의 시세 컬럼의 피벗 (index=날짜, columns=종목코드).
+
+        `price_matrix` 는 종가 전용이다. 섹터 거래대금 집중도를 구하려면
+        `amt` 도 같은 모양으로 필요해서 일반화했다.
+        """
+        if field not in _COLS:
+            raise ValueError(f"알 수 없는 컬럼: {field} (가능: {sorted(_COLS)})")
+        with closing(self._conn()) as con:
+            dates = pd.read_sql_query(
+                "SELECT DISTINCT d FROM prices ORDER BY d DESC LIMIT ?",
+                con, params=(int(days),))
+            if dates.empty:
+                return pd.DataFrame()
+            start = dates["d"].min()
+            df = pd.read_sql_query(
+                f"SELECT d,ticker,{field} FROM prices WHERE d>=?",
+                con, params=(start,))
+        if df.empty:
+            return pd.DataFrame()
+        m = df.pivot(index="d", columns="ticker", values=field)
+        m.index = pd.to_datetime(m.index)
+        return m.sort_index()
+
     def exit_log_history(self, days: int = 60) -> pd.DataFrame:
         since = (_now_kst() - timedelta(days=days)).strftime("%Y-%m-%d")
         with closing(self._conn()) as con:
@@ -779,6 +1353,25 @@ class Store:
         with closing(self._conn()) as con:
             return pd.read_sql_query(q, con, params=params)
 
+    def recent_news_for_cluster(self, hours: int = 48) -> list[dict]:
+        """최근 항목의 `[id, title_norm, cluster_id, source]`.
+
+        `news.cluster_items` 의 씨앗이다. 클러스터링이 수집 배치 안에서만
+        일어나면 같은 기사가 실행마다 다른 cluster_id 를 받고, 최근
+        16시간을 읽는 아침 브리핑에서 중복으로 그대로 노출된다.
+
+        정리에 필요한 네 열만 읽는다. DataFrame 을 만들지 않는 것도
+        같은 이유다 — 이 결과는 파이썬 루프에서만 쓰인다.
+        """
+        cutoff = (_now_kst() - timedelta(hours=int(hours))).isoformat(
+            timespec="seconds")
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT id,title_norm,cluster_id,source FROM news "
+                "WHERE COALESCE(published,collected)>=?", (cutoff,)).fetchall()
+        return [{"id": i, "title_norm": tn, "cluster_id": cid, "source": src}
+                for i, tn, cid, src in rows]
+
     def news_ticker_map(self, news_ids: list[str]) -> pd.DataFrame:
         if not news_ids:
             return pd.DataFrame(columns=["news_id", "ticker", "name"])
@@ -787,6 +1380,208 @@ class Store:
             return pd.read_sql_query(
                 f"SELECT news_id,ticker,name FROM news_tickers "
                 f"WHERE news_id IN ({marks})", con, params=news_ids)
+
+    def news_titles(self, days: int = 30) -> pd.DataFrame:
+        """[d, title] — 일자별 뉴스 제목. 테마 언급 빈도 집계용.
+
+        `d` 는 수집 기준일(달력일)이다. `published` 는 네이버가 안 주므로
+        일자 축으로 못 쓴다.
+        """
+        since = (_now_kst() - timedelta(days=int(days))).strftime("%Y-%m-%d")
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT d,title FROM news WHERE d>=? AND title IS NOT NULL "
+                "ORDER BY d", con, params=(since,))
+
+    # ────────────────── 뉴스 테마 빈도 (기록 전용) ──────────────────
+    _NF_COLS = ("scan_date", "sector", "mention_cnt", "mention_cnt_ma7",
+                "chg_vs_ma7")
+
+    def has_news_freq(self, d) -> bool:
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM news_freq WHERE scan_date=? LIMIT 1",
+                (_d(d),)).fetchone()
+        return row is not None
+
+    def upsert_news_freq(self, rows: list[dict]) -> int:
+        """뉴스 빈도 다건. 같은 (일자, 테마) 는 덮어쓴다."""
+        if not rows:
+            return 0
+        now = _now_str()
+        payload = []
+        for r in rows:
+            vals = [r.get(c) for c in self._NF_COLS]
+            vals[0] = _d(vals[0])
+            payload.append((*vals, now))
+        marks = ",".join("?" * (len(self._NF_COLS) + 1))
+        sets = ",".join(f"{c}=excluded.{c}" for c in self._NF_COLS[2:])
+        with closing(self._conn()) as con:
+            con.executemany(
+                f"INSERT INTO news_freq({','.join(self._NF_COLS)},created_at) "
+                f"VALUES({marks}) ON CONFLICT(scan_date,sector) DO UPDATE SET "
+                f"{sets},created_at=excluded.created_at", payload)
+            con.commit()
+        return len(payload)
+
+    def news_freq_on(self, d) -> pd.DataFrame:
+        """그 일자 테마 빈도 전체."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM news_freq WHERE scan_date=? "
+                "ORDER BY mention_cnt DESC", con, params=(_d(d),))
+
+    # ────────────────────────── 배당 ──────────────────────────
+    _DIV_COLS = ("code", "fiscal_year", "dps", "total_dividend", "net_income",
+                 "payout_ratio", "ocf", "capex", "fcf", "buyback", "status",
+                 "settle_dt")
+
+    def has_dividends(self, code: str, fiscal_year: int) -> bool:
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM dividends WHERE code=? AND fiscal_year=? "
+                "LIMIT 1", (code, int(fiscal_year))).fetchone()
+        return row is not None
+
+    def dividend_asof(self, fiscal_year: int) -> dict:
+        """`{종목코드: collected_at}` — 월 1회 갱신에서 TTL 스킵 판정용."""
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT code,collected_at FROM dividends WHERE fiscal_year=?",
+                (int(fiscal_year),)).fetchall()
+        return {c: at for c, at in rows}
+
+    def upsert_dividends(self, rows: list[dict]) -> int:
+        """배당 실적 다건. 같은 (종목, 사업연도) 는 덮어쓴다.
+
+        COALESCE 를 쓰지 않는다. 재수집은 '같은 공시를 다시 읽은 것'이고,
+        정정공시가 나오면 새 값이 이겨야 한다. 값을 못 읽었으면 애초에
+        행을 만들지 않는다(`status` 로 구분).
+        """
+        if not rows:
+            return 0
+        now = _now_str()
+        payload = []
+        for r in rows:
+            vals = [r.get(c) for c in self._DIV_COLS]
+            vals[1] = int(vals[1])
+            payload.append((*vals, now))
+        marks = ",".join("?" * (len(self._DIV_COLS) + 1))
+        sets = ",".join(f"{c}=excluded.{c}" for c in self._DIV_COLS[2:])
+        with closing(self._conn()) as con:
+            con.executemany(
+                f"INSERT INTO dividends({','.join(self._DIV_COLS)},"
+                f"collected_at) VALUES({marks}) "
+                f"ON CONFLICT(code,fiscal_year) DO UPDATE SET {sets},"
+                f"collected_at=excluded.collected_at", payload)
+            con.commit()
+        return len(payload)
+
+    def dividends_of(self, code: str) -> pd.DataFrame:
+        """한 종목의 사업연도별 배당 실적 (오래된 연도부터)."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM dividends WHERE code=? ORDER BY fiscal_year",
+                con, params=(code,))
+
+    def dividends_on(self, fiscal_year: int) -> pd.DataFrame:
+        """그 사업연도 전종목 배당 실적."""
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT * FROM dividends WHERE fiscal_year=? ORDER BY code",
+                con, params=(int(fiscal_year),))
+
+    def dividend_coverage(self, fiscal_year: int) -> dict:
+        """수집 현황. 몇 종목이 실측으로 채점 가능한지 확인용."""
+        with closing(self._conn()) as con:
+            active = con.execute(
+                "SELECT COUNT(*) FROM tickers WHERE active=1").fetchone()[0]
+            got = con.execute(
+                "SELECT COUNT(*) FROM dividends WHERE fiscal_year=?",
+                (int(fiscal_year),)).fetchone()[0]
+            paid = con.execute(
+                "SELECT COUNT(*) FROM dividends WHERE fiscal_year=? "
+                "AND status='paid'", (int(fiscal_year),)).fetchone()[0]
+            none_n = con.execute(
+                "SELECT COUNT(*) FROM dividends WHERE fiscal_year=? "
+                "AND status='none'", (int(fiscal_year),)).fetchone()[0]
+            newest = con.execute(
+                "SELECT MAX(collected_at) FROM dividends").fetchone()[0]
+        return {"active": int(active), "fiscal_year": int(fiscal_year),
+                "collected": int(got), "paid": int(paid),
+                "no_dividend": int(none_n), "asof": newest}
+
+    # ── 배당 필터 판정 ──
+    _DIVSCR_COLS = ("scan_date", "code", "name", "fiscal_year", "price",
+                    "dps", "div_yield", "years_paid", "payout", "fcf",
+                    "total_dividend", "per", "sector", "sector_per_median",
+                    "passed", "failed_at", "reason", "no_data", "skipped",
+                    "rank")
+
+    def has_dividend_screen(self, d) -> bool:
+        with closing(self._conn()) as con:
+            row = con.execute(
+                "SELECT 1 FROM dividend_screen WHERE scan_date=? LIMIT 1",
+                (_d(d),)).fetchone()
+        return row is not None
+
+    def upsert_dividend_screen(self, rows: list[dict]) -> int:
+        """필터 판정 다건. 같은 (거래일, 종목) 은 덮어쓴다."""
+        if not rows:
+            return 0
+        now = _now_str()
+        payload = []
+        for r in rows:
+            vals = [r.get(c) for c in self._DIVSCR_COLS]
+            vals[0] = _d(vals[0])
+            # bool 을 그대로 넣으면 sqlite 가 0/1 로 저장하긴 하지만,
+            # None(판정 안 함)과 False 를 구분하려면 명시적으로 바꾼다.
+            for i in (14, 17):
+                vals[i] = None if vals[i] is None else int(bool(vals[i]))
+            payload.append((*vals, now))
+        marks = ",".join("?" * (len(self._DIVSCR_COLS) + 1))
+        sets = ",".join(f'"{c}"=excluded."{c}"'
+                        for c in self._DIVSCR_COLS[2:])
+        cols = ",".join(f'"{c}"' for c in self._DIVSCR_COLS)
+        with closing(self._conn()) as con:
+            con.executemany(
+                f"INSERT INTO dividend_screen({cols},created_at) "
+                f"VALUES({marks}) ON CONFLICT(scan_date,code) DO UPDATE SET "
+                f"{sets},created_at=excluded.created_at", payload)
+            con.commit()
+        return len(payload)
+
+    def dividend_screen_on(self, d, passed_only: bool = False) -> pd.DataFrame:
+        """그 거래일 필터 결과. 통과분은 순위 순, 탈락분은 코드 순."""
+        sql = "SELECT * FROM dividend_screen WHERE scan_date=?"
+        if passed_only:
+            sql += " AND passed=1"
+        sql += ' ORDER BY passed DESC, "rank", code'
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(sql, con, params=(_d(d),))
+
+    def dividend_screen_funnel(self, d) -> dict:
+        """`{필터: {"failed": n, "no_data": n}}` + 통과/평가 수.
+
+        필터가 빡빡한지 판단할 근거다. 순차 단락이라 각 칸이 '여기서
+        처음 떨어진 수'를 뜻하고, 합계 + 통과 = 평가 수가 된다.
+        """
+        with closing(self._conn()) as con:
+            total = con.execute(
+                "SELECT COUNT(*) FROM dividend_screen WHERE scan_date=?",
+                (_d(d),)).fetchone()[0]
+            passed = con.execute(
+                "SELECT COUNT(*) FROM dividend_screen WHERE scan_date=? "
+                "AND passed=1", (_d(d),)).fetchone()[0]
+            rows = con.execute(
+                "SELECT failed_at, SUM(1), SUM(COALESCE(no_data,0)) "
+                "FROM dividend_screen WHERE scan_date=? AND failed_at "
+                "IS NOT NULL GROUP BY failed_at ORDER BY failed_at",
+                (_d(d),)).fetchall()
+        return {"scan_date": _d(d), "evaluated": int(total),
+                "passed": int(passed),
+                "by_filter": {str(f): {"failed": int(n), "no_data": int(nd)}
+                              for f, n, nd in rows}}
 
     def news_theme_counts(self, days: int = 14) -> pd.DataFrame:
         """일자 x 카테고리 건수. 주간 테마 부침 분석용."""
@@ -856,15 +1651,23 @@ class Store:
             con.execute(f"UPDATE flags SET {field}=NULL")
             con.commit()
 
-    def load_flags(self) -> dict:
-        """{ticker: {한글키: 값}} 형태. screener.check_exclusion 계약에 맞춘다."""
+    def load_flags(self, cooldown_days: int = COOLDOWN_DAYS) -> dict:
+        """{ticker: {한글키: 값}} 형태. screener.check_exclusion 계약에 맞춘다.
+
+        재진입금지는 저장된 만료 플래그가 아니라 **조회 시점에 경과
+        거래일을 세서** 판정한다. 그래서 청소 잡이 돌지 않아도 만료가
+        자동 반영된다. `expire_cooldowns()` 는 표를 정리하는 용도다.
+        """
+        after = self._trading_days_after_map()
         with closing(self._conn()) as con:
             cur = con.execute(
                 "SELECT ticker,admin_issue,alert_issue,audit_refusal,"
-                "capital_impair,recent_offering,halt_history,penny_risk FROM flags")
+                "capital_impair,recent_offering,halt_history,penny_risk,"
+                "cooldown_from FROM flags")
             rows = cur.fetchall()
         out = {}
-        for (t, adm, alt, aud, imp, off, halt, penny) in rows:
+        for (t, adm, alt, aud, imp, off, halt, penny, cd_from) in rows:
+            elapsed = after(cd_from) if cd_from else None
             out[t] = {
                 "관리종목": bool(adm),
                 "투자주의환기": bool(alt),
@@ -874,8 +1677,105 @@ class Store:
                 "대규모증자": bool(off),
                 "거래정지이력": bool(halt),
                 "동전주위험": bool(penny),
+                "재진입금지": bool(elapsed is not None
+                                   and elapsed < int(cooldown_days)),
+                "재진입금지_시작": cd_from,
+                "재진입금지_경과": elapsed,
             }
         return out
+
+    # ────────────────────── 재진입 금지 (쿨다운) ──────────────────────
+    def _price_dates(self) -> list[str]:
+        """적재된 거래일 전체(오름차순). 경과 거래일 계산의 기준."""
+        with closing(self._conn()) as con:
+            return [d for (d,) in con.execute(
+                "SELECT DISTINCT d FROM prices ORDER BY d").fetchall()]
+
+    def _trading_days_after_map(self):
+        """`d` 이후 경과 거래일을 돌려주는 함수. 날짜 목록을 1회만 읽는다.
+
+        종목마다 COUNT 쿼리를 날리면 2,800회가 된다.
+        """
+        dates = self._price_dates()
+
+        def after(d) -> int:
+            if not d:
+                return 0
+            ds = _d(d)
+            # ds 보다 큰 날짜의 개수 = 그 날 이후 경과 거래일
+            lo, hi = 0, len(dates)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if dates[mid] <= ds:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return len(dates) - lo
+
+        return after
+
+    def trading_days_after(self, d) -> int:
+        """`d` 이후 경과 거래일. 당일은 세지 않는다."""
+        return self._trading_days_after_map()(d)
+
+    def set_cooldown(self, ticker: str, from_date,
+                     reason: str = COOLDOWN_REASON) -> None:
+        """재진입 금지 시작. 같은 종목이면 더 최근 날짜만 남긴다.
+
+        손절이 두 번 나면 늦은 쪽부터 다시 세야 한다. 이전 날짜로
+        되돌아가면 쿨다운이 짧아진다.
+        """
+        ds = _d(from_date)
+        newer = ("flags.cooldown_from IS NULL "
+                 "OR excluded.cooldown_from>flags.cooldown_from")
+        with closing(self._conn()) as con:
+            con.execute(
+                "INSERT INTO flags(ticker,cooldown_from,cooldown_reason,updated) "
+                "VALUES(?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET "
+                f"cooldown_from=CASE WHEN {newer} "
+                "THEN excluded.cooldown_from ELSE flags.cooldown_from END,"
+                f"cooldown_reason=CASE WHEN {newer} "
+                "THEN excluded.cooldown_reason ELSE flags.cooldown_reason END,"
+                "updated=excluded.updated",
+                (ticker, ds, reason, _now_str()))
+            con.commit()
+
+    def cooldown_state(self, cooldown_days: int = COOLDOWN_DAYS) -> dict:
+        """{ticker: {from, reason, elapsed, remaining, active}}"""
+        after = self._trading_days_after_map()
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT ticker,cooldown_from,cooldown_reason FROM flags "
+                "WHERE cooldown_from IS NOT NULL ORDER BY cooldown_from DESC"
+            ).fetchall()
+        out = {}
+        for t, d0, why in rows:
+            el = after(d0)
+            out[t] = {"from": d0, "reason": why, "elapsed": el,
+                      "remaining": max(0, int(cooldown_days) - el),
+                      "active": el < int(cooldown_days)}
+        return out
+
+    def expire_cooldowns(self, cooldown_days: int = COOLDOWN_DAYS,
+                         reason: str = COOLDOWN_REASON) -> list[str]:
+        """경과한 자동 쿨다운을 지운다. 해제된 종목 목록 반환.
+
+        `reason` 이 일치하는 것만 지운다. 자동 청소가 사람이 넣은 항목을
+        지우면 수동 배제가 조용히 풀린다.
+        """
+        state = self.cooldown_state(cooldown_days)
+        gone = [t for t, s in state.items()
+                if not s["active"] and s["reason"] == reason]
+        if not gone:
+            return []
+        marks = ",".join("?" * len(gone))
+        with closing(self._conn()) as con:
+            con.execute(
+                f"UPDATE flags SET cooldown_from=NULL,cooldown_reason=NULL,"
+                f"updated=? WHERE ticker IN ({marks})",
+                (_now_str(), *gone))
+            con.commit()
+        return gone
 
     # 필드별 타임스탬프 컬럼. 없으면 행 전체의 updated 를 쓴다.
     _FLAG_TS_COL = {"capital_impair": "capital_impair_at"}
@@ -950,6 +1850,41 @@ class Store:
                 "SELECT MAX(asof) FROM credit_manual").fetchone()[0]
         return {"active": int(total), "with_credit": int(have), "asof": newest}
 
+    def sector_coverage(self) -> dict:
+        """업종이 채워진 활성 종목 비율.
+
+        섹터 분산 제한(`select_recommendations(per_sector=2)`)은 sector 가
+        NULL 이면 조용히 통과한다. 커버리지가 0%면 제한이 사실상 없는데
+        에러가 나지 않아 알아챌 수 없다. 그래서 숫자로 낸다.
+        """
+        with closing(self._conn()) as con:
+            total = con.execute(
+                "SELECT COUNT(*) FROM tickers WHERE active=1").fetchone()[0]
+            have = con.execute(
+                "SELECT COUNT(*) FROM tickers WHERE active=1 "
+                "AND sector IS NOT NULL AND TRIM(sector)<>''").fetchone()[0]
+            n_sec = con.execute(
+                "SELECT COUNT(DISTINCT sector) FROM tickers WHERE active=1 "
+                "AND sector IS NOT NULL AND TRIM(sector)<>''").fetchone()[0]
+        pct = (have / total * 100.0) if total else 0.0
+        return {"active": int(total), "with_sector": int(have),
+                "sectors": int(n_sec), "pct": round(pct, 1)}
+
+    def credit_sources(self) -> dict:
+        """출처별 신용잔고 종목 수. {source: {"n","asof"}}
+
+        커버리지 숫자만 보면 '몇 종목이 실측이냐'는 알 수 있지만 '누가
+        채웠냐'는 모른다. 자동 수집이 조용히 죽어서 사람이 넣은 옛 값만
+        남은 상황과, 자동이 잘 도는 상황이 같은 숫자로 보인다. 그 둘을
+        구분하기 위한 조회다.
+        """
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT COALESCE(source,'?') AS s, COUNT(*), MAX(asof) "
+                "FROM credit_manual WHERE ratio IS NOT NULL "
+                "GROUP BY s ORDER BY 2 DESC").fetchall()
+        return {str(s): {"n": int(n), "asof": asof} for s, n, asof in rows}
+
     # ────────────────────────── CSV 내보내기 ──────────────────────────
     # 김승곤 차장이 신용잔고 증감률과 대조할 수 있도록 전종목 점수표를
     # 엑셀로 떨어뜨린다. 인코딩은 utf-8-sig 여야 한다. BOM 이 없으면
@@ -958,6 +1893,21 @@ class Store:
         "scans": "SELECT * FROM scans WHERE d>=? ORDER BY d,value_score DESC",
         "recos": "SELECT * FROM recos WHERE d>=? ORDER BY d,rank",
         "exit_log": "SELECT * FROM exit_log WHERE d>=? ORDER BY d DESC,id DESC",
+        # 배치 이력도 내보낸다. 성과를 따질 때 '그날 잡이 돌았는지'가
+        # 먼저다. 스캔 결과만 보면 잡이 죽어서 빈 것과 시장이 조용해서
+        # 빈 것을 구분할 수 없다.
+        # runs 에는 명시적 id 컬럼이 없다. SQLite 의 암묵 rowid 를 쓴다.
+        # ALTER TABLE 로 PRIMARY KEY 컬럼을 추가할 수 없어서, 기존 DB 와
+        # 새 DB 가 같은 모양을 유지하는 쪽을 골랐다.
+        "runs": "SELECT rowid AS id,* FROM runs WHERE started>=? "
+                "ORDER BY rowid DESC",
+        # 뉴스도 내보낸다. 종목 태깅이 맞았는지, 어떤 사건이 추천과
+        # 겹쳤는지는 CSV 로 놓고 봐야 확인된다. 두 테이블이 빠져 있었다.
+        "news": "SELECT * FROM news WHERE d>=? ORDER BY d DESC,importance DESC",
+        "news_tickers": "SELECT nt.news_id,nt.ticker,n.d,n.title,n.category,"
+                        "n.importance FROM news_tickers nt "
+                        "JOIN news n ON n.id=nt.news_id "
+                        "WHERE n.d>=? ORDER BY n.d DESC,nt.ticker",
     }
     _EXPORTS_FULL = {
         "flags": "SELECT * FROM flags",
@@ -991,13 +1941,78 @@ class Store:
 
     # ────────────────────────── 실행 이력 ──────────────────────────
     def log_run(self, mode: str, started: datetime, ok: int, failed: int,
-                note: str = "") -> None:
-        fin = datetime.now()
+                note: str = "", elapsed: float | None = None) -> None:
+        """배치 1회를 기록한다.
+
+        `datetime.now()` 대신 KST 를 쓴다. 나머지 테이블이 전부 KST 인데
+        `runs` 만 서버 로컬시각이면 UTC 호스트에서 9시간 어긋나 이력
+        대조가 불가능해진다.
+
+        `started` 는 naive(KST 가정) 든 aware 든 받는다. 섞인 것을 그대로
+        빼면 TypeError 로 죽는다 — 기록이 목적인 함수가 배치를 죽이면
+        본말이 전도된다.
+        """
+        fin = _now_kst()
+        st = _as_kst_naive(started)
+        if elapsed is None:
+            elapsed = (fin - st).total_seconds()
         with closing(self._conn()) as con:
             con.execute(
                 "INSERT INTO runs(started,finished,mode,ok,failed,elapsed,note) "
                 "VALUES(?,?,?,?,?,?,?)",
-                (started.isoformat(timespec="seconds"),
-                 fin.isoformat(timespec="seconds"), mode, ok, failed,
-                 (fin - started).total_seconds(), note))
+                (st.isoformat(timespec="seconds"),
+                 fin.isoformat(timespec="seconds"), mode, int(ok), int(failed),
+                 float(elapsed), note))
             con.commit()
+
+    def run_history(self, days: int = 14, mode: str | None = None,
+                    limit: int = 200) -> pd.DataFrame:
+        """최근 배치 이력. 이 테이블을 읽는 코드가 없었다.
+
+        AGENTS.md 7장이 "runs 테이블에 모든 배치 이력이 남습니다"라고
+        약속하는데, 쓰는 모드가 둘뿐이고 읽는 경로가 아예 없었다.
+        약속만 있고 확인할 방법이 없으면 그 약속은 검증되지 않는다.
+        """
+        since = (_now_kst() - timedelta(days=max(0, int(days)))
+                 ).isoformat(timespec="seconds")
+        sql = ("SELECT rowid AS id,mode,started,finished,ok,failed,elapsed,note "
+               "FROM runs WHERE started>=?")
+        params: list = [since]
+        if mode:
+            sql += " AND mode=?"
+            params.append(mode)
+        sql += " ORDER BY rowid DESC LIMIT ?"
+        params.append(int(limit))
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(sql, con, params=params)
+
+    def run_summary(self, days: int = 7) -> dict:
+        """모드별 최근 실행 요약. {mode: {...}}
+
+        '몇 시간 전에 돌았나'가 핵심이다. 스케줄이 조용히 멈춘 것을
+        알아채는 유일한 근거다.
+        """
+        since = (_now_kst() - timedelta(days=max(0, int(days)))
+                 ).isoformat(timespec="seconds")
+        with closing(self._conn()) as con:
+            rows = con.execute(
+                "SELECT mode, COUNT(*), MAX(started), SUM(ok), SUM(failed), "
+                "       AVG(elapsed), MAX(elapsed) "
+                "FROM runs WHERE started>=? GROUP BY mode "
+                "ORDER BY MAX(started) DESC", (since,)).fetchall()
+        now = _now_kst()
+        out: dict = {}
+        for mode, n, last, ok, failed, avg, mx in rows:
+            age = None
+            try:
+                age = round((now - datetime.fromisoformat(str(last))
+                             ).total_seconds() / 3600.0, 1)
+            except (TypeError, ValueError):
+                pass
+            out[str(mode)] = {
+                "runs": int(n), "last": last, "age_hours": age,
+                "ok": int(ok or 0), "failed": int(failed or 0),
+                "avg_sec": round(float(avg or 0.0), 1),
+                "max_sec": round(float(mx or 0.0), 1),
+            }
+        return out
