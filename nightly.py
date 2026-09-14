@@ -25,7 +25,8 @@
 --------
   0   정상 (휴장일 스킵, '오늘 이미 실행' 스킵도 0)
   1   파이프라인 자체 실패 (락 획득 실패는 0 이 아니라 3)
-  2   부분 실패 — 한 단계 이상 실패했으나 완주함
+  2   부분 실패 — 한 단계 이상 실패했으나 완주함, 또는 이 드라이버의
+      완료·스킵 알림 발송이 실패함 (마커 reason 에 '알림 실패')
   3   이중 실행 (락 점유 중)
 
 이 파일이 유일한 진입점이다
@@ -42,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -114,6 +116,24 @@ FLASH_EXTRA_ARGS: tuple[str, ...] = ()
 # --force 를 준다.
 DONE_MARKER = "data/nightly_done.json"
 
+# 완주 마커 reason 꼬리표. 이 드라이버의 완료·스킵 알림이 실패하면 붙는다.
+ALERT_FAILED = "알림 실패"
+
+# catch-up 이면 시작 전에 네트워크부터 확인한다.
+#
+# 2026-09-13 17:36: PC 가 9/12 03:09 부터 절전이었고, 깨어나는 순간 Hermes
+# 가 9/12 21:30 회차를 catch-up 으로 띄웠다. 그때 Wi-Fi 는 끊긴 뒤 새 망에
+# 붙기 전(17:36:24~58)이었고, 17:36:43~49 완료 알림이 두 수신자 모두
+# '무응답'으로 샜다. 09-08 에도 catch-up 직후 DNS 가 없어 전 조회가 죽었다.
+#
+# CATCH_UP_SLACK_SEC 는 Hermes 가 제시간(on_time)으로 치는 지연 상한
+# (cron/jobs.py _LATE_DISPATCH_TOLERANCE_SECONDS)과 같다. 제시간 실행도
+# 틱 간격 때문에 수 초 늦게 뜨므로 0 을 쓰면 매일 밤이 catch-up 이 된다.
+CATCH_UP_SLACK_SEC = 300
+NET_PROBE_URL = "https://api.telegram.org"
+NET_WAIT_SEC = 10
+NET_WAIT_TRIES = 6
+
 
 @dataclass
 class Step:
@@ -176,6 +196,11 @@ class Job:
     quiet_ok
         정상/스킵일 때 알림을 보내지 않는다. flash 전용이다 — 5분마다
         "스킵" 을 보내면 하루 84건이 나간다. 실패는 항상 보낸다.
+    cron
+        Hermes 에 등록한 cron 식 (AGENTS 의 등록된 잡 표와 같은 값).
+        Hermes 는 no-agent 스크립트에 예정 시각을 넘기지 않으므로, 지금이
+        catch-up 인지는 이 식의 직전 예정 시각으로 여기서 계산한다.
+        분·시가 고정이 아닌 식(flash 의 */5)은 지연 계산 대상이 아니다.
     """
 
     name: str
@@ -185,6 +210,7 @@ class Job:
     once_per_day: bool = True
     quiet_ok: bool = False
     marker: str = ""
+    cron: str = ""
 
     @property
     def marker_path(self) -> str:
@@ -197,23 +223,26 @@ def _one(name: str, args: list[str], **kw) -> tuple[Step, ...]:
 
 JOBS: dict[str, Job] = {
     "nightly": Job("nightly", "nightly", "\U0001f319", STEPS,
-                   marker=DONE_MARKER),
+                   marker=DONE_MARKER, cron="30 21 * * *"),
     # 수집 전용. 발송하지 않으므로 중복이 나가도 사람에게 보이지는
     # 않지만, 같은 소스를 하루 두 번 긁을 이유가 없다.
-    "news": Job("news", "news", "\U0001f4f0", _one("news", ["--mode", "news"])),
+    "news": Job("news", "news", "\U0001f4f0", _one("news", ["--mode", "news"]),
+                cron="0 6 * * 1-5"),
     # --no-collect: 06:00 news 가 이미 수집했다. 수집과 발송을 분리해야
     # 한 소스가 느려도 브리핑 시각이 밀리지 않는다.
     "brief-morning": Job("brief-morning", "아침 브리핑", "\U0001f305",
                          _one("brief-morning",
-                              ["--mode", "brief-morning", "--no-collect"])),
+                              ["--mode", "brief-morning", "--no-collect"]),
+                         cron="20 6 * * 1-5"),
     "brief-evening": Job("brief-evening", "저녁 브리핑", "\U0001f303",
-                         _one("brief-evening", ["--mode", "brief-evening"])),
+                         _one("brief-evening", ["--mode", "brief-evening"]),
+                         cron="30 22 * * 1-5"),
     "weekly": Job("weekly", "주간 리포트", "\U0001f4c8",
-                  _one("weekly", ["--mode", "weekly"])),
+                  _one("weekly", ["--mode", "weekly"]), cron="45 22 * * 5"),
     # 장중 5분 간격. 마커도 완료 알림도 없다.
     "flash": Job("flash", "flash", "\u26a1",
                  _one("flash", ["--mode", "flash", *FLASH_EXTRA_ARGS]),
-                 once_per_day=False, quiet_ok=True),
+                 once_per_day=False, quiet_ok=True, cron="*/5 9-15 * * 1-5"),
 }
 
 
@@ -287,6 +316,110 @@ def _mark_done(path: Path, day: str, rc: int, reason: str) -> None:
     except OSError as exc:
         log_fallback = f"완주 마커 기록 실패 (무시): {exc}"
         print(log_fallback, file=sys.stderr)
+
+
+def _with_alert(reason: str, sent: bool | None) -> str:
+    """알림이 실패했으면 마커 reason 에 꼬리표를 붙인다."""
+    return f"{reason} · {ALERT_FAILED}" if sent is False else reason
+
+
+def last_slot(expr: str, now: datetime) -> datetime | None:
+    """cron 식의 직전 예정 시각 (now 이하). 분·시가 고정인 식만 다룬다.
+
+    요일 필드는 cron 규약(0·7=일, 1=월)으로 `*` · `1-5` · `5` · `1,3` 을
+    읽는다. 일·월 필드가 `*` 가 아니거나 분·시가 `*/5` 같은 식이면 None.
+    """
+    parts = expr.split()
+    if len(parts) != 5 or parts[2] != "*" or parts[3] != "*":
+        return None
+    try:
+        minute, hour = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    dows = _cron_dows(parts[4])
+    if dows is None:
+        return None
+    base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    for back in range(8):
+        slot = base - timedelta(days=back)
+        if slot <= now and (slot.weekday() + 1) % 7 in dows:
+            return slot
+    return None
+
+
+def _cron_dows(field: str) -> set[int] | None:
+    if field == "*":
+        return set(range(7))
+    out: set[int] = set()
+    for tok in field.split(","):
+        lo, _, hi = tok.partition("-")
+        try:
+            a, b = int(lo), int(hi or lo)
+        except ValueError:
+            return None
+        out.update(d % 7 for d in range(a, b + 1))
+    return out or None
+
+
+def lateness_seconds(job: Job, now: datetime) -> float | None:
+    """직전 예정 시각에서 몇 초 늦게 떴나. 예정 시각을 모르면 None."""
+    slot = last_slot(job.cron, now) if job.cron else None
+    return None if slot is None else (now - slot).total_seconds()
+
+
+def _fmt_late(sec: float) -> str:
+    return f"{sec / 3600:.1f}시간" if sec >= 3600 else f"{sec / 60:.0f}분"
+
+
+def _redact(text: str) -> str:
+    """봇 토큰을 지운다. requests 의 연결 오류는 요청 URL
+    (`/bot<토큰>/sendMessage`)을 메시지에 그대로 싣는다."""
+    tok = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+    if tok:
+        text = text.replace(tok, "***")
+    return re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot***", text)
+
+
+def _net_probe() -> str | None:
+    """텔레그램 API 에 HEAD 1회. 닿으면 None, 못 닿으면 에러 문자열.
+
+    응답 코드는 보지 않는다. 302 든 404 든 응답이 왔으면 DNS·TCP·TLS 가
+    됐다는 뜻이고, 여기서 알고 싶은 건 그것뿐이다.
+    """
+    try:
+        import requests
+        requests.head(NET_PROBE_URL, timeout=5, allow_redirects=False)
+        return None
+    except Exception as exc:                      # noqa: BLE001
+        return f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
+# 대기 함수. smoke 가 바꿔 끼워 60초를 실제로 기다리지 않는다.
+_sleep = time.sleep
+
+
+def wait_for_network(log: Log) -> tuple[int, bool]:
+    """닿을 때까지 NET_WAIT_SEC 간격으로 최대 NET_WAIT_TRIES 회 기다린다.
+
+    반환은 (대기한 초, 닿았는가). 끝내 안 닿아도 진행한다 — 단계마다 자기
+    실패 판정이 있고, 여기서 멈추면 그날은 로그 말고 아무 기록도 남지 않는다.
+    """
+    err = _net_probe()
+    if err is None:
+        log("네트워크 확인됨")
+        return 0, True
+    waited = 0
+    for i in range(1, NET_WAIT_TRIES + 1):
+        log(f"네트워크 대기 {i}/{NET_WAIT_TRIES} — {_redact(err)} · "
+            f"{NET_WAIT_SEC}초 후 재확인")
+        _sleep(NET_WAIT_SEC)
+        waited += NET_WAIT_SEC
+        err = _net_probe()
+        if err is None:
+            log(f"네트워크 확인됨 ({waited}초 대기)")
+            return waited, True
+    log(f"네트워크 미확인 — {waited}초 대기 후 그대로 진행 ({_redact(err)})")
+    return waited, False
 
 
 def _python() -> list[str]:
@@ -460,21 +593,36 @@ def _health_override(step: Step, state: str, note: str,
 
 
 def _notify(text: str, log: Log, enabled: bool,
-            why: str = "--no-telegram") -> None:
-    """텔레그램 1건. 실패해도 파이프라인 결과를 바꾸지 않는다."""
+            why: str = "--no-telegram") -> bool | None:
+    """텔레그램 1건. 반환은 True 발송 · False 실패 · None 보내지 않음.
+
+    단계 결과는 바꾸지 않는다. 대신 호출부가 종료 코드를 2 로 올리고 마커
+    reason 에 '알림 실패' 를 남긴다. 실패 원문은 여기서 로그에 쓴다 —
+    2026-09-13 에는 '무응답' 만 남아 타임아웃인지 연결 불가인지 알 수
+    없었다. 발송 모듈의 경고는 stderr 로만 나가고, Hermes 래퍼는 rc 가
+    0·2·3 이면 자식 stderr 를 버린다.
+    """
     if not enabled:
         log(f"알림 생략 ({why})")
-        return
+        return None
     try:
         from stocknews.notify import TelegramNotConfigured, send_telegram
         try:
             rep = send_telegram(text)
-            log("알림 발송 " + ("완료" if rep else rep.summary()))
         except TelegramNotConfigured:
             # 토큰이 없는 것은 설정 문제다. 파이프라인 실패가 아니다.
             log("알림 생략 — TELEGRAM_BOT_TOKEN / CHAT_ID 미설정")
+            return None
+        if rep:
+            log("알림 발송 완료")
+            return True
+        log("알림 " + rep.summary())
+        for f in rep.failures:
+            log(f"  {f.chat} {f.status or '무응답'} · {_redact(f.error)}")
+        return False
     except Exception as exc:                      # noqa: BLE001
-        log(f"알림 발송 중 오류 (무시): {type(exc).__name__}: {exc}")
+        log(f"알림 발송 중 오류: {type(exc).__name__}: {_redact(str(exc))}")
+        return False
 
 
 def _summary(job: Job, started: datetime, finished: datetime,
@@ -596,7 +744,28 @@ def main(argv: list[str] | None = None) -> int:
     rc_final = 0
     day = f"{started:%Y-%m-%d}"
     marker = REPO / (args.done_marker or job.marker_path)
+    wait_note = ""
+
+    def noted(text: str) -> str:
+        """알림 끝에 catch-up 대기 사실을 붙인다 (대기가 있었을 때만)."""
+        return f"{text}\n{wait_note}" if wait_note else text
+
     try:
+        # ── catch-up 이면 네트워크부터 ──
+        # 절전·종료로 밀린 회차는 PC 가 깨어난 직후에 뜬다. 그때는 망이
+        # 아직 없을 수 있다(09-08 DNS, 09-13 Wi-Fi 전환). 마커 확인보다
+        # 앞에 두는 이유는 '이미 실행' 스킵도 알림을 보내기 때문이다.
+        late = lateness_seconds(job, started)
+        if late is not None and late > CATCH_UP_SLACK_SEC:
+            slot = started - timedelta(seconds=late)
+            log(f"catch-up 실행 — 예정 {slot:%m-%d %H:%M} 보다 "
+                f"{_fmt_late(late)} 늦음 · 네트워크 확인")
+            waited, net_ok = wait_for_network(log)
+            if waited:
+                wait_note = (f"⏳ catch-up({_fmt_late(late)} 지연) · "
+                             f"네트워크 대기 {waited}초"
+                             + ("" if net_ok else " · 미확인 상태로 진행"))
+
         # ── 오늘 이미 돌았으면 스킵 ──
         # 반드시 락을 잡은 뒤에 본다. 순서를 뒤집으면 동시에 뜬 두
         # 프로세스가 같은 마커를 읽고 둘 다 '아직 안 돌았다'로 판정한다.
@@ -616,12 +785,15 @@ def main(argv: list[str] | None = None) -> int:
             # 으로 이어진다. 스킵도 결과다 — 결과는 보고한다.
             # '이미 완주'라고 쓰지 않는다. reason 이 '부분 완료'·'부분 실패'
             # 일 수 있다.
-            _notify(f"{job.emoji} {job.label} 스킵 {started:%m/%d %H:%M} | "
-                    f"오늘 이미 실행({done.get('reason')})",
-                    log, notify_on and not job.quiet_ok,
-                    why="--no-telegram" if not notify_on else "quiet_ok 잡")
-            log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit 0")
-            return 0
+            # 마커는 이미 있으므로 다시 쓰지 않는다. 알림 실패는 exit 2 로만 남긴다.
+            sent = _notify(noted(f"{job.emoji} {job.label} 스킵 "
+                                 f"{started:%m/%d %H:%M} | "
+                                 f"오늘 이미 실행({done.get('reason')})"),
+                           log, notify_on and not job.quiet_ok,
+                           why="--no-telegram" if not notify_on else "quiet_ok 잡")
+            rc = 2 if sent is False else 0
+            log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit {rc}")
+            return rc
 
         # ── 휴장일 판정 ──
         when = args.check_date or started
@@ -641,15 +813,18 @@ def main(argv: list[str] | None = None) -> int:
         log(f"거래일 판정 {when_s} -> {status}")
         if status in (CLOSED_WEEKEND, CLOSED_HOLIDAY) and not args.force:
             log(f"휴장 — 스킵 ({status})")
+            sent = _notify(noted(f"{job.emoji} {job.label} 스킵 "
+                                 f"{started:%m/%d %H:%M} | 휴장({status})"),
+                           log, notify_on and not job.quiet_ok,
+                           why="--no-telegram" if not notify_on else "quiet_ok 잡")
+            rc = 2 if sent is False else 0
             # 휴장 판정도 '오늘 할 일을 끝냈다'이다. 기록해 두지 않으면
             # catch-up 이 뜰 때마다 같은 판정을 반복하고 알림도 반복된다.
+            # 마커는 발송 결과를 본 뒤에 쓴다 — 알림 실패를 reason 에 남긴다.
             if job.once_per_day:
-                _mark_done(marker, day, 0, f"휴장({status})")
-            log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit 0")
-            _notify(f"{job.emoji} {job.label} 스킵 {started:%m/%d %H:%M} | "
-                    f"휴장({status})", log, notify_on and not job.quiet_ok,
-                    why="--no-telegram" if not notify_on else "quiet_ok 잡")
-            return 0
+                _mark_done(marker, day, rc, _with_alert(f"휴장({status})", sent))
+            log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit {rc}")
+            return rc
 
         # ── 단계 실행 ──
         results: list[dict] = []
@@ -667,20 +842,26 @@ def main(argv: list[str] | None = None) -> int:
 
         fails = [r for r in results if r["state"] == "fail"]
         rc_final = 2 if fails else 0
+        text = noted(_summary(job, started, finished, results, job_dry))
+        # quiet_ok 잡은 실패일 때만 알린다. flash 는 5분마다 돌아서
+        # 정상 보고를 매번 보내면 하루 84건이 나간다.
+        sent = _notify(text, log, notify_on and (bool(fails) or not job.quiet_ok),
+                       why="--no-telegram" if not notify_on
+                           else "quiet_ok 잡 · 실패 없음")
+        if sent is False:
+            rc_final = 2
         # 부분 실패(exit 2)·부분 완료도 마커는 남긴다. nightly.py 의 설계
         # 원칙 1 이 '한 단계가 실패해도 다음 단계는 돈다'이므로, 여기
         # 도달했다는 건 모든 단계를 한 번씩 시도했다는 뜻이다. 재시도는
         # 사람이 --force 로 판단한다 — 자동 재시도는 장중 재실행으로 이어져
         # 부분 적재를 만든다. reason 은 _outcome 이 정한다.
+        #
+        # 마커는 발송 뒤에 쓴다. 앞에 쓰면 알림이 새도 마커는 '완주'로 남아
+        # 누락을 알 길이 없다 (2026-09-13).
         if job.once_per_day:
-            _mark_done(marker, day, rc_final, _outcome(results))
-        text = _summary(job, started, finished, results, job_dry)
-        log(f"{job.name} 종료 {finished:%H:%M:%S} · exit {rc_final}")
-        # quiet_ok 잡은 실패일 때만 알린다. flash 는 5분마다 돌아서
-        # 정상 보고를 매번 보내면 하루 84건이 나간다.
-        _notify(text, log, notify_on and (bool(fails) or not job.quiet_ok),
-                why="--no-telegram" if not notify_on
-                    else "quiet_ok 잡 · 실패 없음")
+            _mark_done(marker, day, rc_final,
+                       _with_alert(_outcome(results), sent))
+        log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit {rc_final}")
         return rc_final
 
     except BaseException as exc:                  # noqa: BLE001
@@ -689,8 +870,8 @@ def main(argv: list[str] | None = None) -> int:
         import traceback
         log("파이프라인 실패:")
         log.raw(traceback.format_exc())
-        _notify(f"🚨 {job.label} 실패 {started:%m/%d %H:%M} | "
-                f"{type(exc).__name__}: {str(exc)[:160]}", log, notify_on)
+        _notify(noted(f"🚨 {job.label} 실패 {started:%m/%d %H:%M} | "
+                      f"{type(exc).__name__}: {str(exc)[:160]}"), log, notify_on)
         return 1
     finally:
         lock.release()

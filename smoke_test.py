@@ -3296,7 +3296,7 @@ def test_market_source(tmp: Path):
         root.mkdir(parents=True, exist_ok=True)
         sent: list[str] = []
         saved = (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
-                 mod._notify)
+                 mod._notify, mod._net_probe)
         try:
             mod.REPO = root
             mod.load_env = lambda *a, **k: {"exists": True, "path": ""}
@@ -3305,6 +3305,8 @@ def test_market_source(tmp: Path):
                 step.name, **({"rows": 0, "holidays_skipped": 1}
                               if step.name == "update" else {}))
             mod._notify = lambda text, log, enabled, why="": sent.append(text)
+            # 실제 시계라 catch-up 으로 판정될 수 있다. 네트워크는 쓰지 않는다.
+            mod._net_probe = lambda: None
             argv = ["--db", str(root / "q.db"),
                     "--lock-dir", str(root / "locks")]
             with contextlib.redirect_stderr(io.StringIO()):
@@ -3315,11 +3317,168 @@ def test_market_source(tmp: Path):
                 rc2 = mod.main(argv)
         finally:
             (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
-             mod._notify) = saved
+             mod._notify, mod._net_probe) = saved
         assert rc1 == 0 and rc2 == 0, (rc1, rc2)
         assert done["reason"] == "부분 완료", done
         assert "nightly 부분 완료" in first, first
         assert "이미 완주" not in sent[-1] and "부분 완료" in sent[-1], sent[-1]
+
+    def t_nightly_alert_failure_marks_after_send():
+        """자체 알림 실패: 원문은 로그에, 마커는 발송 뒤 '알림 실패'·exit 2 (09-13)."""
+        import contextlib
+        import io
+        import json as _j
+        import stocknews.notify as nt
+        mod = _nightly()
+
+        # requests 연결 오류는 요청 URL(봇 토큰 포함)을 메시지에 싣는다.
+        fake_tok = "123456789:FAKEtoken_value-xyz"
+        err = ("ConnectionError: HTTPSConnectionPool(host='api.telegram.org', "
+               f"port=443): Max retries exceeded with url: /bot{fake_tok}"
+               "/sendMessage (Caused by NameResolutionError: getaddrinfo failed)")
+
+        def res(name, **payload):
+            return {"name": name, "rc": 0, "state": "ok", "note": "",
+                    "detail": "", "elapsed": 0.0, "json": payload}
+
+        cases = (("OPEN", "완주 · 알림 실패"),
+                 (mod.CLOSED_WEEKEND, f"휴장({mod.CLOSED_WEEKEND}) · 알림 실패"))
+        saved = (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
+                 mod._net_probe, nt.send_telegram)
+        try:
+            for status, want_reason in cases:
+                root = tmp / f"nightly_alert_{status.lower()}"
+                root.mkdir(parents=True, exist_ok=True)
+                marker = root / mod.DONE_MARKER
+                seen_marker: list[bool] = []
+
+                def fake_send(text, *a, **k):
+                    seen_marker.append(marker.exists())
+                    return nt.SendReport(sent=1, failures=(
+                        nt.SendFailure("****2467", None, err),))
+
+                mod.REPO = root
+                mod.load_env = lambda *a, **k: {"exists": True, "path": ""}
+                mod.market_status = lambda store, when, s=status: s
+                mod._run_step = lambda step, dry, log, timeout: res(
+                    step.name, **({"rows": 2419} if step.name == "update"
+                                  else {}))
+                mod._net_probe = lambda: None
+                nt.send_telegram = fake_send
+                argv = ["--db", str(root / "q.db"),
+                        "--lock-dir", str(root / "locks")]
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rc = mod.main(argv)
+
+                assert rc == 2, (status, rc)
+                assert seen_marker == [False], \
+                    f"{status}: 마커가 발송보다 먼저 써졌다 {seen_marker}"
+                done = _j.loads(marker.read_text(encoding="utf-8"))
+                assert done["reason"] == want_reason, done
+                assert done["exit"] == 2, done
+                logtxt = "".join(p.read_text(encoding="utf-8")
+                                 for p in (root / "logs").glob("nightly_*.log"))
+                assert "getaddrinfo failed" in logtxt, logtxt[-600:]
+                assert "****2467" in logtxt, logtxt[-600:]
+                assert fake_tok not in logtxt, "봇 토큰이 로그에 남았다"
+                assert f"exit 2" in logtxt, logtxt[-600:]
+        finally:
+            (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
+             mod._net_probe, nt.send_telegram) = saved
+
+    def t_nightly_catch_up_waits_for_network():
+        """catch-up 이면 시작 전 네트워크 확인 — 10초 간격 최대 6회, 대기는 로그·알림에."""
+        import contextlib
+        import io
+        from datetime import timedelta as _td, timezone as _tz
+        mod = _nightly()
+        kst = _tz(_td(hours=9))
+
+        def t(*a):
+            return datetime(*a, tzinfo=kst)
+
+        # 직전 예정 시각. 2026-09-13(일) 17:36:43 은 9/12 21:30 회차의 catch-up
+        nj = mod.JOBS["nightly"]
+        now = t(2026, 9, 13, 17, 36, 43)
+        assert mod.lateness_seconds(nj, now) == \
+            (now - t(2026, 9, 12, 21, 30)).total_seconds()
+        assert mod.lateness_seconds(nj, t(2026, 9, 13, 21, 30, 2)) == 2.0
+        # 평일 잡: 월 05:00 의 직전 06:20 은 금요일
+        mon = t(2026, 9, 14, 5, 0)
+        assert mod.lateness_seconds(mod.JOBS["brief-morning"], mon) == \
+            (mon - t(2026, 9, 11, 6, 20)).total_seconds()
+        assert mod.lateness_seconds(mod.JOBS["weekly"], t(2026, 9, 12, 9, 0)) \
+            == (t(2026, 9, 12, 9, 0) - t(2026, 9, 11, 22, 45)).total_seconds()
+        assert mod.lateness_seconds(mod.JOBS["flash"], mon) is None
+
+        def run(name, clock, probe_results):
+            root = tmp / f"nightly_net_{name}"
+            root.mkdir(parents=True, exist_ok=True)
+            sent: list[str] = []
+            sleeps: list[float] = []
+            probes: list[int] = []
+            steps: list[str] = []
+            queue = list(probe_results)
+
+            def probe():
+                probes.append(1)
+                return queue.pop(0) if queue else None
+
+            saved = (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
+                     mod._notify, mod._net_probe, mod._sleep, mod.now_kst)
+            try:
+                mod.REPO = root
+                mod.load_env = lambda *a, **k: {"exists": True, "path": ""}
+                mod.market_status = lambda store, when: "OPEN"
+                mod._run_step = lambda step, dry, log, timeout: (
+                    steps.append(step.name),
+                    {"name": step.name, "rc": 0, "state": "ok", "note": "",
+                     "detail": "", "elapsed": 0.0,
+                     "json": {"rows": 2419} if step.name == "update" else {}},
+                )[1]
+                mod._notify = lambda text, log, enabled, why="": (
+                    sent.append(text), True)[1]
+                mod._net_probe = probe
+                mod._sleep = sleeps.append
+                mod.now_kst = lambda: clock
+                argv = ["--db", str(root / "q.db"),
+                        "--lock-dir", str(root / "locks")]
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rc = mod.main(argv)
+            finally:
+                (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
+                 mod._notify, mod._net_probe, mod._sleep, mod.now_kst) = saved
+            logtxt = "".join(p.read_text(encoding="utf-8")
+                             for p in (root / "logs").glob("*.log"))
+            return rc, sent, sleeps, probes, steps, logtxt
+
+        down = "ConnectionError: getaddrinfo failed"
+
+        # 두 번 못 닿고 세 번째에 닿음 -> 20초 대기, 알림에 남는다
+        rc, sent, sleeps, probes, steps, logtxt = run(
+            "recovers", now, [down, down, None])
+        assert rc == 0, rc
+        assert sleeps == [10, 10], sleeps
+        assert len(probes) == 3, probes
+        assert "catch-up 실행" in logtxt and "네트워크 대기 2/6" in logtxt, logtxt
+        assert "네트워크 확인됨 (20초 대기)" in logtxt, logtxt
+        assert sent and "네트워크 대기 20초" in sent[-1], sent
+        assert steps and steps[0] == "master", steps
+
+        # 끝내 못 닿음 -> 10초 x 6회 뒤 그대로 진행
+        rc, sent, sleeps, probes, steps, logtxt = run(
+            "never", now, [down] * 10)
+        assert sleeps == [10] * 6, sleeps
+        assert len(probes) == 7, probes
+        assert "네트워크 미확인 — 60초 대기 후 그대로 진행" in logtxt, logtxt
+        assert sent and "미확인 상태로 진행" in sent[-1], sent
+        assert len(steps) == len(mod.STEPS), "대기 후 단계를 건너뛰었다"
+
+        # 제시간 실행(21:30:02)은 확인하지 않는다
+        rc, sent, sleeps, probes, steps, logtxt = run(
+            "on_time", t(2026, 9, 13, 21, 30, 2), [down])
+        assert probes == [] and sleeps == [], (probes, sleeps)
+        assert "catch-up" not in logtxt and "⏳" not in sent[-1], sent[-1]
 
     def t_snapshot_path_used():
         """스냅샷이 검증되면 요청 1회로 적재된다."""
@@ -3367,6 +3526,8 @@ def test_market_source(tmp: Path):
     check("market_source", "소스 장애를 실패로 집계", t_nightly_counts_outage_as_failure)
     check("market_source", "credit-kiwoom exit 4 스킵/실패 구분", t_nightly_credit_kiwoom_rc4)
     check("market_source", "update 0건은 부분 완료", t_nightly_zero_rows_is_partial_done)
+    check("market_source", "nightly 알림 실패: 원문 로그·마커 뒤·exit 2", t_nightly_alert_failure_marks_after_send)
+    check("market_source", "catch-up 네트워크 대기 (10초×최대 6회)", t_nightly_catch_up_waits_for_network)
     check("market_source", "스냅샷 경로 적재", t_snapshot_path_used)
     check("market_source", "주말 즉시 생략", t_weekend_short_circuits)
 
