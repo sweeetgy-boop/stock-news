@@ -3512,6 +3512,86 @@ def test_market_source(tmp: Path):
         finally:
             uni.market_snapshot, uni.close_on = s_snap, s_close
 
+    def t_nightly_lock_skip_says_why():
+        """rc=3 으로 비킨 회차는 사유를 알림에 적는다 (2026-09-16).
+
+        저녁 브리핑이 nightly 와 겹치면 DB 락에 막혀 rc=3 으로 끝난다.
+        예전 알림은 "brief-evening(rc=3)" 이 전부라, 받은 사람이 할 수
+        있는 일이 로그를 여는 것뿐이었다.
+        """
+        import contextlib
+        import io
+        import os as _os
+        from datetime import datetime as _dt
+        mod = _nightly()
+        job = mod.JOBS["brief-evening"]
+        step = job.steps[0]
+
+        # 22:30 -> 23:00. nightly 최악 경로에 여유를 준 값이다.
+        assert job.cron == "0 23 * * 1-5", job.cron
+
+        def judged(holder):
+            return mod._judge(step, 3, "", {"locked_by": holder})
+
+        # nightly 가 쥐고 있으면 그렇게 적는다.
+        state, note, detail = judged({"job": "nightly", "mode": "daily",
+                                      "started": "2026-09-16T22:58:03"})
+        assert state == "fail", state          # 브리핑은 실제로 안 나갔다
+        assert "nightly 진행 중이라 스킵" in note, note
+        assert "daily 단계" in note and "22:58:03" in note, note
+        assert detail == note, (detail, note)
+        # 잡 표시가 없는 옛 락도 모드 이름으로 되짚는다.
+        assert "nightly 진행 중" in judged({"mode": "flags"})[1]
+        # news 는 06:00 잡과 겹치는 이름이다. nightly 라고 단정하지 않는다.
+        assert "nightly" not in judged({"mode": "news"})[1]
+        # 점유자 정보가 없어도 문장은 나온다.
+        assert "점유자 불명" in judged({})[1]
+
+        # 요약문은 이름만 머리줄에 적고 사유는 따로 한 줄로 내린다.
+        res = [{"name": step.name, "rc": 3, "state": state, "note": note,
+                "detail": detail, "elapsed": 0.4, "json": {}}]
+        text = mod._summary(job, _dt(2026, 9, 16, 23, 0),
+                            _dt(2026, 9, 16, 23, 0, 1), res, False)
+        assert "brief-evening 실패: nightly 진행 중이라 스킵" in text, text
+
+        # 락 파일에 잡 이름이 실려야 위 판정이 성립한다.
+        saved_env = _os.environ.get("STOCKNEWS_JOB")
+        try:
+            _os.environ["STOCKNEWS_JOB"] = "nightly"
+            lk = mod.JobLock("quant", mode="daily",
+                             lock_dir=str(tmp / "lock_job_tag"))
+            assert lk.acquire()
+            assert lk._read().get("job") == "nightly", lk._read()
+            lk.release()
+        finally:
+            if saved_env is None:
+                _os.environ.pop("STOCKNEWS_JOB", None)
+            else:
+                _os.environ["STOCKNEWS_JOB"] = saved_env
+
+        # 드라이버 락이 잡혀 있으면 exit 3 이고, 그때도 알림이 나간다.
+        root = tmp / "nightly_busy"
+        root.mkdir(parents=True, exist_ok=True)
+        sent = []
+        saved = (mod.REPO, mod.load_env, mod.market_status, mod._notify)
+        try:
+            mod.REPO = root
+            mod.load_env = lambda *a, **k: {"exists": True, "path": ""}
+            mod.market_status = lambda store, when: "OPEN"
+            mod._notify = lambda text, log, enabled, why="": sent.append(text)
+            held = mod.JobLock("brief-evening", mode="brief-evening",
+                               lock_dir=str(root / "locks"))
+            assert held.acquire()
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = mod.main(["--job", "brief-evening",
+                               "--db", str(root / "q.db"),
+                               "--lock-dir", str(root / "locks")])
+        finally:
+            (mod.REPO, mod.load_env, mod.market_status, mod._notify) = saved
+        assert rc == 3, rc
+        assert len(sent) == 1, sent
+        assert "저녁 브리핑 스킵" in sent[0] and "잡 락 점유" in sent[0], sent[0]
+
     check("market_source", "스냅샷 컬럼 매핑", t_snap_mapping)
     check("market_source", "빈 스냅샷 거부", t_verify_empty)
     check("market_source", "기준종목 없으면 거부", t_verify_no_refs)
@@ -3528,6 +3608,7 @@ def test_market_source(tmp: Path):
     check("market_source", "update 0건은 부분 완료", t_nightly_zero_rows_is_partial_done)
     check("market_source", "nightly 알림 실패: 원문 로그·마커 뒤·exit 2", t_nightly_alert_failure_marks_after_send)
     check("market_source", "catch-up 네트워크 대기 (10초×최대 6회)", t_nightly_catch_up_waits_for_network)
+    check("market_source", "rc=3 은 사유를 알림에 적는다", t_nightly_lock_skip_says_why)
     check("market_source", "스냅샷 경로 적재", t_snapshot_path_used)
     check("market_source", "주말 즉시 생략", t_weekend_short_circuits)
 

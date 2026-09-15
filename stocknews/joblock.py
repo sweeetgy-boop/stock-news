@@ -111,6 +111,10 @@ class JobLock:
         return json.dumps({
             "pid": os.getpid(),
             "mode": self.mode,
+            # 어느 Hermes 잡이 쥐고 있는지. nightly.py 가 세운다. 모드
+            # 이름만으로는 nightly 의 news 단계와 06:00 news 잡을 구분할 수
+            # 없어서, 비켜난 쪽이 알림에 점유자를 지목하지 못했다.
+            "job": os.getenv("STOCKNEWS_JOB", ""),
             "started": now.isoformat(timespec="seconds"),
             "expires": (now + timedelta(seconds=self.timeout)
                         ).isoformat(timespec="seconds"),

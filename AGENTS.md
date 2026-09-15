@@ -113,6 +113,10 @@ exit 1 로 끝냅니다. 자세한 이유는 8-4장에 있습니다.
 낫게 만들지 않았습니다.
 
 exit 3 은 '다른 잡이 정말로 돌고 있다'는 뜻이므로 비켜주는 것이 맞습니다.
+비켜난 쪽은 조용히 끝내지 않습니다 — `nightly.py` 가 `locked_by` 의
+점유자(잡·모드·시작 시각)를 읽어 **"nightly 진행 중이라 스킵 (daily 단계가
+DB 락 점유 · 22:58:03 시작)"** 처럼 사유를 알림에 적습니다. 잡 자체가
+이중 실행으로 끝나는 경우(드라이버 락 점유, exit 3)도 같은 알림이 나갑니다.
 exit 4 는 순서가 틀렸거나 설정이 빠졌다는 뜻이고, exit 64 는 명령 자체가
 틀렸다는 뜻입니다. 셋 다 다시 걸어서 풀리는 문제가 아닙니다.
 
@@ -184,7 +188,7 @@ stock-news-news             0 6 * * 1-5       평일 06:00  stocknews_news.py
 stock-news-brief-morning    20 6 * * 1-5      평일 06:20  stocknews_brief_morning.py
 stock-news-flash            */5 9-15 * * 1-5  평일 5분    stocknews_flash.py    [paused]
 stock-news-nightly          30 21 * * *       매일 21:30  stocknews_nightly.py
-stock-news-brief-evening    30 22 * * 1-5     평일 22:30  stocknews_brief_evening.py
+stock-news-brief-evening    0 23 * * 1-5      평일 23:00  stocknews_brief_evening.py
 stock-news-weekly           45 22 * * 5       금 22:45    stocknews_weekly.py
 ```
 
@@ -206,10 +210,19 @@ stock-news-weekly           45 22 * * 5       금 22:45    stocknews_weekly.py
                   14:00~14:25 / 15:20~15:35)을 전부 덮는다. 창 밖 호출은
                   즉시 {"skipped":true} 로 끝난다.
 21:30 nightly     기존. master -> update -> flags -> ... -> daily -> exits
-22:30 brief-evening  ★ nightly 뒤여야 한다. 저녁 브리핑은 '오늘 추천
+23:00 brief-evening  ★ nightly 뒤여야 한다. 저녁 브리핑은 '오늘 추천
                   10선'을 recos 에서 읽는데, 그 행을 만드는 것이
                   nightly 의 daily 단계다. 앞에 두면 어제 것이 나간다.
                   구 스케줄(17:20/18:20)은 daily 가 16:05 이던 시절 값이다.
+
+                  ★ 2026-09-16 에 22:30 -> 23:00 으로 옮겼다. '뒤'로는
+                  부족하고 '충분히 뒤'여야 한다. nightly 의 최악 경로는
+                  이틀치 재적재에 KRX 스냅샷이 죽어 종목별 폴백까지
+                  떨어지는 밤이고(09-14~15), 그러면 21:30 에서 한 시간을
+                  넘긴다. 그때 22:30 브리핑은 daily 가 쥔 DB 락에 막혀
+                  rc=3 으로 비킨다 — 그날 저녁 브리핑은 나가지 않는다.
+                  30분을 더 주면 그 밤도 덮인다. 그래도 겹치면 알림이
+                  "nightly 진행 중이라 스킵"이라고 사유를 적는다.
 금 22:45 weekly    같은 이유. 금요일 스캔이 주간 집계에 들어가려면
                   nightly 뒤여야 한다. days_covered 가 4 가 아니라 5 가 된다.
 ```

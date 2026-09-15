@@ -27,7 +27,8 @@
   1   파이프라인 자체 실패 (락 획득 실패는 0 이 아니라 3)
   2   부분 실패 — 한 단계 이상 실패했으나 완주함, 또는 이 드라이버의
       완료·스킵 알림 발송이 실패함 (마커 reason 에 '알림 실패')
-  3   이중 실행 (락 점유 중)
+  3   이중 실행 (락 점유 중). 조용히 끝내지 않는다 — 누가 쥐고 있는지를
+      알림에 적는다. 단계가 락에 막혀 rc=3 으로 비킨 경우도 같다.
 
 이 파일이 유일한 진입점이다
 --------------------------
@@ -76,6 +77,11 @@ LOCK_TIMEOUT_SEC = 7200
 # 뜻이다. 그러면 기다릴 게 아니라 즉시 비켜야 한다. 잔류(만료) 락은
 # JobLock.acquire 가 대기 없이도 회수하므로 원래 의도했던 방어는 그대로다.
 LOCK_WAIT = "0"
+
+# run_screen 의 EXIT_LOCKED. 단계가 이 코드로 끝났다는 것은 '해보고
+# 실패했다'가 아니라 '락에 막혀 아예 못 돌았다'는 뜻이다. 둘을 같은
+# "rc=3" 으로 알리면 사람은 매번 로그를 열어봐야 한다.
+EXIT_LOCKED = 3
 
 # 텔레그램을 실제로 보내는 모드. 토큰이 없으면 exit 4 로 끝나므로
 # STOCKNEWS_SEND=1 이 아닐 때는 --dry-run 을 붙인다.
@@ -234,9 +240,12 @@ JOBS: dict[str, Job] = {
                          _one("brief-morning",
                               ["--mode", "brief-morning", "--no-collect"]),
                          cron="20 6 * * 1-5"),
+    # 23:00. 2026-09-16 에 22:30 에서 옮겼다. nightly(21:30)의 최악 경로
+    # — 이틀치 재적재 + 종목별 폴백 — 가 한 시간을 넘기면 22:30 의 저녁
+    # 브리핑이 daily 가 쥔 DB 락에 막혀 rc=3 으로 비킨다. 30분을 더 준다.
     "brief-evening": Job("brief-evening", "저녁 브리핑", "\U0001f303",
                          _one("brief-evening", ["--mode", "brief-evening"]),
-                         cron="30 22 * * 1-5"),
+                         cron="0 23 * * 1-5"),
     "weekly": Job("weekly", "주간 리포트", "\U0001f4c8",
                   _one("weekly", ["--mode", "weekly"]), cron="45 22 * * 5"),
     # 장중 5분 간격. 마커도 완료 알림도 없다.
@@ -244,6 +253,14 @@ JOBS: dict[str, Job] = {
                  _one("flash", ["--mode", "flash", *FLASH_EXTRA_ARGS]),
                  once_per_day=False, quiet_ok=True, cron="*/5 9-15 * * 1-5"),
 }
+
+
+# nightly 만 도는 모드. 다른 잡이 같은 이름의 모드를 돌지 않으므로, DB 락을
+# 이 이름으로 쥐고 있으면 그 점유자는 nightly 다. `news` 는 06:00 잡과
+# 겹치므로 빠진다 — 겹치는 이름으로 'nightly 진행 중'을 말하면 틀린다.
+_NIGHTLY_ONLY_MODES = frozenset(
+    {s.name for s in STEPS}
+    - {s.name for n, j in JOBS.items() if n != "nightly" for s in j.steps})
 
 
 def dry_jobs_from_env(value: str | None) -> set[str]:
@@ -520,6 +537,14 @@ def _judge(step: Step, rc: int | None, err: str,
     if rc == 2:
         # 부분 실패. 다음 잡은 계속한다(AGENTS 2장). 성공으로 세되 경고.
         return "warn", f"부분 실패 (실패 {payload.get('failed', '?')})", ""
+    if rc == EXIT_LOCKED:
+        # 락에 막혀 못 돈 단계다. '기대된 스킵'으로 세지 않는다 — 그날
+        # 저녁 브리핑은 실제로 나가지 않았고, 재시도는 하지 않는 것이
+        # 계약이므로(AGENTS 2장) 사람이 보게 두는 편이 맞다. 대신 왜
+        # 못 돌았는지를 알림에 문장으로 적는다. detail 로도 돌려주면
+        # 요약문이 이름만 머리줄에 적고 사유는 따로 한 줄로 내린다.
+        note = _locked_note(payload)
+        return "fail", note, note
     if rc == 64 and step.optional:
         return "skip", "미구현 모드", ""
     if rc in step.soft and (not step.soft_reasons
@@ -532,6 +557,35 @@ def _judge(step: Step, rc: int | None, err: str,
     if detail:
         return "fail", detail, detail
     return "fail", f"rc={rc}" + (f" {reason}" if reason else ""), ""
+
+
+def _locked_note(payload: dict, what: str = "DB 락") -> str:
+    """rc=3 의 사유 한 줄. 누가 쥐고 있었는지까지 사람 말로 적는다.
+
+    알림에 "rc=3" 다섯 글자만 실리면, 받은 사람이 할 수 있는 일은 로그를
+    여는 것뿐이다. 이 잡이 비킨 이유는 거의 항상 'nightly 가 아직 돌고
+    있다'이고, 그건 알림 한 줄로 끝날 이야기다.
+
+    점유자 정보는 run_screen 이 `--json` 의 `locked_by` 로 올려보낸다
+    (AGENTS 2장). 잡 이름(`job`)은 `STOCKNEWS_JOB` 에서 나오므로, 그 표시가
+    없는 옛 락 파일이면 모드 이름으로 되짚는다.
+    """
+    holder = payload.get("locked_by") or {}
+    job = str(holder.get("job") or "")
+    mode = str(holder.get("mode") or "")
+    # 락 파일의 시각은 오늘 것이다. 날짜까지 싣지 않는다 — 알림 한 줄에
+    # 들어가야 하고, 사람이 보고 싶은 건 '언제부터 붙잡고 있나'뿐이다.
+    since = str(holder.get("started") or "").split("T")[-1]
+    if job == "nightly" or (not job and mode in _NIGHTLY_ONLY_MODES):
+        head, who = "nightly 진행 중이라 스킵", f"{mode} 단계" if mode else "nightly"
+    elif job or mode:
+        head, who = f"{job or mode} 진행 중이라 스킵", mode or job
+    else:
+        return f"다른 잡 진행 중이라 스킵 · {what} 점유자 불명"
+    tail = f"{what} 점유: {who}"
+    if since:
+        tail += f" ({since} 시작)"
+    return f"{head} · {tail}"
 
 
 def _codes_detail(payload: dict) -> str:
@@ -702,6 +756,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     job = JOBS[args.job]
+    # 자식 단계가 잡는 DB 락에 '어느 잡이 쥐고 있는지'를 남긴다.
+    # STOCKNEWS_ENTRY 로는 구분되지 않는다 — 그 값은 어느 잡이든 "nightly"
+    # (드라이버 이름)라서, 락을 쥔 것이 nightly 인지 저녁 브리핑인지
+    # 말해주지 못한다. _child_env 가 os.environ 을 복사하므로 여기서 한 번
+    # 세우면 단계까지 전달되고, rc=3 알림이 점유자를 지목할 수 있다.
+    os.environ["STOCKNEWS_JOB"] = job.name
     started = now_kst()
     log = Log(REPO / "logs" / f"{job.name}_{started:%Y%m%d}.log")
     dry = os.getenv("STOCKNEWS_SEND") != "1"
@@ -737,6 +797,15 @@ def main(argv: list[str] | None = None) -> int:
         h = lock.holder
         log(f"이미 실행 중 — 즉시 종료 (pid={h.get('pid')} "
             f"시작={h.get('started')} 만료={h.get('expires')})")
+        # 조용히 3 으로 끝내면 사람에게 남는 것은 '오늘 브리핑이 안 왔다'
+        # 뿐이다. 휴장·'오늘 이미 실행' 스킵과 대칭으로 알리고, 사유를
+        # 적는다. 발송 결과로 종료 코드를 바꾸지는 않는다 — 3 은 '이중
+        # 실행'이라는 사실이고, 그 사실은 알림이 새도 변하지 않는다.
+        _notify(f"{job.emoji} {job.label} 스킵 {started:%m/%d %H:%M} | "
+                + _locked_note({"locked_by": h}, what="잡 락"),
+                log, notify_on and not job.quiet_ok,
+                why="--no-telegram" if not notify_on else "quiet_ok 잡")
+        log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit 3")
         log.close()
         return 3
     log(f"락 획득 {lock.path} (만료 {LOCK_TIMEOUT_SEC // 3600}시간)")
