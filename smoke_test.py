@@ -3631,7 +3631,9 @@ def test_krx_reconcile(tmp: Path):
 
     from stocknews import data as dmod
     from stocknews import universe as uni
-    from stocknews.reconcile import WARN_PCT, reconcile_day
+    from stocknews.config import RECONCILE_ADJ_SUSPECT_RATIO, RECONCILE_MIN_DATE
+    from stocknews.reconcile import (WARN_PCT, ReconcileRefused,
+                                     adjusted_price_like, reconcile_day)
     from stocknews.renderer import render_reconcile
     from stocknews.store import Store
 
@@ -3722,19 +3724,23 @@ def test_krx_reconcile(tmp: Path):
         return _pd.DataFrame([list(v) for v in spec.values()],
                              index=list(spec), columns=cols, dtype=float)
 
-    def _seed(st, rows):
+    def _seed(st, rows, day=DAY):
         """pykrx 잠정 행 (ticker, o,h,l,c,v,amt)."""
         for t, o, h, l, c, v, amt in rows:
             df = _pd.DataFrame({"시가": [o], "고가": [h], "저가": [l],
                                 "종가": [c], "거래량": [v], "거래대금": [amt]},
-                               index=_pd.to_datetime([DAY]))
+                               index=_pd.to_datetime([day]))
             st.upsert_prices(t, df, allow_today=True)
 
-    def _price(st, t):
+    def _price(st, t, day=DAY):
         with sqlite3.connect(st.path) as con:
             return con.execute(
                 "SELECT o,h,l,c,v,amt,source,is_final FROM prices "
-                "WHERE ticker=? AND d=?", (t, DAY)).fetchone()
+                "WHERE ticker=? AND d=?", (t, day)).fetchone()
+
+    def _diff_count(st):
+        with sqlite3.connect(st.path) as con:
+            return con.execute("SELECT COUNT(*) FROM price_diffs").fetchone()[0]
 
     def t_overwrite_and_diffs():
         st = Store(tmp / "recon.db")
@@ -3984,6 +3990,130 @@ def test_krx_reconcile(tmp: Path):
         rc, js, _ = _run(["--mode", "reconcile", "--date", "2026-09-16"], empty)
         assert rc == mod.EXIT_PRECOND and js["reason"] == "not_published", js
 
+
+    def t_min_date_refused():
+        """★ 백필 수정주가 구간은 실행 자체를 거부한다 (우회 옵션 없음)."""
+        assert RECONCILE_MIN_DATE == "2026-08-28", RECONCILE_MIN_DATE
+        st = Store(tmp / "recon_min.db")
+        BF = "2026-08-27"
+        _seed(st, [("380540", 100, 100, 100, 100, 1000, None)], day=BF)
+        krx = _krx_frame({"380540": (200, 200, 200, 200, 500, 1e5)})
+        for d in (BF, "20260827", "2024-09-12"):
+            try:
+                reconcile_day(st, d, krx)
+            except ReconcileRefused as exc:
+                assert exc.code == "before_min_date", exc.code
+                assert "RECONCILE_MIN_DATE" in exc.reason, exc.reason
+            else:
+                raise AssertionError(f"{d} 보정이 거부되지 않았다")
+        assert _price(st, "380540", BF) == (100, 100, 100, 100, 1000, None,
+                                            "pykrx", 0), "거부했는데 썼다"
+        assert _diff_count(st) == 0
+        # 경계일은 허용
+        _seed(st, [("005930", 10, 10, 10, 10, 5, None)], day=RECONCILE_MIN_DATE)
+        res = reconcile_day(st, RECONCILE_MIN_DATE,
+                            _krx_frame({"005930": (10, 10, 10, 10, 5, 50)}))
+        assert res["compared"] == 1, res
+
+    def t_adjusted_price_like():
+        base = {"o": 1000.0, "h": 1100.0, "l": 900.0, "c": 1000.0, "v": 5000.0}
+        krx = lambda o, h, l, c, v: {"시가": o, "고가": h, "저가": l,
+                                     "종가": c, "거래량": v}
+        # 액면분할 1/2: 가격 x0.5 · 거래량 x2
+        assert adjusted_price_like(base, krx(500, 550, 450, 500, 10000)) == (0.5, 2.0)
+        # 실측 247540 (2026-08-28 복구 행): 1.016 x 0.98426
+        got = adjusted_price_like({"c": 116339.0, "v": 287754.0},
+                                  {"종가": 118200.0, "거래량": 283225.0})
+        assert got is not None and abs(got[0] * got[1] - 1) < 1e-3, got
+        # 9/15 모양: 종가만 0.8% 다름 · 거래량 같음 -> 아님
+        assert adjusted_price_like(base, krx(1000, 1100, 900, 992, 5000)) is None
+        # 실측 000660 9/15: 종가 -1.3% · 거래량 +3.1% (곱 1.017) -> 아님
+        assert adjusted_price_like({"c": 1712000.0, "v": 2651098.0},
+                                   {"종가": 1690000.0, "거래량": 2732031.0}) is None
+        # 거래량만 다름 -> 아님
+        assert adjusted_price_like(base, krx(1000, 1100, 900, 1000, 5100)) is None
+        # 종가·거래량은 역수인데 고가가 같은 비율이 아님 -> 조정이 아니다
+        assert adjusted_price_like(base, krx(500, 1100, 450, 500, 10000)) is None
+
+    def _adj_case(name, n_adj, n_vol):
+        """수정주가 모양 n_adj 종목 + 거래량만 다른 n_vol 종목."""
+        st = Store(tmp / name)
+        seed, spec = [], {}
+        for i in range(n_adj):
+            t = f"1{i:04d}0"
+            seed.append((t, 2000, 2200, 1800, 2000, 1000, None))
+            spec[t] = (1000, 1100, 900, 1000, 2000, 2e6)
+        for i in range(n_vol):
+            t = f"2{i:04d}0"
+            seed.append((t, 500, 500, 500, 500, 1000, None))
+            spec[t] = (500, 500, 500, 500, 1010, 505000)
+        _seed(st, seed)
+        return st, _krx_frame(spec)
+
+    def t_adjusted_suspect_stops_before_write():
+        """★ 날짜와 무관한 방어. 10% 초과면 아무것도 쓰지 않고 중단."""
+        assert RECONCILE_ADJ_SUSPECT_RATIO == 0.10
+        st, krx = _adj_case("recon_adj_stop.db", n_adj=2, n_vol=8)   # 20%
+        try:
+            reconcile_day(st, DAY, krx)
+        except ReconcileRefused as exc:
+            assert exc.code == "adjusted_price_suspect", exc.code
+            assert exc.detail["adjusted_suspects"] == 2, exc.detail
+            assert exc.detail["diff_tickers"] == 10, exc.detail
+            assert "수정주가" in exc.reason, exc.reason
+        else:
+            raise AssertionError("수정주가 20% 인데 보정했다")
+        assert _price(st, "100000") == (2000, 2200, 1800, 2000, 1000, None,
+                                        "pykrx", 0), "중단했는데 썼다"
+        assert _price(st, "200000")[6] == "pykrx", "중단했는데 다른 종목을 썼다"
+        assert _diff_count(st) == 0
+
+        # 정확히 10% 는 '넘지' 않는다 -> 진행하고 의심 수를 보고한다
+        st2, krx2 = _adj_case("recon_adj_edge.db", n_adj=1, n_vol=9)
+        res = reconcile_day(st2, DAY, krx2)
+        assert res["adjusted_suspects"] == 1 and res["written"] == 10, res
+
+    def t_mode_refusals():
+        mod = importlib.import_module("run_screen")
+        calls = []
+
+        def _run(argv, fake, db):
+            saved = mod.krx_daily_prices
+            mod.krx_daily_prices = fake
+            so, se = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+                    rc = mod.main(argv + ["--db", str(db), "--no-lock",
+                                          "--dry-run", "--json",
+                                          "--env-file", str(tmp / "absent.env")])
+            finally:
+                mod.krx_daily_prices = saved
+            return rc, _json.loads(so.getvalue().strip())
+
+        def never(bas_dd, key=None, timeout=30.0, report=None):
+            calls.append(bas_dd)
+            raise AssertionError("금지 날짜인데 KRX 를 불렀다")
+
+        rc, js = _run(["--mode", "reconcile", "--date", "2026-08-27"], never,
+                      tmp / "recon_mode_min.db")
+        assert rc == mod.EXIT_USAGE, (rc, js)
+        assert js["reason"] == "before_min_date" and "2026-08-28" in js["refused"], js
+        assert calls == [], calls
+        assert not js.get("messages"), js
+
+        st, krx = _adj_case("recon_mode_adj.db", n_adj=3, n_vol=7)
+
+        def adj(bas_dd, key=None, timeout=30.0, report=None):
+            report.update({"status": "DATA", "rows": {}, "elapsed_sec": 0.1})
+            return krx
+        rc, js = _run(["--mode", "reconcile", "--date", DAY], adj, st.path)
+        assert rc == mod.EXIT_PRECOND, (rc, js)
+        assert js["reason"] == "adjusted_price_suspect", js
+        assert js["adjusted_suspects"] == 3 and js["adjusted_ratio"] == 0.3, js
+        assert not js.get("messages"), "중단했는데 보정 완료 알림이 나갔다"
+        assert _price(st, "100000")[6:] == ("pykrx", 0)
+        assert _diff_count(st) == 0
+
     check("krx_reconcile", "빈 응답 -> None (예외 없음)", t_empty_response_is_none)
     check("krx_reconcile", "호출 실패 -> None (예외 없음)", t_error_is_none_not_raise)
     check("krx_reconcile", "키 없음 -> None", t_no_key_is_none)
@@ -3996,6 +4126,10 @@ def test_krx_reconcile(tmp: Path):
     check("krx_reconcile", "스냅샷 영숫자 코드 유지", t_snapshot_keeps_alnum_codes)
     check("krx_reconcile", "마스터 KRX 기본정보 필터 병행", t_master_krx_filter_parallel)
     check("krx_reconcile", "--mode reconcile 전체 (scans·recos 불변)", t_mode_reconcile_end_to_end)
+    check("krx_reconcile", "RECONCILE_MIN_DATE 이전 거부 (백필 수정주가)", t_min_date_refused)
+    check("krx_reconcile", "수정주가 모양 판정 (분할·실측·오탐 방지)", t_adjusted_price_like)
+    check("krx_reconcile", "수정주가 10% 초과면 쓰기 전 중단", t_adjusted_suspect_stops_before_write)
+    check("krx_reconcile", "모드 거부 exit 64 / 4 · KRX 미호출 · 알림 없음", t_mode_refusals)
 
 
 def test_kiwoom(tmp: Path):

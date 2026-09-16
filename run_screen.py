@@ -83,7 +83,7 @@ from stocknews.krx_credit import diagnose as krx_diagnose
 from stocknews.krx_credit import refresh_credit_auto
 from stocknews.joblock import JobLock, clear_locks
 from stocknews.notify import TelegramNotConfigured, now_kst
-from stocknews.reconcile import reconcile_day
+from stocknews.reconcile import ReconcileRefused, date_refusal, reconcile_day
 from stocknews.trading_day import (is_definitely_closed, market_status,
                                    news_window_hours, should_scan_intraday)
 from stocknews.news import process_and_store, theme_shift
@@ -486,13 +486,21 @@ def mode_reconcile(store: Store, args) -> int:
     price_diffs 에 남긴다. scans · recos 는 다시 만들지 않는다.
 
     종료 코드
-      0  보정 완료 · 또는 휴장일이라 할 일 없음
-      1  KRX 호출 실패 / 한 시장만 응답
-      4  KRX_API_KEY 없음 · 거래일인데 아직 미공개(익영업일 08:00 전)
+      0   보정 완료 · 또는 휴장일이라 할 일 없음
+      1   KRX 호출 실패 / 한 시장만 응답
+      4   KRX_API_KEY 없음 · 거래일인데 아직 미공개(익영업일 08:00 전)
+          · 수정주가 의심으로 중단 (아무것도 쓰지 않음)
+      64  RECONCILE_MIN_DATE 이전 날짜 (백필 수정주가 구간, KRX 도 부르지 않음)
     """
     iso = _reconcile_target(store, args)
     bas_dd = iso.replace("-", "")
     SUMMARY["trade_date"] = iso
+
+    why = date_refusal(iso)
+    if why:
+        log.error("보정 거부: %s", why)
+        SUMMARY.update({"reason": "before_min_date", "refused": why})
+        return EXIT_USAGE
 
     rep: dict = {}
     krx = krx_daily_prices(bas_dd, report=rep)
@@ -517,8 +525,14 @@ def mode_reconcile(store: Store, args) -> int:
         SUMMARY["error"] = rep.get("error")
         return EXIT_FAIL
 
-    res = reconcile_day(store, iso, krx,
-                        universe=set(store.active_tickers()))
+    try:
+        res = reconcile_day(store, iso, krx,
+                            universe=set(store.active_tickers()))
+    except ReconcileRefused as exc:
+        log.error("보정 중단: %s", exc.reason)
+        SUMMARY.update({"reason": exc.code, "refused": exc.reason,
+                        **exc.detail})
+        return EXIT_PRECOND
     SUMMARY.update({k: v for k, v in res.items()
                     if k not in ("warnings", "missing_in_krx",
                                  "halted_in_krx")})
