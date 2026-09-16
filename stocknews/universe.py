@@ -22,7 +22,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from .data import (REF_PROBE_RETRIES, REF_TICKERS, close_on,
-                   close_on_status, market_snapshot, verify_snapshot_date)
+                   close_on_status, krx_base_info, market_snapshot,
+                   verify_snapshot_date)
 from .holidays import holiday_name
 from .trading_day import is_definitely_closed, market_status_reason
 from .trading_day import now_kst as _now_kst
@@ -33,7 +34,8 @@ __all__ = ["EXCLUDE_KEYWORDS", "is_tradable_name", "refresh_master",
            "fill_sectors", "sector_source", "SECTOR_LISTINGS",
            "fetch_day", "backfill_one", "liquidity_filter",
            "MARKETS_WANTED", "probe_refs", "load_floor",
-           "DAY_MIN_EXPECTED", "DAY_SHRINK_TOLERANCE", "JUDGE_AFTER_HOUR"]
+           "DAY_MIN_EXPECTED", "DAY_SHRINK_TOLERANCE", "JUDGE_AFTER_HOUR",
+           "krx_exclusion_reason", "latest_krx_base_info"]
 
 # 하루치 적재량 하한. refresh_master 의 (min_expected, shrink_tolerance) 와
 # 같은 논리다 — 직전 수준의 절반, 또는 절대 하한 중 큰 쪽.
@@ -73,14 +75,70 @@ def is_tradable_name(name: str) -> bool:
 
 
 def _is_common_share(code: str) -> bool:
-    """보통주만. 우선주는 종목코드 끝자리가 0이 아니다(005935 등)."""
+    """보통주만. 우선주는 종목코드 끝자리가 0이 아니다(005935 등).
+
+    영숫자 코드도 같은 규칙이다. 보통주 `0126Z0` / 우선주 `00088K`.
+    """
     return len(code) == 6 and code.endswith("0")
+
+
+# KRX 종목기본정보로 거르는 경로. 이름 키워드(EXCLUDE_KEYWORDS)·코드
+# 끝자리 규칙과 **병행**한다 — 둘 중 하나라도 배제하면 배제된다. 기존
+# 필터를 없애지 않는 이유는 기본정보를 못 받는 날(키 없음·장애)에도
+# 유니버스가 그대로여야 하기 때문이다.
+KRX_COMMON_KIND = "보통주"             # 구형우선주 · 신형우선주 · 종류주권 배제
+KRX_EXCLUDE_SECUGRP = ("부동산투자회사", "사회간접자본투융자회사", "투자회사")
+# 스팩은 증권구분 '주권' · 주식종류 '보통주' 라서 위 두 필드로는 안 걸린다
+# (2026-09-15 실측 66종목 전부). 코스닥 소속부로만 구분된다. 단 관리종목으로
+# 지정된 스팩은 소속부가 '관리종목(소속부없음)' 으로 바뀌어 이 판정을
+# 빠져나간다(같은 날 3종목). 그건 이름 키워드 필터가 받친다 — 병행하는 이유.
+KRX_SPAC_SECT_PREFIX = "SPAC"
+
+
+def krx_exclusion_reason(info: dict, include_preferred: bool = False
+                         ) -> str | None:
+    """KRX 종목기본정보 1행으로 배제 사유를 판정한다. 통과면 None."""
+    kind = str(info.get("주식종류") or "").strip()
+    grp = str(info.get("증권구분") or "").strip()
+    sect = str(info.get("소속부") or "").strip()
+    if sect.upper().startswith(KRX_SPAC_SECT_PREFIX):
+        return "스팩"
+    if grp in KRX_EXCLUDE_SECUGRP:
+        return grp
+    if not include_preferred and kind and kind != KRX_COMMON_KIND:
+        return kind
+    return None
+
+
+def latest_krx_base_info(on_date: str | None = None, lookback: int = 7,
+                         report: dict | None = None) -> pd.DataFrame | None:
+    """가장 최근에 열린 종목기본정보. 당일분은 익영업일 08:00 에 열린다.
+
+    어제부터 하루씩 거슬러 빈 응답이 아닌 첫 날짜를 쓴다. 키가 없거나
+    호출이 실패하면 더 거슬러 봐야 같은 결과라 바로 None 을 준다.
+    """
+    rep = report if report is not None else {}
+    base = (datetime.strptime(on_date, "%Y%m%d") if on_date
+            else _now_kst().replace(tzinfo=None))
+    for back in range(1, lookback + 1):
+        ds = (base - timedelta(days=back)).strftime("%Y%m%d")
+        sub: dict = {}
+        info = krx_base_info(ds, report=sub)
+        rep.update({"bas_dd": ds, "status": sub.get("status")})
+        if info is not None:
+            return info
+        if sub.get("status") != "EMPTY":
+            return None
+    return None
 
 
 def refresh_master(store, on_date: str | None = None,
                    include_preferred: bool = False,
                    min_expected: int = 500,
-                   shrink_tolerance: float = 0.5) -> int:
+                   shrink_tolerance: float = 0.5,
+                   krx_info: pd.DataFrame | None = None,
+                   use_krx_info: bool = True,
+                   report: dict | None = None) -> int:
     """전종목 목록 + 시가총액 + 상장주식수를 마스터 테이블에 반영.
 
     상장폐지된 종목은 active=0 으로 내려 스캔 대상에서 자동 제외된다.
@@ -102,24 +160,48 @@ def refresh_master(store, on_date: str | None = None,
     `mark_non_trading_day` 를 불렀는데, 소스 장애로 빈 결과가 오면 실제
     거래일이 영구히 휴장일로 박혀서 그 날짜를 두 번 다시 받지 못했다.
     휴장 판정은 주말/기지정 공휴일 같은 **적극적 근거**가 있을 때만 한다.
+
+    ★ KRX 종목기본정보 병행 필터
+    ----------------------------
+    `krx_info` (없으면 `use_krx_info` 일 때 직접 조회) 가 있으면 코드
+    끝자리·이름 키워드 필터를 통과한 종목에 `krx_exclusion_reason` 을
+    한 번 더 건다. 기본정보에 없는 종목은 기존 필터만 적용한다.
+    두 필터의 판정이 갈린 종목은 로그와 report 에 남긴다.
     """
     ds = on_date or _now_kst().strftime("%Y%m%d")
     iso = f"{ds[:4]}-{ds[4:6]}-{ds[6:8]}"
     rows: list[dict] = []
     alive: set[str] = set()
+    rep = report if report is not None else {}
 
     _, meta = market_snapshot()
+
+    if krx_info is None and use_krx_info and not meta.empty:
+        info_rep: dict = {}
+        krx_info = latest_krx_base_info(report=info_rep)
+        rep["krx_info"] = info_rep
+    legacy_only: dict[str, str] = {}  # 기존 필터는 배제, KRX 는 보통주
+    krx_only: dict[str, str] = {}    # 기존 필터는 통과, KRX 가 배제
 
     if not meta.empty and "종목명" in meta.columns:
         for code, r in meta.iterrows():
             code = str(code).zfill(6)
-            if not include_preferred and not _is_common_share(code):
-                continue
             mk = MARKETS_WANTED.get(str(r.get("시장", "")).strip().upper())
             if mk is None:
                 continue
             name = str(r.get("종목명") or code).strip()
-            if not is_tradable_name(name):
+            legacy_ok = ((include_preferred or _is_common_share(code))
+                         and is_tradable_name(name))
+            why = None
+            if krx_info is not None and code in krx_info.index:
+                why = krx_exclusion_reason(krx_info.loc[code].to_dict(),
+                                           include_preferred)
+                if not legacy_ok and why is None:
+                    legacy_only[code] = name
+            if not legacy_ok:
+                continue
+            if why is not None:
+                krx_only[code] = f"{name}({why})"
                 continue
             alive.add(code)
             mc = r.get("시가총액")
@@ -131,6 +213,27 @@ def refresh_master(store, on_date: str | None = None,
             })
     else:
         rows, alive = _refresh_master_pykrx(ds, include_preferred)
+
+    rep.update({"krx_filter": krx_info is not None, "alive": len(alive),
+                "krx_only_excluded": krx_only,
+                "legacy_only_excluded": len(legacy_only)})
+    if krx_info is None:
+        log.info("KRX 종목기본정보 없음 — 코드·이름 필터만 적용")
+    else:
+        log.info("KRX 종목기본정보 병행 필터: 추가 배제 %d · 기존 필터만 배제 "
+                 "%d (KRX 는 보통주로 봄)", len(krx_only), len(legacy_only))
+        if krx_only:
+            log.warning("기존 필터를 통과했으나 KRX 기본정보가 배제: %s",
+                        ", ".join(f"{c} {v}" for c, v
+                                  in list(krx_only.items())[:15]))
+        if legacy_only:
+            # 2026-09-16 실측 8종목. 이름 키워드 오탐 5(메리츠금융지주·
+            # 블리츠웨이엔터테인먼트 '리츠', YG PLUS 'PLUS', NICE인프라·
+            # 바이오인프라 '인프라') + 소속부가 '관리종목'이라 KRX 스팩
+            # 판정을 빠져나간 스팩 3. 병행이라 둘 다 배제 상태로 남는다.
+            log.info("기존 필터만 배제 (KRX 는 보통주): %s",
+                     ", ".join(f"{c} {n}" for c, n
+                               in list(legacy_only.items())[:15]))
 
     # ── 휴장일/조회실패 방어 ──
     prev = len(store.active_tickers())

@@ -45,8 +45,9 @@ KNOWN_KEYS: tuple[str, ...] = (
     "DART_API_KEY",
     "DATA_GO_KR_KEY",
     "KRX_CREDIT_BLD",
-    # KRX 오픈API 인증키. 아직 읽는 모드는 없지만 운영 .env 에 들어 있어서
-    # 여기 없으면 매 실행 "알 수 없는 키" 경고가 난다 (2026-09-10~).
+    # KRX 오픈API 인증키 (헤더 AUTH_KEY). reconcile 의 확정 시세와 master 의
+    # 종목기본정보 필터가 읽는다. 없으면 reconcile 은 exit 4, master 는
+    # 기존 코드·이름 필터만 쓴다.
     "KRX_API_KEY",
     "KIWOOM_APP_KEY",
     "KIWOOM_APP_SECRET",

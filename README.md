@@ -152,6 +152,7 @@ copy data\flags_manual.csv.example data\flags_manual.csv
 
 ```bash
 python run_screen.py --mode update          # 당일 시세 증분 (요청 2회, 수초)
+python run_screen.py --mode reconcile       # 전 거래일 시세를 KRX 오픈API 확정값으로 보정 (08:00 이후)
 python run_screen.py --mode credit-kiwoom   # 신용잔고 REST 실측 (앱키 필요)
 python run_screen.py --mode credit          # 신용잔고 CSV 적재 (자동 -> 수동)
 python run_screen.py --mode runs            # 배치 이력 + 스케줄 공백 점검

@@ -1264,3 +1264,30 @@ def render_dividend_report(rep: dict, asof, cfg: Config = DEFAULT) -> str:
         DIVIDEND_FOOTER,
     ]
     return "\n".join(head + body)
+
+
+def render_reconcile(res: dict, top: int = 3) -> str:
+    """시세 보정 결과. 평소엔 한 줄, 5% 초과 차이가 있으면 경고 한 줄을 더한다.
+
+    🔄 시세 보정 09-15 | 비교 2,417 | 차이 2,100건(종가 2,030 / 거래량 36) | 추가 108건
+
+    '차이 N건' 은 한 필드라도 달랐던 **종목 수**다. 필드별 건수는
+    price_diffs 에 있고, 괄호에는 사람이 먼저 보는 종가·거래량만 적는다.
+    """
+    from .reconcile import FIELD_LABELS
+
+    d = str(res.get("trade_date") or "")[5:10]
+    df = res.get("diff_fields") or {}
+    line = (f"🔄 시세 보정 {d} | 비교 {res.get('compared', 0):,} | "
+            f"차이 {res.get('diff_tickers', 0):,}건"
+            f"(종가 {df.get('c', 0):,} / 거래량 {df.get('v', 0):,}) | "
+            f"추가 {res.get('added', 0):,}건")
+    warns = res.get("warnings") or []
+    if not warns:
+        return line
+    wf = res.get("warn_fields") or {}
+    by = " / ".join(f"{FIELD_LABELS.get(f, f)} {n:,}"
+                    for f, n in sorted(wf.items(), key=lambda kv: -kv[1]))
+    ex = ", ".join(f"{t} {FIELD_LABELS.get(f, f)} {pv:,.0f}→{kv:,.0f}"
+                   f"({pct:+.0f}%)" for t, f, pv, kv, pct in warns[:top])
+    return f"{line}\n⚠️ 5% 초과 {len(warns):,}건({by}) · {_e(ex)}"

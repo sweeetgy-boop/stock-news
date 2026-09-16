@@ -10,6 +10,10 @@
   python run_screen.py --mode flags         # 배제 플래그 갱신 (청산 계층 0)
   python run_screen.py --mode daily         # 전종목 스캔 + 추천 10선 발송
 
+다음 날 아침 (08:00 이후, 수동)
+  python run_screen.py --mode reconcile     # 전 거래일 시세를 KRX 확정값으로 보정
+  python run_screen.py --mode reconcile --date 2026-09-15
+
 매일 (뉴스)
   python run_screen.py --mode news            # 수집 + 정리만 (발송 없음)
   python run_screen.py --mode brief-morning   # 아침 브리핑 (개장 전)
@@ -38,7 +42,8 @@
 이미 설정된 OS 환경변수가 `.env` 보다 우선한다. 키 목록은 `.env.example`
 과 `stocknews/env.py` 의 KNOWN_KEYS 를 참조.
   필수  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  선택  DART_API_KEY, KIWOOM_APP_KEY, KIWOOM_APP_SECRET, KRX_CREDIT_BLD
+  선택  DART_API_KEY, KIWOOM_APP_KEY, KIWOOM_APP_SECRET, KRX_CREDIT_BLD,
+        KRX_API_KEY (reconcile · master 의 종목기본정보 필터)
 """
 from __future__ import annotations
 
@@ -55,6 +60,7 @@ from pathlib import Path
 import pandas as pd
 
 from stocknews.config import DEFAULT
+from stocknews.data import krx_daily_prices
 from stocknews.daily import run_daily, scan_all, select_recommendations
 from stocknews.dividend_calendar import (build_dividend_report,
                                          report_send_allowed)
@@ -77,6 +83,7 @@ from stocknews.krx_credit import diagnose as krx_diagnose
 from stocknews.krx_credit import refresh_credit_auto
 from stocknews.joblock import JobLock, clear_locks
 from stocknews.notify import TelegramNotConfigured, now_kst
+from stocknews.reconcile import reconcile_day
 from stocknews.trading_day import (is_definitely_closed, market_status,
                                    news_window_hours, should_scan_intraday)
 from stocknews.news import process_and_store, theme_shift
@@ -90,7 +97,8 @@ from stocknews.renderer import (render_daily_holdings, render_detail,
                                 render_exit_digest, render_fib_list,
                                 render_morning_brief, render_news_weekly,
                                 render_positions, render_reco_stored,
-                                render_top10, render_weekly)
+                                render_reconcile, render_top10,
+                                render_weekly)
 from stocknews.screener import screen_one
 from stocknews.store import Store
 from stocknews.universe import (backfill_one, fetch_day, fill_sectors,
@@ -193,7 +201,8 @@ PARTIAL_FAIL_RATIO = 0.10
 _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "credit-kiwoom", "collect-dividends", "dividend-report",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
-                "flash", "pos-open", "fill", "pos-close", "holidays"}
+                "flash", "pos-open", "fill", "pos-close", "holidays",
+                "reconcile"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -306,7 +315,15 @@ def _run_note(rc: int) -> str:
 
 # ────────────────────────── 모드 구현 ──────────────────────────
 def mode_master(store: Store, args) -> int:
-    refresh_master(store, include_preferred=args.include_preferred)
+    rep: dict = {}
+    refresh_master(store, include_preferred=args.include_preferred,
+                   report=rep)
+    SUMMARY["universe_filter"] = {
+        "krx_filter": rep.get("krx_filter"),
+        "krx_info": rep.get("krx_info"),
+        "krx_only_excluded": len(rep.get("krx_only_excluded") or {}),
+        "legacy_only_excluded": rep.get("legacy_only_excluded"),
+    }
     sectors = fill_sectors(store)
     n = len(store.active_tickers())
     cov = store.sector_coverage()
@@ -441,6 +458,75 @@ def mode_update(store: Store, args) -> int:
                   "기록하지 않았으므로 다음 실행에서 다시 요청합니다.",
                   len(outages), ", ".join(outages))
         return EXIT_PARTIAL
+    return EXIT_OK
+
+
+def _reconcile_target(store: Store, args) -> str:
+    """보정 기준일 'YYYY-MM-DD'. --date 가 없으면 오늘 이전 마지막 거래일.
+
+    주말·공휴일·기록된 휴장일만 건너뛴다. 미확인 평일은 거래일로 본다 —
+    KRX 가 빈 응답을 주면 그때 판정한다.
+    """
+    if args.date:
+        raw = str(args.date).strip().replace("-", "")
+        return datetime.strptime(raw, "%Y%m%d").strftime("%Y-%m-%d")
+    day = now_kst().date()
+    for _ in range(14):
+        day -= timedelta(days=1)
+        if not is_definitely_closed(store, day.isoformat()):
+            break
+    return day.isoformat()
+
+
+def mode_reconcile(store: Store, args) -> int:
+    """전 거래일 시세를 KRX 오픈API 확정값으로 보정한다. **시세만.**
+
+    21:30 nightly 는 pykrx 로 잠정 적재한다(KRX 는 익영업일 08:00 에야
+    당일분을 연다). 이 모드가 다음 날 그 값을 정본으로 덮어쓰고 차이를
+    price_diffs 에 남긴다. scans · recos 는 다시 만들지 않는다.
+
+    종료 코드
+      0  보정 완료 · 또는 휴장일이라 할 일 없음
+      1  KRX 호출 실패 / 한 시장만 응답
+      4  KRX_API_KEY 없음 · 거래일인데 아직 미공개(익영업일 08:00 전)
+    """
+    iso = _reconcile_target(store, args)
+    bas_dd = iso.replace("-", "")
+    SUMMARY["trade_date"] = iso
+
+    rep: dict = {}
+    krx = krx_daily_prices(bas_dd, report=rep)
+    SUMMARY["krx"] = {"status": rep.get("status"), "rows": rep.get("rows"),
+                      "elapsed_sec": rep.get("elapsed_sec")}
+    if krx is None:
+        status = rep.get("status")
+        if status == "NOKEY":
+            SUMMARY["reason"] = "no_api_key"
+            return EXIT_PRECOND
+        if status == "EMPTY":
+            if (is_definitely_closed(store, iso)
+                    or store.is_known_non_trading(iso)):
+                log.info("%s 휴장일 — 보정할 시세가 없습니다", iso)
+                SUMMARY["reason"] = "closed"
+                return EXIT_OK
+            log.warning("%s KRX 미공개 — 익영업일 08:00 이후에 다시 "
+                        "실행하십시오 (미등록 휴장일일 수도 있음)", iso)
+            SUMMARY["reason"] = "not_published"
+            return EXIT_PRECOND
+        SUMMARY["reason"] = str(status).lower()
+        SUMMARY["error"] = rep.get("error")
+        return EXIT_FAIL
+
+    res = reconcile_day(store, iso, krx,
+                        universe=set(store.active_tickers()))
+    SUMMARY.update({k: v for k, v in res.items()
+                    if k not in ("warnings", "missing_in_krx",
+                                 "halted_in_krx")})
+    SUMMARY.update({"warn_count": len(res["warnings"]),
+                    "warn_top": [list(w) for w in res["warnings"][:10]],
+                    "missing_in_krx": len(res["missing_in_krx"]),
+                    "halted_in_krx": len(res["halted_in_krx"])})
+    _emit(render_reconcile(res), args.dry_run)
     return EXIT_OK
 
 
@@ -1690,6 +1776,7 @@ MODES = {
     "master": mode_master,
     "backfill": mode_backfill,
     "update": mode_update,
+    "reconcile": mode_reconcile,
     "daily": mode_daily,
     "weekly": mode_weekly,
     "fib": mode_fib,
@@ -1760,7 +1847,8 @@ def main(argv=None) -> int:
     ap.add_argument("--qty", type=int, help="pos-open 수량")
     ap.add_argument("--price", type=float,
                     help="pos-open 진입가 (생략 시 최근 종가)")
-    ap.add_argument("--date", help="pos-open 진입일 YYYY-MM-DD")
+    ap.add_argument("--date", help="pos-open 진입일 / reconcile 기준일 "
+                                   "YYYY-MM-DD")
     ap.add_argument("--year", type=int, default=None,
                     help="holidays: 기준 연도 (그 해 + 다음 해 조회). 기본 올해")
     ap.add_argument("--track", choices=("VALUE", "TREND"),

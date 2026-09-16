@@ -56,6 +56,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "holidays": 120,
     "master": 900,
     "update": 900,
+    # KRX 오픈API 2회(각 2초대) + 전종목 한 트랜잭션.
+    "reconcile": 300,
     "exits": 900,
     "news": 900,
     "brief-morning": 900,

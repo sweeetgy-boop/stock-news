@@ -45,7 +45,18 @@ log = logging.getLogger(__name__)
 __all__ = ["normalize_ohlcv", "load_ohlcv", "load_investor", "load_shorting",
            "make_loader", "market_snapshot", "verify_snapshot_date",
            "close_on", "close_on_status", "net_reachable", "load_index",
-           "INDEX_SYMBOLS", "REF_TICKERS", "REF_PROBE_RETRIES"]
+           "INDEX_SYMBOLS", "REF_TICKERS", "REF_PROBE_RETRIES",
+           "TICKER_PATTERN", "krx_daily_prices", "krx_base_info",
+           "KRX_API_KEY_ENV"]
+
+# 종목코드 형식. **영숫자 6자리다.**
+#
+# 2025-08 이후 신규상장부터 코드가 `0126Z0`(삼성에피스홀딩스) 처럼 영문을
+# 섞는다. 예전 `\d{6}` 필터가 이들을 스냅샷 단계에서 떨어뜨려, 2026-09-10
+# 실측으로 보통주 25종목이 마스터에 한 번도 들어오지 못했다. 우선주도
+# `00088K` 처럼 끝자리가 영문일 수 있으나 그건 `_is_common_share` 가
+# 따로 거른다.
+TICKER_PATTERN = r"[0-9A-Z]{6}"
 
 # 날짜 대조용 기준 종목. 거래정지 가능성이 낮은 초대형주만 쓴다.
 REF_TICKERS = ("005930", "000660", "005380")
@@ -203,7 +214,7 @@ def market_snapshot() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     lst = lst.copy()
     lst[code_col] = lst[code_col].astype(str).str.zfill(6)
-    lst = lst[lst[code_col].str.fullmatch(r"\d{6}")]
+    lst = lst[lst[code_col].str.fullmatch(TICKER_PATTERN)]
     lst = lst.drop_duplicates(subset=[code_col]).set_index(code_col)
 
     def _slice(mapping):
@@ -377,6 +388,185 @@ def verify_snapshot_date(prices: pd.DataFrame, trade_date: str,
         return True, f"기준 {matched}/{checked} 일치 ({' '.join(detail)})"
     return False, (f"기준 {matched}/{checked} 일치 — 스냅샷이 {trade_date} "
                    f"종가가 아님 (장중 현재가 가능) ({' '.join(detail)})")
+
+
+# ────────────────────────── KRX 오픈API ──────────────────────────
+#
+# KRX 공식 오픈API(data-dbg.krx.co.kr). 로그인이 막힌 data.krx.co.kr 와는
+# 별개 경로이고, 인증키로 부른다. 요청 1회에 한 시장 전종목이 온다.
+#
+# ★ 당일분이 없다
+# ---------------
+# D일 시세는 **익영업일 08:00 이후**에 열린다. 그 전에는 HTTP 200 에
+# `{"OutBlock_1": []}` 가 온다(2026-09-10 실측). 그래서 21:30 nightly 는
+# 여전히 pykrx(잠정)로 적재하고, 이 경로는 다음 날 아침 `reconcile` 이
+# 확정값으로 덮어쓰는 데만 쓴다.
+#
+# 실측 (2026-09-16, basDd=20260915)
+#   stk_bydd_trd        943행  294KB  2.2s
+#   ksq_bydd_trd      1,820행  595KB  2.3s
+#   stk_isu_base_info   943행  279KB  0.4s
+#   ksq_isu_base_info 1,820행  561KB  0.7s
+# 한도는 키당 1일 10,000회. 값은 전부 문자열이다.
+KRX_API_BASE = "https://data-dbg.krx.co.kr/svc/apis/sto/"
+KRX_API_KEY_ENV = "KRX_API_KEY"
+KRX_DAILY_SERVICES = {"KOSPI": "stk_bydd_trd", "KOSDAQ": "ksq_bydd_trd"}
+KRX_BASE_INFO_SERVICES = {"KOSPI": "stk_isu_base_info",
+                          "KOSDAQ": "ksq_isu_base_info"}
+
+_KRX_PRICE = {"TDD_OPNPRC": "시가", "TDD_HGPRC": "고가", "TDD_LWPRC": "저가",
+              "TDD_CLSPRC": "종가", "ACC_TRDVOL": "거래량",
+              "ACC_TRDVAL": "거래대금", "MKTCAP": "시가총액",
+              "LIST_SHRS": "상장주식수"}
+_KRX_BASE = {"ISU_ABBRV": "종목명", "MKT_TP_NM": "시장",
+             "SECUGRP_NM": "증권구분", "SECT_TP_NM": "소속부",
+             "KIND_STKCERT_TP_NM": "주식종류"}
+
+
+def _krx_get(service: str, bas_dd: str, key: str,
+             timeout: float = 30.0) -> list[dict]:
+    """서비스 1개 호출. 행 목록을 준다. 실패는 예외로 올린다.
+
+    예외를 여기서 삼키지 않는 이유: '빈 응답'과 '호출 실패'를 호출부가
+    구분해야 한다 (`close_on_status` 와 같은 원칙).
+    """
+    import requests
+
+    res = requests.get(KRX_API_BASE + service, params={"basDd": bas_dd},
+                       headers={"AUTH_KEY": key}, timeout=timeout)
+    if res.status_code != 200:
+        # 키 없음 401 "Unauthorized Key", 서비스 미신청 "Unauthorized API
+        # Call". 본문이 원인이다. 키 값은 본문에 없다.
+        raise RuntimeError(f"HTTP {res.status_code}: {res.text[:120]}")
+    rows = res.json().get("OutBlock_1")
+    if not isinstance(rows, list):
+        raise ValueError(f"OutBlock_1 없음: {res.text[:120]}")
+    return rows
+
+
+def _krx_fetch(services: dict, bas_dd: str, key: str | None,
+               timeout: float, rep: dict) -> list[dict] | None:
+    """두 시장을 불러 합친다. 판정 근거는 rep 에 적는다.
+
+    rep["status"]
+        "DATA"     두 시장 모두 행이 있다
+        "EMPTY"    두 시장 모두 빈 응답 (익영업일 08:00 전 · 휴장일)
+        "PARTIAL"  한 시장만 비었다. 반쪽 데이터로 정본을 삼지 않는다
+        "ERROR"    호출 자체가 실패했다
+        "NOKEY"    KRX_API_KEY 미설정
+    """
+    import os
+
+    key = key or os.getenv(KRX_API_KEY_ENV, "").strip()
+    rep.update({"status": None, "rows": {}, "elapsed_sec": 0.0})
+    if not key:
+        rep["status"] = "NOKEY"
+        log.warning("%s 미설정 — KRX 오픈API 를 부를 수 없습니다",
+                    KRX_API_KEY_ENV)
+        return None
+    t0 = time.time()
+    out: list[dict] = []
+    try:
+        for market, svc in services.items():
+            rows = _krx_get(svc, bas_dd, key, timeout)
+            rep["rows"][market] = len(rows)
+            for r in rows:
+                out.append({**r, "_market": market})
+    except Exception as exc:  # noqa: BLE001
+        rep.update({"status": "ERROR",
+                    "error": f"{type(exc).__name__}: {exc}"[:200],
+                    "elapsed_sec": round(time.time() - t0, 2)})
+        hint = "" if net_reachable("data-dbg.krx.co.kr") else " (DNS 해석 실패)"
+        log.error("KRX 오픈API 호출 실패 %s basDd=%s: %s%s",
+                  svc, bas_dd, rep["error"], hint)
+        return None
+    rep["elapsed_sec"] = round(time.time() - t0, 2)
+    counts = list(rep["rows"].values())
+    if not any(counts):
+        rep["status"] = "EMPTY"
+        log.info("KRX 오픈API basDd=%s 빈 응답 (익영업일 08:00 전이거나 "
+                 "휴장일)", bas_dd)
+        return None
+    if not all(counts):
+        rep["status"] = "PARTIAL"
+        log.error("KRX 오픈API basDd=%s 한 시장만 비었습니다 %s — 사용하지 "
+                  "않습니다", bas_dd, rep["rows"])
+        return None
+    rep["status"] = "DATA"
+    return out
+
+
+def _krx_num(s: pd.Series) -> pd.Series:
+    """'1,234' / '-' / '' 를 숫자로. 못 읽으면 NaN."""
+    return pd.to_numeric(s.astype(str).str.replace(",", "", regex=False),
+                         errors="coerce")
+
+
+def krx_daily_prices(bas_dd: str, key: str | None = None,
+                     timeout: float = 30.0,
+                     report: dict | None = None) -> pd.DataFrame | None:
+    """KRX 오픈API 일별 매매정보 (코스피 + 코스닥 전종목).
+
+    bas_dd : 'YYYYMMDD'
+    반환   : index=종목코드(영숫자 6자리)
+             columns=시가 고가 저가 종가 거래량 거래대금 시가총액 상장주식수
+                     종목명 시장
+             빈 응답·실패·키 없음이면 None. **예외를 던지지 않는다.**
+             어느 쪽인지는 report["status"] 로 구분한다 (`_krx_fetch`).
+    """
+    rep = report if report is not None else {}
+    rows = _krx_fetch(KRX_DAILY_SERVICES, bas_dd, key, timeout, rep)
+    if rows is None:
+        return None
+    df = pd.DataFrame(rows)
+    df["ISU_CD"] = df["ISU_CD"].astype(str).str.strip().str.zfill(6)
+    bad = ~df["ISU_CD"].str.fullmatch(TICKER_PATTERN)
+    if bad.any():
+        log.warning("KRX 오픈API 종목코드 형식 이상 %d건 제외: %s", int(bad.sum()),
+                    df.loc[bad, "ISU_CD"].head(5).tolist())
+        df = df[~bad]
+    out = pd.DataFrame(index=pd.Index(df["ISU_CD"], name="ticker"))
+    for src, dst in _KRX_PRICE.items():
+        out[dst] = (_krx_num(df[src]).to_numpy() if src in df.columns
+                    else float("nan"))
+    out["종목명"] = df.get("ISU_NM", pd.Series("", index=df.index)).to_numpy()
+    out["시장"] = df["_market"].to_numpy()
+    out = out[~out.index.duplicated(keep="first")]
+    log.info("KRX 오픈API basDd=%s %d종목 (%s) %.1fs", bas_dd, len(out),
+             " / ".join(f"{k} {v}" for k, v in rep["rows"].items()),
+             rep["elapsed_sec"])
+    return out
+
+
+def krx_base_info(bas_dd: str, key: str | None = None,
+                  timeout: float = 30.0,
+                  report: dict | None = None) -> pd.DataFrame | None:
+    """KRX 오픈API 종목기본정보 (코스피 + 코스닥).
+
+    반환 : index=단축코드(ISU_SRT_CD)
+           columns=종목명 시장 증권구분 소속부 주식종류
+           None 조건은 `krx_daily_prices` 와 같다.
+
+    2026-09-15 실측 분포
+      주식종류  보통주 2,649 / 구형우선주 78 / 신형우선주 23 / 종류주권 13
+      증권구분  주권 2,715 / 부동산투자회사 23 / 외국주권 12 / 주식예탁증권 10
+                / 사회간접자본투융자회사 2 / 투자회사 1
+      소속부    코스닥만 채워짐. 'SPAC(소속부없음)' 66
+
+    **스팩은 주식종류·증권구분으로 구분되지 않는다** (주권 · 보통주).
+    소속부로만 가려진다 — `universe.krx_exclusion_reason` 참조.
+    """
+    rep = report if report is not None else {}
+    rows = _krx_fetch(KRX_BASE_INFO_SERVICES, bas_dd, key, timeout, rep)
+    if rows is None:
+        return None
+    df = pd.DataFrame(rows)
+    code = df["ISU_SRT_CD"].astype(str).str.strip().str.zfill(6)
+    out = pd.DataFrame(index=pd.Index(code, name="ticker"))
+    for src, dst in _KRX_BASE.items():
+        out[dst] = (df[src].astype(str).str.strip().to_numpy()
+                    if src in df.columns else "")
+    return out[~out.index.duplicated(keep="first")]
 
 
 def make_loader(credit_provider=None, flag_provider=None, days: int = 400):

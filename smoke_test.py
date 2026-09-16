@@ -3613,6 +3613,391 @@ def test_market_source(tmp: Path):
     check("market_source", "주말 즉시 생략", t_weekend_short_circuits)
 
 
+def test_krx_reconcile(tmp: Path):
+    """KRX 오픈API 확정 시세 보정 (reconcile) + 영숫자 종목코드.
+
+    21:30 nightly 는 pykrx 잠정값을 적재하고, 다음 날 08:00 이후 KRX 가
+    그 값을 정본으로 덮어쓴다. 2026-09-16 실측: 종목별 폴백으로 적재된
+    9/15 는 종가가 2,030/2,417종목 KRX 와 달랐다.
+    """
+    import contextlib
+    import importlib
+    import io
+    import json as _json
+    import sqlite3
+    import types
+
+    import pandas as _pd
+
+    from stocknews import data as dmod
+    from stocknews import universe as uni
+    from stocknews.reconcile import WARN_PCT, reconcile_day
+    from stocknews.renderer import render_reconcile
+    from stocknews.store import Store
+
+    DAY, BAS = "2026-09-15", "20260915"
+
+    def _raw(code, close, vol, name="종목", o=None, h=None, l=None, amt=None):
+        """KRX 오픈API 원문 행. 값은 전부 문자열이다."""
+        o = close if o is None else o
+        h = close if h is None else h
+        l = close if l is None else l
+        amt = close * vol if amt is None else amt
+        return {"BAS_DD": BAS, "ISU_CD": code, "ISU_NM": name,
+                "MKT_NM": "", "SECT_TP_NM": "", "TDD_CLSPRC": str(close),
+                "CMPPREVDD_PRC": "0", "FLUC_RT": "0.00",
+                "TDD_OPNPRC": str(o), "TDD_HGPRC": str(h),
+                "TDD_LWPRC": str(l), "ACC_TRDVOL": str(vol),
+                "ACC_TRDVAL": str(amt), "MKTCAP": "1,000,000",
+                "LIST_SHRS": "1000"}
+
+    def _with_krx_get(fn, body):
+        saved = dmod._krx_get
+        dmod._krx_get = fn
+        try:
+            return body()
+        finally:
+            dmod._krx_get = saved
+
+    def _krx(rows_by_svc):
+        return lambda svc, bas, key, timeout=30.0: rows_by_svc.get(svc, [])
+
+    def t_empty_response_is_none():
+        """D+1 08:00 전 · 휴장일. None 이지 예외가 아니다."""
+        rep = {}
+        got = _with_krx_get(_krx({}), lambda: dmod.krx_daily_prices(
+            BAS, key="k", report=rep))
+        assert got is None, got
+        assert rep["status"] == "EMPTY", rep
+
+    def t_error_is_none_not_raise():
+        def boom(*a, **k):
+            raise RuntimeError("HTTP 401: Unauthorized Key")
+        rep = {}
+        got = _with_krx_get(boom, lambda: dmod.krx_daily_prices(
+            BAS, key="k", report=rep))
+        assert got is None and rep["status"] == "ERROR", rep
+        assert "401" in rep["error"], rep
+
+    def t_no_key_is_none():
+        import os
+        saved = os.environ.pop("KRX_API_KEY", None)
+        try:
+            rep = {}
+            assert dmod.krx_daily_prices(BAS, report=rep) is None
+            assert rep["status"] == "NOKEY", rep
+        finally:
+            if saved is not None:
+                os.environ["KRX_API_KEY"] = saved
+
+    def t_one_market_empty_is_partial():
+        """한 시장만 오면 반쪽 정본이 된다. 쓰지 않는다."""
+        rep = {}
+        got = _with_krx_get(
+            _krx({"stk_bydd_trd": [_raw("005930", 100, 10)]}),
+            lambda: dmod.krx_daily_prices(BAS, key="k", report=rep))
+        assert got is None and rep["status"] == "PARTIAL", rep
+
+    def t_adapter_mapping_and_alnum():
+        rows = {"stk_bydd_trd": [_raw("005930", 248500, 11435506),
+                                 _raw("0126Z0", 50000, 1200, "삼성에피스홀딩스")],
+                "ksq_bydd_trd": [_raw("060310", 1142, 86526, o=1152,
+                                      h=1176, l=1135, amt=99729602)]}
+        rep = {}
+        df = _with_krx_get(_krx(rows), lambda: dmod.krx_daily_prices(
+            BAS, key="k", report=rep))
+        assert rep["status"] == "DATA" and df is not None, rep
+        assert set(df.index) == {"005930", "0126Z0", "060310"}, list(df.index)
+        r = df.loc["060310"]
+        assert (r["시가"], r["고가"], r["저가"], r["종가"]) == \
+            (1152.0, 1176.0, 1135.0, 1142.0), r.to_dict()
+        assert r["거래량"] == 86526.0 and r["거래대금"] == 99729602.0
+        assert df.loc["005930", "시가총액"] == 1_000_000.0, "쉼표 숫자 변환"
+        assert df.loc["0126Z0", "시장"] == "KOSPI"
+        assert df.loc["060310", "시장"] == "KOSDAQ"
+
+    def _krx_frame(spec: dict) -> _pd.DataFrame:
+        """ticker -> (o,h,l,c,v,amt). 어댑터 반환 형식."""
+        cols = ["시가", "고가", "저가", "종가", "거래량", "거래대금"]
+        return _pd.DataFrame([list(v) for v in spec.values()],
+                             index=list(spec), columns=cols, dtype=float)
+
+    def _seed(st, rows):
+        """pykrx 잠정 행 (ticker, o,h,l,c,v,amt)."""
+        for t, o, h, l, c, v, amt in rows:
+            df = _pd.DataFrame({"시가": [o], "고가": [h], "저가": [l],
+                                "종가": [c], "거래량": [v], "거래대금": [amt]},
+                               index=_pd.to_datetime([DAY]))
+            st.upsert_prices(t, df, allow_today=True)
+
+    def _price(st, t):
+        with sqlite3.connect(st.path) as con:
+            return con.execute(
+                "SELECT o,h,l,c,v,amt,source,is_final FROM prices "
+                "WHERE ticker=? AND d=?", (t, DAY)).fetchone()
+
+    def t_overwrite_and_diffs():
+        st = Store(tmp / "recon.db")
+        _seed(st, [
+            ("005930", 248000, 252000, 246000, 250500, 11435506, None),
+            ("000660", 1690000, 1729000, 1671000, 1712000, 2651098, None),
+            ("095570", 4210, 4210, 4140, 4155, 51907, 215709277),  # 동일
+            ("111110", 100, 100, 100, 100, 5, 500),                # KRX 에 없음
+        ])
+        krx = _krx_frame({
+            "005930": (248000, 252000, 246000, 248500, 11435506, 2.8e12),
+            "000660": (1690000, 1729000, 1671000, 1690000, 2732031, 4.6e12),
+            "095570": (4210, 4210, 4140, 4155, 51907, 215709277),
+            "0126Z0": (50000, 51000, 49000, 50500, 1200, 6.06e7),  # 추가
+            "222220": (900, 900, 900, 900, 10, 9000),              # 마스터 밖
+            "333330": (0, 0, 0, 4200, 0, 0),                       # 거래정지
+        })
+        res = reconcile_day(st, DAY, krx,
+                            universe={"005930", "000660", "095570",
+                                      "111110", "0126Z0", "333330"})
+        assert res["compared"] == 3, res
+        assert res["diff_tickers"] == 2, res
+        assert res["diff_fields"] == {"c": 2, "v": 1}, res["diff_fields"]
+        assert res["amt_filled"] == 2, res
+        assert res["added"] == 1, "마스터 밖 222220 · 거래정지 333330 은 추가 안 함"
+        assert res["missing_in_krx"] == ["111110"], res
+        # KRX 가 정본: 종가·거래량·거래대금 전부 덮어쓴다
+        p = _price(st, "005930")
+        assert p[3] == 248500 and p[5] == 2.8e12, p
+        assert p[6:] == ("krx_api", 1), p
+        assert _price(st, "000660")[4] == 2732031
+        # 같은 값이어도 확정으로 표시한다
+        assert _price(st, "095570")[6:] == ("krx_api", 1)
+        # KRX 에 없는 종목은 잠정값 그대로
+        assert _price(st, "111110") == (100, 100, 100, 100, 5, 500, "pykrx", 0)
+        # 영숫자 코드 추가
+        assert _price(st, "0126Z0")[3] == 50500
+        assert _price(st, "222220") is None
+        diffs = st.price_diffs_on(DAY)
+        got = {(r.ticker, r.field, r.pykrx_val, r.krx_val)
+               for r in diffs.itertuples()}
+        assert got == {("005930", "c", 250500.0, 248500.0),
+                       ("000660", "c", 1712000.0, 1690000.0),
+                       ("000660", "v", 2651098.0, 2732031.0)}, got
+
+        # 재실행: 이미 확정이라 비교하지 않고 차이도 새로 남기지 않는다
+        res2 = reconcile_day(st, DAY, krx, universe={"005930"})
+        assert res2["compared"] == 0 and res2["already_final"] == 4, res2
+        assert len(st.price_diffs_on(DAY)) == 3
+
+        # nightly(pykrx) 가 다시 돌아도 확정값을 잠정값으로 되돌리지 않는다
+        _seed(st, [("005930", 1, 1, 1, 1, 1, 1)])
+        assert _price(st, "005930")[3] == 248500, "확정 행이 덮어써졌다"
+        assert _price(st, "111110")[6] == "pykrx"
+        _seed(st, [("111110", 101, 101, 101, 101, 6, 606)])
+        assert _price(st, "111110")[3] == 101, "잠정 행은 계속 갱신돼야 한다"
+        st.upsert_cross_section(DAY, _pd.DataFrame(
+            {"시가": [2.0], "고가": [2.0], "저가": [2.0], "종가": [2.0],
+             "거래량": [2.0], "거래대금": [2.0]}, index=["000660"]),
+            allow_today=True)
+        assert _price(st, "000660")[3] == 1690000, "스냅샷 경로도 확정 보호"
+
+    def t_warn_over_5pct():
+        st = Store(tmp / "recon_warn.db")
+        _seed(st, [
+            ("041830", 56700, 60200, 56700, 59300, 73864, None),
+            ("033780", 171100, 172700, 169500, 170400, 152000, None),
+        ])
+        krx = _krx_frame({
+            # 거래량 +325% -> 경고
+            "041830": (56700, 60200, 56700, 58300, 313864, 1.8e10),
+            # 종가 +0.2% · 거래량 +1.2% -> 차이지만 경고 아님
+            "033780": (171100, 172700, 169500, 170800, 153855, 2.6e10),
+        })
+        res = reconcile_day(st, DAY, krx, universe=None)
+        assert WARN_PCT == 5.0
+        assert len(res["warnings"]) == 1, res["warnings"]
+        t, f, pv, kv, pct = res["warnings"][0]
+        assert (t, f) == ("041830", "v") and round(pct) == 325, res["warnings"]
+        assert res["warn_fields"] == {"v": 1}, res
+        msg = render_reconcile(res)
+        lines = msg.split("\n")
+        assert lines[0] == ("🔄 시세 보정 09-15 | 비교 2 | 차이 2건(종가 2 / "
+                            "거래량 2) | 추가 0건"), lines[0]
+        assert len(lines) == 2 and lines[1].startswith("⚠️ 5% 초과 1건(거래량 1)"), msg
+        assert "041830 거래량 73,864→313,864(+325%)" in lines[1], lines[1]
+
+    def t_message_one_line_without_warning():
+        res = {"trade_date": DAY, "compared": 2417, "diff_tickers": 2100,
+               "diff_fields": {"c": 2030, "v": 36, "h": 619},
+               "added": 108, "warnings": []}
+        assert render_reconcile(res) == (
+            "🔄 시세 보정 09-15 | 비교 2,417 | 차이 2,100건(종가 2,030 / "
+            "거래량 36) | 추가 108건")
+
+    def t_migration_marks_existing_pykrx():
+        """컬럼이 없던 DB 의 기존 행은 pykrx/0 이 된다."""
+        p = tmp / "old_schema.db"
+        with sqlite3.connect(p) as con:
+            con.execute("CREATE TABLE prices (ticker TEXT NOT NULL, d TEXT "
+                        "NOT NULL, o REAL, h REAL, l REAL, c REAL, v REAL, "
+                        "amt REAL, PRIMARY KEY (ticker, d))")
+            con.execute("INSERT INTO prices VALUES('005930','2026-09-11',"
+                        "1,1,1,1,1,1)")
+            con.commit()
+        st = Store(p)
+        with sqlite3.connect(st.path) as con:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(prices)")}
+            row = con.execute("SELECT source,is_final FROM prices").fetchone()
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"source", "is_final"} <= cols, cols
+        assert row == ("pykrx", 0), row
+        assert "price_diffs" in tables
+        Store(p)   # 두 번째 열기에서 ALTER 가 중복되면 안 된다
+
+    def t_snapshot_keeps_alnum_codes():
+        """★ 영숫자 코드 회귀 앵커. `\\d{6}` 필터가 보통주 25종목을 떨어뜨렸다."""
+        lst = _pd.DataFrame({
+            "Code": ["005930", "0126Z0", "00088K", "12345"],
+            "Name": ["삼성전자", "삼성에피스홀딩스", "한화3우B", "옛코드"],
+            "Market": ["KOSPI", "KOSPI", "KOSPI", "KOSDAQ"],
+            "Open": [1, 1, 1, 1], "High": [1, 1, 1, 1], "Low": [1, 1, 1, 1],
+            "Close": [1, 1, 1, 1], "Volume": [1, 1, 1, 1],
+            "Amount": [1, 1, 1, 1], "Marcap": [1, 1, 1, 1],
+            "Stocks": [1, 1, 1, 1]})
+        fake = types.SimpleNamespace(StockListing=lambda name: lst)
+        saved = sys.modules.get("FinanceDataReader")
+        sys.modules["FinanceDataReader"] = fake
+        try:
+            prices, meta = dmod.market_snapshot()
+        finally:
+            if saved is None:
+                sys.modules.pop("FinanceDataReader", None)
+            else:
+                sys.modules["FinanceDataReader"] = saved
+        assert "0126Z0" in prices.index and "00088K" in meta.index, \
+            list(meta.index)
+        assert "012345" in meta.index, "5자리 숫자는 zfill 로 살린다"
+
+    def t_master_krx_filter_parallel():
+        """코드·이름 필터와 KRX 기본정보 필터를 병행한다."""
+        meta = _pd.DataFrame({
+            "종목명": ["삼성전자", "삼성에피스홀딩스", "한화3우B", "교보19호스팩",
+                     "대신밸류리츠", "이름에표시없음", "기본정보없음"],
+            "시장": ["KOSPI", "KOSPI", "KOSPI", "KOSDAQ", "KOSPI",
+                   "KOSDAQ", "KOSDAQ"],
+            "시가총액": [1.0] * 7, "상장주식수": [1.0] * 7},
+            index=["005930", "0126Z0", "00088K", "0098T0", "0030R0",
+                   "999990", "888880"])
+        info = _pd.DataFrame({
+            "주식종류": ["보통주", "보통주", "구형우선주", "보통주", "보통주",
+                     "보통주"],
+            "증권구분": ["주권", "주권", "주권", "주권", "부동산투자회사",
+                     "주권"],
+            "소속부": ["", "", "", "SPAC(소속부없음)", "",
+                    "SPAC(소속부없음)"]},
+            index=["005930", "0126Z0", "00088K", "0098T0", "0030R0",
+                   "999990"])
+        assert uni.krx_exclusion_reason(info.loc["00088K"].to_dict()) == "구형우선주"
+        assert uni.krx_exclusion_reason(
+            info.loc["00088K"].to_dict(), include_preferred=True) is None
+        assert uni.krx_exclusion_reason(info.loc["0098T0"].to_dict()) == "스팩"
+        assert uni.krx_exclusion_reason(info.loc["0030R0"].to_dict()) == "부동산투자회사"
+
+        st = Store(tmp / "master_krx.db")
+        saved = uni.market_snapshot
+        uni.market_snapshot = lambda: (_pd.DataFrame(), meta)
+        try:
+            rep = {}
+            uni.refresh_master(st, on_date="20260916", min_expected=1,
+                               krx_info=info, report=rep)
+            got = set(st.active_tickers())
+            rep_legacy = {}
+            st2 = Store(tmp / "master_legacy.db")
+            uni.refresh_master(st2, on_date="20260916", min_expected=1,
+                               use_krx_info=False, report=rep_legacy)
+            got_legacy = set(st2.active_tickers())
+        finally:
+            uni.market_snapshot = saved
+        # 기존 필터: 우선주(끝자리 K) · 이름 '스팩'/'리츠' 배제, 영숫자 보통주 통과
+        assert got_legacy == {"005930", "0126Z0", "999990", "888880"}, got_legacy
+        # KRX 병행: 이름에 '스팩'이 없어도 소속부로 배제. 기본정보에 없으면 기존 필터만
+        assert got == {"005930", "0126Z0", "888880"}, got
+        assert rep["krx_filter"] is True and rep_legacy["krx_filter"] is False
+        assert list(rep["krx_only_excluded"]) == ["999990"], rep
+
+    def t_mode_reconcile_end_to_end():
+        """모드 전체. 시세만 보정하고 scans · recos 는 건드리지 않는다."""
+        mod = importlib.import_module("run_screen")
+        db = tmp / "recon_mode.db"
+        st = Store(db)
+        st.upsert_tickers([{"ticker": "005930", "name": "삼성전자",
+                            "market": "KOSPI"},
+                           {"ticker": "0126Z0", "name": "삼성에피스홀딩스",
+                            "market": "KOSPI"}])
+        _seed(st, [("005930", 248000, 252000, 246000, 250500, 11435506, None)])
+        _insert_reco(st, DAY, "005930", "삼성전자", "VALUE", "A")
+
+        def _counts():
+            with sqlite3.connect(db) as con:
+                return tuple(con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                             for t in ("scans", "recos"))
+        before = _counts()
+
+        calls = []
+
+        def fake_prices(bas_dd, key=None, timeout=30.0, report=None):
+            calls.append(bas_dd)
+            if report is not None:
+                report.update({"status": "DATA", "rows": {"KOSPI": 2},
+                               "elapsed_sec": 0.1})
+            return _krx_frame({
+                "005930": (248000, 252000, 246000, 248500, 11435506, 2.8e12),
+                "0126Z0": (50000, 51000, 49000, 50500, 1200, 6.06e7)})
+
+        def _run(argv, fake):
+            saved = mod.krx_daily_prices
+            mod.krx_daily_prices = fake
+            so, se = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+                    rc = mod.main(argv + ["--db", str(db), "--no-lock",
+                                          "--dry-run", "--json",
+                                          "--env-file", str(tmp / "absent.env")])
+            finally:
+                mod.krx_daily_prices = saved
+            return rc, _json.loads(so.getvalue().strip()), se.getvalue()
+
+        rc, js, err = _run(["--mode", "reconcile", "--date", DAY], fake_prices)
+        assert rc == 0, (rc, js)
+        assert calls == [BAS], calls
+        assert js["compared"] == 1 and js["added"] == 1, js
+        assert js["diff_fields"] == {"c": 1}, js
+        assert "🔄 시세 보정 09-15 | 비교 1 | 차이 1건(종가 1 / 거래량 0) | 추가 1건" \
+            in err, err[-400:]
+        assert _counts() == before, "reconcile 이 scans/recos 를 건드렸다"
+        assert _price(st, "0126Z0")[6:] == ("krx_api", 1)
+
+        def empty(bas_dd, key=None, timeout=30.0, report=None):
+            report.update({"status": "EMPTY", "rows": {}, "elapsed_sec": 0.1})
+            return None
+        # 주말: 휴장 -> exit 0, 메시지 없음
+        rc, js, _ = _run(["--mode", "reconcile", "--date", "2026-09-12"], empty)
+        assert rc == 0 and js["reason"] == "closed" and not js.get("messages"), js
+        # 평일인데 비었다: 아직 미공개 -> exit 4
+        rc, js, _ = _run(["--mode", "reconcile", "--date", "2026-09-16"], empty)
+        assert rc == mod.EXIT_PRECOND and js["reason"] == "not_published", js
+
+    check("krx_reconcile", "빈 응답 -> None (예외 없음)", t_empty_response_is_none)
+    check("krx_reconcile", "호출 실패 -> None (예외 없음)", t_error_is_none_not_raise)
+    check("krx_reconcile", "키 없음 -> None", t_no_key_is_none)
+    check("krx_reconcile", "한 시장만 응답 -> 사용 안 함", t_one_market_empty_is_partial)
+    check("krx_reconcile", "어댑터 컬럼 매핑 + 영숫자 코드", t_adapter_mapping_and_alnum)
+    check("krx_reconcile", "KRX 정본 덮어쓰기 + price_diffs + 확정 보호", t_overwrite_and_diffs)
+    check("krx_reconcile", "5% 초과 경고", t_warn_over_5pct)
+    check("krx_reconcile", "알림 한 줄 형식", t_message_one_line_without_warning)
+    check("krx_reconcile", "기존 행 pykrx/0 마이그레이션", t_migration_marks_existing_pykrx)
+    check("krx_reconcile", "스냅샷 영숫자 코드 유지", t_snapshot_keeps_alnum_codes)
+    check("krx_reconcile", "마스터 KRX 기본정보 필터 병행", t_master_krx_filter_parallel)
+    check("krx_reconcile", "--mode reconcile 전체 (scans·recos 불변)", t_mode_reconcile_end_to_end)
+
+
 def test_kiwoom(tmp: Path):
     """키움 OpenAPI+ 제한기·계획기·CSV. OCX 없이 검증되는 부분만.
 
@@ -8260,7 +8645,7 @@ def test_imports():
                   "brief-weekly", "flags", "exits", "pos-open", "pos-list",
                   "fill", "pos-close", "credit", "credit-kiwoom",
                   "credit-probe", "kiwoom-plan", "export", "runs",
-                  "backtest"}
+                  "backtest", "reconcile"}
         missing = expect - set(mod.MODES)
         assert not missing, f"MODES 누락: {missing}"
         del runpy
@@ -8384,6 +8769,7 @@ def main() -> int:
         test_backtest(tmp)
         test_krx_credit()
         test_market_source(tmp)
+        test_krx_reconcile(tmp)
         test_kiwoom(tmp)
         test_kiwoom_rest(tmp)
         test_dividends(tmp)

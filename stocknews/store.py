@@ -99,13 +99,30 @@ _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
+-- source   : 'pykrx'(nightly update · 잠정) / 'krx_api'(reconcile · 확정)
+-- is_final : 0 잠정 / 1 확정. 확정 행은 pykrx 경로가 덮어쓰지 않는다.
 CREATE TABLE IF NOT EXISTS prices (
   ticker TEXT NOT NULL,
   d      TEXT NOT NULL,
   o REAL, h REAL, l REAL, c REAL, v REAL, amt REAL,
+  source   TEXT    NOT NULL DEFAULT 'pykrx',
+  is_final INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (ticker, d)
 );
 CREATE INDEX IF NOT EXISTS ix_prices_d ON prices(d);
+
+-- reconcile 이 KRX 확정값으로 덮어쓴 필드의 원래 값. 필드 단위 1행.
+-- field : o h l c v amt (prices 컬럼명)
+CREATE TABLE IF NOT EXISTS price_diffs (
+  ticker    TEXT NOT NULL,
+  d         TEXT NOT NULL,
+  field     TEXT NOT NULL,
+  pykrx_val REAL,
+  krx_val   REAL,
+  created   TEXT,
+  PRIMARY KEY (ticker, d, field)
+);
+CREATE INDEX IF NOT EXISTS ix_price_diffs_d ON price_diffs(d);
 
 CREATE TABLE IF NOT EXISTS tickers (
   ticker TEXT PRIMARY KEY,
@@ -452,6 +469,10 @@ class Store:
         # 자사주 취득액(총주주환원율). dividends 는 이미 만들어진 DB 가
         # 있으므로 CREATE TABLE IF NOT EXISTS 로는 컬럼이 붙지 않는다.
         ("dividends", "buyback", "REAL"),
+        # 시세 출처. 기존 행은 전부 pykrx 잠정이다. SQLite 의 ADD COLUMN 은
+        # 상수 DEFAULT 를 기존 행에 그대로 보여주므로 행 재작성이 없다.
+        ("prices", "source", "TEXT NOT NULL DEFAULT 'pykrx'"),
+        ("prices", "is_final", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     def _init(self) -> None:
@@ -525,7 +546,9 @@ class Store:
                 "INSERT INTO prices(ticker,d,o,h,l,c,v,amt) VALUES(?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(ticker,d) DO UPDATE SET "
                 "o=excluded.o,h=excluded.h,l=excluded.l,c=excluded.c,"
-                "v=excluded.v,amt=excluded.amt",
+                "v=excluded.v,amt=excluded.amt "
+                # KRX 확정 행은 잠정값으로 되돌리지 않는다 (reconcile).
+                "WHERE prices.is_final=0",
                 rows,
             )
             con.commit()
@@ -571,11 +594,59 @@ class Store:
                 "INSERT INTO prices(ticker,d,o,h,l,c,v,amt) VALUES(?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(ticker,d) DO UPDATE SET "
                 "o=excluded.o,h=excluded.h,l=excluded.l,c=excluded.c,"
-                "v=excluded.v,amt=excluded.amt",
+                "v=excluded.v,amt=excluded.amt "
+                # KRX 확정 행은 잠정값으로 되돌리지 않는다 (reconcile).
+                "WHERE prices.is_final=0",
                 rows,
             )
             con.commit()
         return len(rows)
+
+    def prices_on(self, d) -> pd.DataFrame:
+        """하루치 시세 전체. index=ticker, o h l c v amt source is_final."""
+        with closing(self._conn()) as con:
+            df = pd.read_sql_query(
+                "SELECT ticker,o,h,l,c,v,amt,source,is_final FROM prices "
+                "WHERE d=?", con, params=(_d(d),))
+        return df.set_index("ticker")
+
+    def apply_final_prices(self, d, rows: list[tuple],
+                           diffs: list[tuple]) -> int:
+        """KRX 확정값 적재 + 차이 기록을 한 트랜잭션으로.
+
+        rows  : (ticker, o, h, l, c, v, amt)  — 있으면 덮어쓰고 없으면 추가
+        diffs : (ticker, field, pykrx_val, krx_val)
+
+        둘을 따로 커밋하면, 중간에 죽었을 때 값은 확정됐는데 원래 값이
+        사라진(또는 그 반대) 상태가 남는다. 확정 행은 다음 reconcile 이
+        비교하지 않으므로 그 차이는 영영 복구되지 않는다.
+        """
+        ds = _d(d)
+        now = _now_str()
+        with closing(self._conn()) as con:
+            con.executemany(
+                "INSERT INTO price_diffs(ticker,d,field,pykrx_val,krx_val,created) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(ticker,d,field) DO UPDATE SET "
+                "pykrx_val=excluded.pykrx_val,krx_val=excluded.krx_val,"
+                "created=excluded.created",
+                [(t, ds, f, pv, kv, now) for t, f, pv, kv in diffs])
+            con.executemany(
+                "INSERT INTO prices(ticker,d,o,h,l,c,v,amt,source,is_final) "
+                "VALUES(?,?,?,?,?,?,?,?,'krx_api',1) "
+                "ON CONFLICT(ticker,d) DO UPDATE SET "
+                "o=excluded.o,h=excluded.h,l=excluded.l,c=excluded.c,"
+                "v=excluded.v,amt=excluded.amt,"
+                "source='krx_api',is_final=1",
+                [(t, ds, o, h, l, c, v, amt)
+                 for t, o, h, l, c, v, amt in rows])
+            con.commit()
+        return len(rows)
+
+    def price_diffs_on(self, d) -> pd.DataFrame:
+        with closing(self._conn()) as con:
+            return pd.read_sql_query(
+                "SELECT ticker,field,pykrx_val,krx_val FROM price_diffs "
+                "WHERE d=? ORDER BY ticker,field", con, params=(_d(d),))
 
     def load_ohlcv(self, ticker: str, days: int = 400) -> pd.DataFrame | None:
         """스캔용 OHLCV 로드. 네트워크 없음."""
