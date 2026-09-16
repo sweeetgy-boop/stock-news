@@ -21,77 +21,383 @@
 """
 from __future__ import annotations
 
+import bisect
 import logging
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 
-from .config import Config, DEFAULT
+from .config import MIN_SCORED_FOR_JUDGMENT, Config, DEFAULT
+from .contracts import STOP_RULE_PREFIX
+from .trading_day import as_date, now_kst
 
 log = logging.getLogger(__name__)
 
-__all__ = ["audit_recos", "score_momentum", "persistence", "churn",
-           "band_eta", "weekly_events", "sector_concentration", "weekly_report"]
+__all__ = ["audit_recos", "audit_multi", "scoring_progress", "score_momentum",
+           "persistence", "churn", "band_eta", "weekly_events",
+           "sector_concentration", "is_first_friday", "prev_month_bounds",
+           "monthly_review", "weekly_report"]
 
 
 # ────────────────────────── 1. 자기 검증 ──────────────────────────
-def audit_recos(store, horizon: int = 5, lookback: int = 12) -> dict:
-    """과거 추천의 실제 성적. 시장 중위 수익률을 대조군으로 쓴다.
+def _score_horizon(recos: pd.DataFrame, pm: pd.DataFrame,
+                   horizon: int) -> tuple[pd.DataFrame, int, int]:
+    """한 보유기간의 채점. (채점된 행, 미도래 건수, 가격없음 건수).
 
-    horizon : 보유 가정 거래일수 (기본 5 = 1주)
-    대조군을 안 쓰면 하락장 반등을 전략의 실력으로 착각한다.
+    **미도래는 채점에서 뺀다.** 0으로 넣으면 평균이 0쪽으로 끌려가
+    성적이 실제보다 나빠 보이고, 실패로 세면 표본이 조용히 줄어든다.
+    별도로 세서 리포트에 그대로 노출한다.
     """
-    recos = store.reco_history(days=lookback)
-    pm = store.price_matrix(days=lookback + horizon + 5)
-    if recos.empty or pm.empty:
-        return {"n": 0, "note": "누적 데이터 부족"}
-
     dates = list(pm.index.strftime("%Y-%m-%d"))
     pos = {d: i for i, d in enumerate(dates)}
 
-    rows = []
+    rows: list[dict] = []
+    pending = 0
+    no_price = 0
     for _, r in recos.iterrows():
         d0 = str(r["d"])[:10]
         t = str(r["ticker"])
         if d0 not in pos or t not in pm.columns:
+            no_price += 1
             continue
         i0 = pos[d0]
         i1 = i0 + horizon
         if i1 >= len(dates):
+            pending += 1          # 보유기간이 아직 경과하지 않음
             continue
         p0, p1 = pm.iloc[i0][t], pm.iloc[i1][t]
         if not (pd.notna(p0) and pd.notna(p1) and p0 > 0):
+            no_price += 1
             continue
         ret = float(p1 / p0 - 1.0) * 100.0
 
-        # 같은 구간의 시장 중위 수익률
+        # 같은 구간의 시장 중위 수익률 (대조군)
         col0, col1 = pm.iloc[i0], pm.iloc[i1]
         mask = col0.notna() & col1.notna() & (col0 > 0)
-        mkt = float(((col1[mask] / col0[mask]) - 1.0).median() * 100.0) if mask.any() else np.nan
+        mkt = (float(((col1[mask] / col0[mask]) - 1.0).median() * 100.0)
+               if mask.any() else np.nan)
 
         rows.append({"date": d0, "ticker": t, "name": r["name"],
                      "slot": r["slot"], "grade": r["grade"],
                      "ret": ret, "mkt": mkt, "alpha": ret - mkt})
 
-    if not rows:
-        return {"n": 0, "note": f"보유기간 {horizon}일 경과 추천 없음"}
+    return pd.DataFrame(rows), pending, no_price
 
-    df = pd.DataFrame(rows)
-    by_slot = (df.groupby("slot")["alpha"]
-               .agg(["count", "mean"]).round(2).to_dict("index"))
+
+def _summarize(df: pd.DataFrame, horizon: int, pending: int,
+               no_price: int) -> dict:
+    """한 보유기간의 집계. 표본이 0이면 숫자를 만들지 않는다."""
+    if df.empty:
+        return {"horizon": horizon, "n": 0, "pending": pending,
+                "no_price": no_price,
+                "note": (f"보유 {horizon}거래일 미도래 {pending}건"
+                         if pending else f"보유 {horizon}거래일 표본 없음")}
     return {
-        "n": int(len(df)),
         "horizon": horizon,
+        "n": int(len(df)),
+        "pending": pending,
+        "no_price": no_price,
         "win_rate": float((df["ret"] > 0).mean() * 100.0),
         "alpha_win_rate": float((df["alpha"] > 0).mean() * 100.0),
         "mean_ret": float(df["ret"].mean()),
         "median_ret": float(df["ret"].median()),
         "mean_mkt": float(df["mkt"].mean()),
+        # 알파 분포. 평균만 보면 한 종목이 만든 평균과 고르게 나온 평균을
+        # 구분할 수 없다. 중앙값·최대·최소를 함께 낸다.
         "mean_alpha": float(df["alpha"].mean()),
+        "median_alpha": float(df["alpha"].median()),
+        "max_alpha": float(df["alpha"].max()),
+        "min_alpha": float(df["alpha"].min()),
         "best": df.nlargest(3, "ret")[["name", "ret"]].to_dict("records"),
         "worst": df.nsmallest(3, "ret")[["name", "ret"]].to_dict("records"),
-        "by_slot": by_slot,
+        "by_slot": (df.groupby("slot")["alpha"]
+                    .agg(["count", "mean"]).round(2).to_dict("index")),
         "detail": df,
+    }
+
+
+def audit_recos(store, horizon: int = 5, lookback: int = 12) -> dict:
+    """과거 추천의 실제 성적 (단일 보유기간).
+
+    horizon : 보유 가정 거래일수 (기본 5 = 1주)
+    대조군을 안 쓰면 하락장 반등을 전략의 실력으로 착각한다.
+
+    여러 기간을 한 번에 보려면 `audit_multi()` 를 쓴다.
+    """
+    recos = store.reco_history(days=lookback)
+    pm = store.price_matrix(days=lookback + horizon + 5)
+    if recos.empty or pm.empty:
+        return {"n": 0, "note": "누적 데이터 부족"}
+    df, pending, no_price = _score_horizon(recos, pm, horizon)
+    return _summarize(df, horizon, pending, no_price)
+
+
+def audit_multi(store, cfg: Config = DEFAULT,
+                horizons: tuple[int, ...] | None = None,
+                lookback: int | None = None) -> dict:
+    """보유기간 5/10/20 을 **병렬로** 채점한다.
+
+    한 기간만 보면 '이 전략이 5일물인지 20일물인지' 를 알 수 없다.
+    5일에 알파가 없어도 20일에 나올 수 있고 그 반대도 가능하다. 어느
+    보유기간에서 알파가 나는지 비교할 수 있게 나란히 낸다.
+
+    가격 행렬은 **가장 긴 기간** 기준으로 한 번만 뽑아 세 기간이 같은
+    구간을 본다. 기간마다 따로 뽑으면 대조군 모집단이 달라져 비교가
+    성립하지 않는다.
+
+    반환에 `total_recos`(전체 누적 추천 건수)와 `min_sample` 을 담는다.
+    표본이 최소치에 닿기 전에는 성적을 신뢰하지 않는다는 표시다.
+    """
+    ac = cfg.audit
+    hs = tuple(horizons) if horizons else ac.horizons
+    lb = int(lookback) if lookback else ac.lookback_dates
+    longest = max(hs) if hs else 0
+
+    out: dict = {
+        "horizons": list(hs),
+        "primary": hs[0] if hs else None,
+        "min_sample": ac.min_sample,
+        "total_recos": store.reco_count(),
+        "by_horizon": {},
+    }
+
+    recos = store.reco_history(days=lb)
+    pm = store.price_matrix(days=lb + longest + 5)
+    if recos.empty or pm.empty:
+        out["note"] = "누적 데이터 부족"
+        out["by_horizon"] = {
+            h: {"horizon": h, "n": 0, "pending": 0, "no_price": 0,
+                "note": "누적 데이터 부족"} for h in hs}
+    else:
+        out["sampled_recos"] = int(len(recos))
+        for h in hs:
+            df, pending, no_price = _score_horizon(recos, pm, h)
+            out["by_horizon"][h] = _summarize(df, h, pending, no_price)
+
+    out["progress"] = scoring_progress(out, ac.min_sample)
+    return out
+
+
+def scoring_progress(a: dict,
+                     min_scored: int = MIN_SCORED_FOR_JUDGMENT) -> dict:
+    """채점 진행률. 판단 기준까지 몇 건 남았는지 센다.
+
+    **누적 추천이 아니라 채점 완료 건수를 센다.** 추천 100건을 쌓아도
+    보유기간이 지나지 않았으면 성적은 0건이다. 진행률을 추천 건수로
+    표시하면 다 됐다고 착각한다.
+
+    기준 기간은 **가장 긴 보유기간**이다. 짧은 기간이 먼저 채워지므로
+    남은 시간을 결정하는 건 가장 긴 기간이다.
+    """
+    by = a.get("by_horizon") or {}
+    hs = a.get("horizons") or sorted(by)
+
+    def _cell(h, key):
+        d = by.get(h) or by.get(str(h)) or {}
+        return int(d.get(key) or 0)
+
+    scored = {h: _cell(h, "n") for h in hs}
+    judge = max(hs) if hs else None
+    done = scored.get(judge, 0) if judge is not None else 0
+    need = int(min_scored)
+    return {
+        "total_recos": int(a.get("total_recos") or 0),
+        "horizons": list(hs),
+        "scored": scored,
+        "pending": {h: _cell(h, "pending") for h in hs},
+        "judge_horizon": judge,
+        "min_scored": need,
+        "remaining": max(0, need - done),
+        "ready": done >= need,
+    }
+
+
+# ────────────────────── 1-b. 월간 회고 (전월) ──────────────────────
+def is_first_friday(d=None) -> bool:
+    """그 달의 첫 금요일인가. 월간 회고를 붙일 날을 정한다.
+
+    '첫째 주 금요일'이 아니라 '그 달의 첫 금요일'이다. 1일이 토요일이면
+    첫 금요일은 7일이므로 `day <= 7` 로 판정된다.
+    """
+    dt = as_date(d if d is not None else now_kst())
+    return dt.weekday() == 4 and dt.day <= 7
+
+
+def prev_month_bounds(d=None) -> tuple[str, str, str]:
+    """`d` 기준 전월의 (첫날, 마지막날, "YYYY-MM"). 달력일 문자열."""
+    dt = as_date(d if d is not None else now_kst())
+    first_this = date(dt.year, dt.month, 1)
+    last_prev = first_this - timedelta(days=1)
+    first_prev = date(last_prev.year, last_prev.month, 1)
+    return (first_prev.isoformat(), last_prev.isoformat(),
+            f"{last_prev.year:04d}-{last_prev.month:02d}")
+
+
+def _span_bars(dates: list[str], start: str, end: str) -> int | None:
+    """[start, end] 사이 거래일 수. start 봉을 1일로 센다.
+
+    달력일로 세면 주말·연휴에 앞서간다. 적재된 거래일만 센다. 구간이
+    시세 범위를 벗어나면 None (셀 수 없음).
+    """
+    if not dates or not start or not end:
+        return None
+    s, e = str(start)[:10], str(end)[:10]
+    if s > e or e > dates[-1] or s < dates[0]:
+        return None
+    lo = bisect.bisect_left(dates, s)
+    hi = bisect.bisect_right(dates, e)
+    return max(0, hi - lo)
+
+
+def _compliance(store, cfg: Config, entries: pd.DataFrame,
+                exits: pd.DataFrame, start: str, end: str) -> dict:
+    """규칙 준수율. 숫자와 목록만 만든다.
+
+    세 가지를 센다. 정의를 코드로 고정해 두지 않으면 매달 다른 것을
+    세게 되고, 그러면 추세를 볼 수 없다.
+
+      최소보유일 위반  체결된 청산 중 보유 거래일 < MIN_HOLD_DAYS 이고
+                       규칙이 손절·무효화·만료가 아닌 것. 엔진은 이런
+                       신호를 내지 않으므로 사람이 개입한 흔적이다.
+      손절 미이행      규칙이 stop:* 인데 executed=0. 나가라는 신호를
+                       받고 나가지 않은 건수다.
+      재진입 위반      손절 청산 후 COOLDOWN_DAYS 거래일 안에 같은 종목을
+                       다시 진입한 건수.
+
+    `close_position` 은 exit_log 를 남기지 않으므로 수동 종료는 보유일을
+    셀 수 없다. 그 건수를 `unverifiable` 로 따로 낸다 — 검증 못 한 것을
+    준수로 세면 준수율이 부풀려진다.
+    """
+    ec = cfg.exit
+    dates = store.price_dates()
+    min_hold, cooldown = int(ec.min_hold_days), int(ec.cooldown_days)
+    exempt = (STOP_RULE_PREFIX, "invalidation:", "hold:expired")
+
+    min_hold_list: list[dict] = []
+    stop_pending: list[dict] = []
+    checked = 0
+    if exits is not None and not exits.empty:
+        for _, r in exits.iterrows():
+            rule = str(r.get("rule") or "")
+            executed = int(r.get("executed") or 0)
+            if rule.startswith(STOP_RULE_PREFIX) and not executed:
+                stop_pending.append({
+                    "ticker": str(r["ticker"]), "name": str(r.get("name") or ""),
+                    "d": str(r["d"]), "rule": rule,
+                    "signal_price": r.get("signal_price"),
+                    "ret_pct": r.get("ret_pct")})
+            if not executed:
+                continue
+            checked += 1
+            if rule.startswith(exempt):
+                continue
+            held = _span_bars(dates, str(r.get("entry_date") or ""), str(r["d"]))
+            if held is not None and held < min_hold:
+                min_hold_list.append({
+                    "ticker": str(r["ticker"]), "name": str(r.get("name") or ""),
+                    "entry_date": str(r.get("entry_date") or ""),
+                    "d": str(r["d"]), "rule": rule, "held": held,
+                    "min_hold_days": min_hold})
+
+    # 재진입 위반: 구간 앞쪽 손절도 봐야 하므로 여유를 두고 조회한다.
+    look_from = (as_date(start) - timedelta(days=cooldown * 3 + 30)).isoformat()
+    prior = store.exit_log_between(look_from, end)
+    stops: dict[str, list[str]] = {}
+    if prior is not None and not prior.empty:
+        for _, r in prior.iterrows():
+            if str(r.get("rule") or "").startswith(STOP_RULE_PREFIX):
+                stops.setdefault(str(r["ticker"]), []).append(str(r["d"]))
+
+    reentry: list[dict] = []
+    if entries is not None and not entries.empty:
+        for _, p in entries.iterrows():
+            t = str(p["ticker"])
+            ed = str(p["entry_date"])[:10]
+            for sd in stops.get(t, ()):
+                if sd >= ed:
+                    continue          # 진입 이후의 손절은 위반이 아니다
+                gap = _span_bars(dates, sd, ed)
+                if gap is not None and gap <= cooldown:
+                    reentry.append({
+                        "ticker": t, "name": str(p.get("name") or ""),
+                        "stop_date": sd, "entry_date": ed,
+                        "gap_bars": gap, "cooldown_days": cooldown})
+                    break
+
+    # 수동 종료(exit_log 없음)는 보유일 검증이 불가능하다.
+    unverifiable = 0
+    if entries is not None and not entries.empty:
+        with_log = set()
+        if exits is not None and not exits.empty:
+            with_log = {int(x) for x in exits["position_id"].dropna().tolist()}
+        unverifiable = int(sum(1 for _, p in entries.iterrows()
+                               if str(p.get("status")) == "CLOSED"
+                               and int(p["id"]) not in with_log))
+
+    violations = len(min_hold_list) + len(stop_pending) + len(reentry)
+    denom = checked + len(stop_pending) + int(len(entries) if entries is not None
+                                              and not entries.empty else 0)
+    return {
+        "min_hold_days": min_hold,
+        "cooldown_days": cooldown,
+        "checked_exits": checked,
+        "checked_entries": int(len(entries)) if entries is not None
+        and not entries.empty else 0,
+        "min_hold_violations": len(min_hold_list),
+        "min_hold_list": min_hold_list,
+        "stop_not_executed": len(stop_pending),
+        "stop_not_executed_list": stop_pending,
+        "reentry_violations": len(reentry),
+        "reentry_list": reentry,
+        "unverifiable_closes": unverifiable,
+        "violations": violations,
+        "checks": denom,
+        "compliance_pct": (round((denom - violations) / denom * 100.0, 1)
+                           if denom else None),
+    }
+
+
+def monthly_review(store, cfg: Config = DEFAULT, asof=None) -> dict:
+    """전월 회고. 숫자와 목록만 낸다.
+
+    해석 문구를 넣지 않는다. '개선됐다', '양호하다' 같은 말은 표본이
+    20건도 안 되는 시점에 확신을 만들어낸다. 사람이 숫자를 보고 판단한다.
+    """
+    start, end, month = prev_month_bounds(asof)
+    entries = store.positions_between(start, end)
+    exits = store.exit_log_between(start, end)
+    recos = store.recos_between(start, end)
+
+    hs = tuple(cfg.audit.horizons)
+    by_h: dict = {}
+    if recos is not None and not recos.empty:
+        # 전월 추천을 채점하려면 최장 보유기간만큼 이후 시세가 필요하다.
+        span_days = (as_date(now_kst()) - as_date(start)).days + 10
+        pm = store.price_matrix(days=span_days)
+        for h in hs:
+            if pm is None or pm.empty:
+                by_h[h] = {"horizon": h, "n": 0, "pending": 0, "no_price": 0,
+                           "note": "시세 부족"}
+                continue
+            df, pending, no_price = _score_horizon(recos, pm, h)
+            by_h[h] = _summarize(df, h, pending, no_price)
+    else:
+        by_h = {h: {"horizon": h, "n": 0, "pending": 0, "no_price": 0,
+                    "note": "전월 추천 없음"} for h in hs}
+
+    return {
+        "month": month,
+        "start": start,
+        "end": end,
+        "horizons": list(hs),
+        "recos": int(len(recos)) if recos is not None and not recos.empty else 0,
+        "entries": (entries.to_dict("records")
+                    if entries is not None and not entries.empty else []),
+        "exits": (exits.to_dict("records")
+                  if exits is not None and not exits.empty else []),
+        "by_horizon": by_h,
+        "compliance": _compliance(store, cfg, entries, exits, start, end),
     }
 
 
@@ -261,8 +567,13 @@ def sector_concentration(recos: pd.DataFrame, meta: pd.DataFrame,
 
 # ────────────────────────── 종합 ──────────────────────────
 def weekly_report(store, cfg: Config = DEFAULT, week_days: int = 5,
-                  horizon: int = 5) -> dict:
-    """금요일 리포트 재료 일괄 생성."""
+                  horizon: int = 5, monthly: bool | None = None) -> dict:
+    """금요일 리포트 재료 일괄 생성.
+
+    monthly : None 이면 '그 달의 첫 금요일인가'로 자동 판정한다.
+              True/False 로 강제할 수 있다(검증·수동 재발행용).
+    """
+    want_monthly = is_first_friday() if monthly is None else bool(monthly)
     scans = store.scan_history(days=week_days * 2)
     recos = store.reco_history(days=week_days * 3)
     meta = store.ticker_meta()
@@ -274,11 +585,15 @@ def weekly_report(store, cfg: Config = DEFAULT, week_days: int = 5,
         "trade_date": store.last_price_date(),
         "days_covered": len(week_scan_days),
         "universe_size": int(week_scans["ticker"].nunique()) if not week_scans.empty else 0,
-        "audit": audit_recos(store, horizon=horizon),
+        # 보유기간 5/10/20 병렬 채점. 단일 기간만 필요하면 audit_recos().
+        "audit": audit_multi(store, cfg=cfg),
         "momentum": score_momentum(week_scans),
         "persistence": persistence(recos, week_scans),
         "churn": churn(recos, week_days),
         "eta": band_eta(week_scans),
         "events": weekly_events(week_scans, week_days),
         "sector": sector_concentration(recos, meta, week_days),
+        # 전월 회고는 매월 첫 금요일에만 붙인다. 매주 붙이면 같은 숫자를
+        # 네 번 보게 되고, 그러면 읽지 않는다.
+        "monthly": monthly_review(store, cfg=cfg) if want_monthly else None,
     }

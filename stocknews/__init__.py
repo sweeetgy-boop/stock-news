@@ -13,20 +13,32 @@
         트랙 V는 밴드로 들어가서 밴드로 나오고,
         트랙 T는 크로스로 들어가서 트레일링으로 나온다.
 """
-from .config import (Config, CreditConfig, DEFAULT, ExitConfig, FibConfig,
-                     GateConfig, MAConfig)
+from .config import (Config, CreditConfig, DEFAULT, DividendConfig,
+                     ExitConfig, FibConfig, GateConfig, MAConfig,
+                     NewsFreqConfig, SectorConfig)
 from .contracts import (DONE_TAKE1, DONE_TAKE2, CrossEvent, ExitDecision,
                         FibSignal, LiquidationSignal, Position, ScreenResult,
                         TrendSignal)
 from .daily import run_daily, scan_all, select_recommendations
+from .dividend_data import (collect_dividends, latest_fiscal_year,
+                            parse_alot_matter, parse_cashflow, payout_ratio)
+from .dividend_calendar import (build_dividend_report, dps_cagr,
+                                record_date_plan, report_send_allowed)
+from .dividend_screen import (collect_dividend_screen, screen_dividends,
+                              screen_one as screen_dividend_one)
+from .env import load_env
 from .exits import evaluate_position, evaluate_rotation, run_exits
 from .fibonacci import evaluate_fib, fib_levels, is_below_level
-from .flags import flag_summary, refresh_flags
+from .flags import (flag_summary, refresh_credit, refresh_credit_chain,
+                    refresh_flags)
 from .indicators import evaluate_trend, last_cross, moving_averages
+from .kiwoom_rest import KiwoomRestClient, collect_credit
 from .liquidation import evaluate_liquidation, liquidation_band, margin_call_due_dates
 from .news import classify, normalize_title, process_and_store, theme_shift
+from .news_freq import collect_news_freq, compute_news_freq
 from .news_sources import collect_all
 from .screener import rank_results, screen_one, screen_universe
+from .sector_metrics import collect_sector_metrics, compute_sector_metrics
 from .store import Store
 from .weekly import audit_recos, band_eta, score_momentum, weekly_report
 
@@ -44,6 +56,19 @@ __all__ = [
     "ExitConfig", "Position", "ExitDecision", "DONE_TAKE1", "DONE_TAKE2",
     "evaluate_position", "evaluate_rotation", "run_exits",
     "refresh_flags", "flag_summary",
+    "refresh_credit", "refresh_credit_chain",
+    "KiwoomRestClient", "collect_credit",
+    # 섹터·뉴스 지표 — 기록 전용. 점수·추천·알림에 쓰지 않는다.
+    "SectorConfig", "compute_sector_metrics", "collect_sector_metrics",
+    "NewsFreqConfig", "compute_news_freq", "collect_news_freq",
+    # 배당 — 수집·저장·필터만. 점수·추천·알림에 넣지 않는다.
+    "collect_dividends", "latest_fiscal_year", "parse_alot_matter",
+    "parse_cashflow", "payout_ratio",
+    "DividendConfig", "screen_dividends", "screen_dividend_one",
+    "collect_dividend_screen",
+    "build_dividend_report", "dps_cagr", "record_date_plan",
+    "report_send_allowed",
+    "load_env",
 ]
 
 __version__ = "0.5.0"

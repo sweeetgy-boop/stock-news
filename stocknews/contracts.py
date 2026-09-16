@@ -140,6 +140,11 @@ class Position:
     remaining: int
 
     # ── 진입 시점 스냅샷 (재계산 금지) ──
+    # stop_price 는 진입 시 확정 기록되는 손절선이다. 청산 판정은 이 값만
+    # 본다. 판정 시점에 다시 계산하면 손절선이 주가를 따라 내려간다.
+    # 사후 수정 API 는 의도적으로 두지 않았다 — 손절선을 옮길 수 있으면
+    # 손절은 규칙이 아니라 기분이 된다.
+    stop_price: Optional[float] = None
     entry_p0: Optional[float] = None
     entry_band_hi: Optional[float] = None
     entry_band_mid: Optional[float] = None
@@ -188,6 +193,23 @@ class ExitDecision:
     fill_note: str = "익일 시가 집행 가정"
     detail: dict = field(default_factory=dict)
 
+
+# 계층 0 은 두 규칙이 공유한다: 무효화(invalidation:*)와 보유기간
+# 만료(hold:expired). 사람이 읽는 이름은 규칙으로 갈라야 하므로
+# RULE_NAME 을 먼저 본다.
+RULE_NAME = {
+    "hold:expired": "보유만료",
+}
+
+# 계층 1 손절 규칙 접두사. 재진입 쿨다운을 걸 대상을 이걸로 판별한다.
+STOP_RULE_PREFIX = "stop:"
+
+# 배제 플래그의 사유 코드. 자동 판정과 사람이 넣은 것을 구분한다.
+# 자동 쿨다운은 만료되면 코드가 스스로 지우지만, 수동 플래그는 사람이
+# 지울 때까지 남아야 한다. 같은 컬럼에 섞으면 만료 청소가 수동 항목을
+# 지운다.
+COOLDOWN_REASON = "AUTO:STOP_COOLDOWN"
+MANUAL_REASON = "MANUAL"
 
 LAYER_NAME = {
     0: "무효화",

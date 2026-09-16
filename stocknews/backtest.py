@@ -40,7 +40,7 @@ import pandas as pd
 
 from .config import Config, DEFAULT
 from .contracts import Position
-from .exits import evaluate_position
+from .exits import evaluate_position, stop_price_for
 from .indicators import moving_averages
 from .liquidation import liquidation_band
 from .screener import screen_one
@@ -306,6 +306,10 @@ def simulate_exit_rules(store, events: pd.DataFrame, cfg: Config = DEFAULT,
             id=0, ticker=code, name=str(ev.get("name") or code), track=track,
             entry_date=ohlcv.index[i0 + 1].strftime("%Y-%m-%d"),
             entry_price=entry, qty=100, remaining=100,
+            # 실거래와 같은 규칙으로 손절선을 진입 시 고정한다. 이걸 빼면
+            # 백테스트에서만 계층 1 고정 손절이 발동하지 않아 성과가
+            # 실제보다 좋게 나온다.
+            stop_price=stop_price_for(entry, cfg),
             entry_p0=snap.liq.cost_basis if snap.liq else None,
             entry_band_hi=band.get("hi"), entry_band_mid=band.get("mid"),
             entry_band_lo=band.get("lo"),
