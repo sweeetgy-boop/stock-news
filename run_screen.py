@@ -90,7 +90,7 @@ from stocknews.news import process_and_store, theme_shift
 from stocknews.news_freq import collect_news_freq
 from stocknews.news_sources import collect_all
 from stocknews.notify import (AlertGate, reco_send_allowed,  # noqa: F401
-                             reco_send_dow_label, send_photo, send_telegram)
+                             reco_send_dow_label, send_album, send_telegram)
 from stocknews.renderer import (render_daily_holdings, render_detail,
                                 render_dividend_report,
                                 render_evening_brief, render_exit_alert,
@@ -586,13 +586,14 @@ def _holdings_msg(store: Store, args, asof, trade_date: str, scanned: int,
 
 def _send_charts(store: Store, args, trade_date: str, picks=None,
                  rows=None) -> None:
-    """추천 발송 **뒤에** 상위 등급 차트를 붙인다 (CHART_MIN_GRADE · CHART_MAX_COUNT).
+    """추천 발송 **뒤에** 10선 차트를 앨범 1개로 붙인다 (CHART_MAX_COUNT).
 
     어떤 실패도 텍스트 발송으로 번지지 않는다. 텍스트는 이미 나갔고,
-    차트 생성 실패(데이터·폰트·matplotlib)는 그 종목만 건너뛴다.
-    사진 **발송** 실패만 send_failed 로 센다 — 텍스트 발송 실패와 같은
+    차트 생성 실패(데이터·폰트·matplotlib)는 그 종목만 앨범에서 빠진다.
+    앨범이 실패한 수신자에게는 send_album 이 사진을 한 장씩 다시 보낸다.
+    그래도 못 받은 수신자만 send_failed 로 센다 — 텍스트 발송 실패와 같은
     규칙(exit 2 + nightly 요약의 수신자별 실패)으로 드러나야 하기 때문이다.
-    --dry-run 이면 PNG 는 만들고 보내지 않는다.
+    --dry-run 이면 PNG 와 앨범 요청 구성까지만 만들고 보내지 않는다.
 
     picks : 방금 채점한 [(slot, ScreenResult)] (스캔 경로)
     rows  : recos 행 (일요일 경로 — DB 시세로 재계산해 그린다)
@@ -602,6 +603,7 @@ def _send_charts(store: Store, args, trade_date: str, picks=None,
     SUMMARY["charts"] = info
     try:
         from stocknews import chart as ch
+        from stocknews.notify import album_payload, caption_units, fit_caption
         jobs = (ch.jobs_from_picks(picks) if picks is not None
                 else ch.jobs_from_rows(rows))
         targets = ch.select_targets(jobs, DEFAULT)
@@ -610,57 +612,60 @@ def _send_charts(store: Store, args, trade_date: str, picks=None,
             return
         ch.prune_chart_dirs(DEFAULT)
         outs = ch.build_charts(store, targets, trade_date, DEFAULT)
+        items = ch.album_items(outs, DEFAULT)
+        # 실제 요청과 같은 함수로 구성한다. dry-run 에서 본 것이 나가는 것이다.
+        media, _names = album_payload(
+            [(p, *fit_caption(c)) for p, c in items])
     except Exception as exc:  # noqa: BLE001 - 차트는 부가 정보다
         info["error"] = f"{type(exc).__name__}: {exc}"[:200]
         log.warning("차트 단계 실패 — 텍스트 발송은 이미 끝났습니다 (%s)",
                     info["error"])
         return
 
-    halted = ""
     for o in outs:
         if o.path is None:
             info["failed"].append({"ticker": o.ticker, "stage": "render",
                                    "error": (o.error or "")[:200]})
-            continue
-        if halted:
-            # 앞 사진이 전원에게 실패했다(토큰·네트워크). 같은 벽에 남은
-            # 사진을 던지면 장당 최대 90초 x 수신자 수를 기다리기만 한다.
-            info["failed"].append({"ticker": o.ticker, "stage": "skipped",
-                                   "error": halted})
-            continue
-        info["made"] += 1
-        info["files"].append(str(o.path))
-        if args.dry_run:
-            out = _out()
-            print("-" * 62, file=out)
-            print(f"[차트 {o.rank}. {o.name}({o.ticker})] {o.path}", file=out)
-            print(o.caption, file=out)
-            continue
-        try:
-            report = send_photo(o.path, o.caption)
-        except Exception as exc:  # noqa: BLE001
-            msg = f"{type(exc).__name__}: {exc}"[:200]
-            info["failed"].append({"ticker": o.ticker, "stage": "send",
-                                   "error": msg})
-            log.warning("차트 발송 실패 %s — 건너뜀: %s", o.ticker, msg)
-            continue
-        if report:
-            info["sent"] += 1
-            continue
+    info["made"] = len(items)
+    info["files"] = [str(p) for p, _c in items]
+    info["album"] = {"photos": len(media),
+                     "caption_max": max((caption_units(m["caption"])
+                                         for m in media), default=0)}
+    if not items:
+        return
+    if args.dry_run:
+        _say("-" * 62)
+        _say(f"[차트 앨범 {len(media)}장 · 캡션 최대 "
+             f"{info['album']['caption_max']}자]")
+        for (p, _c), m in zip(items, media):
+            _say(f"  {p}")
+            _say("    " + m["caption"].replace("\n", "\n    "))
+        log.info("차트 대상 %d · 생성 %d · 실패 %d (dry-run: 앨범 발송 안 함)",
+                 info["eligible"], info["made"], len(info["failed"]))
+        return
+
+    try:
+        report = send_album(items)
+    except Exception as exc:  # noqa: BLE001
+        msg = f"{type(exc).__name__}: {exc}"[:200]
+        info["failed"].append({"ticker": "*", "stage": "send", "error": msg})
+        log.warning("차트 앨범 발송 실패 — 건너뜀: %s", msg)
+        return
+    info["sent"] = report.sent
+    if report.fallback:
+        info["fallback"] = list(report.fallback)
+        log.warning("앨범 대신 개별 사진으로 받은 수신자: %s",
+                    ", ".join(report.fallback))
+    if not report:
         SUMMARY["send_failed"] = (SUMMARY.get("send_failed", 0)
                                   + len(report.failures))
         SUMMARY.setdefault("send_failures", []).extend(
-            {**d, "kind": "chart", "ticker": o.ticker}
-            for d in report.as_dicts())
-        info["failed"].append({"ticker": o.ticker, "stage": "send",
+            {**d, "kind": "chart"} for d in report.as_dicts())
+        info["failed"].append({"ticker": "*", "stage": "send",
                                "error": report.summary()})
-        log.error("차트 %s %s", o.ticker, report.summary())
-        if report.sent == 0:
-            halted = f"{o.ticker} 사진이 전 수신자에게 실패 — 남은 차트 발송 중단"
-            log.error("%s", halted)
-    log.info("차트 대상 %d · 생성 %d · 발송 %d · 실패 %d%s",
-             info["eligible"], info["made"], info["sent"],
-             len(info["failed"]), " (dry-run: 발송 안 함)" if args.dry_run else "")
+        log.error("차트 앨범 %s", report.summary())
+    log.info("차트 대상 %d · 생성 %d · 앨범 수신 %d명 · 실패 %d",
+             info["eligible"], info["made"], report.sent, len(info["failed"]))
 
 
 def _iso_date(text: str):

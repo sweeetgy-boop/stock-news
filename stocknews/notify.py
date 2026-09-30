@@ -28,6 +28,7 @@ __all__ = ["AlertWindow", "WINDOWS", "AlertGate", "send_telegram", "now_kst",
            "TelegramNotConfigured", "DOW_KR", "reco_send_allowed",
            "reco_send_dow_label", "parse_chat_ids", "mask_chat_id",
            "SendFailure", "SendReport", "send_photo", "fit_caption",
+           "send_album", "album_payload", "MEDIA_GROUP_MAX",
            "caption_units", "TELEGRAM_CAPTION_MAX"]
 
 log = logging.getLogger("notify")
@@ -335,6 +336,8 @@ class SendReport:
 
     sent: int
     failures: tuple[SendFailure, ...] = ()
+    # 앨범이 실패해 개별 사진으로 받은 수신자 (마스킹된 ID). 실패는 아니다.
+    fallback: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         return not self.failures
@@ -534,25 +537,11 @@ def send_photo(path, caption: str = "", chat_id: str | None = None,
         log.warning("캡션 %d -> %d (상한 %d) — 뒷줄을 잘랐습니다",
                     caption_units(caption), caption_units(cap),
                     TELEGRAM_CAPTION_MAX)
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
-    data = {"caption": cap}
-    if mode:
-        data["parse_mode"] = mode
-
-    def post_to(target: str):
-        def post():
-            with path.open("rb") as fh:
-                return requests.post(
-                    url, data={**data, "chat_id": target},
-                    files={"photo": (path.name, fh, "image/png")},
-                    timeout=30)
-        return post
-
     sent = 0
     failures: list[SendFailure] = []
     for target in targets:
         fail = _deliver(mask_chat_id(target), f"사진 {path.name}",
-                        post_to(target), retries)
+                        _photo_post(token, target, path, cap, mode), retries)
         if fail is None:
             sent += 1
         else:
@@ -561,3 +550,140 @@ def send_photo(path, caption: str = "", chat_id: str | None = None,
     if failures:
         log.error("텔레그램 사진 %d명 중 %d명 실패", len(targets), len(failures))
     return SendReport(sent=sent, failures=tuple(failures))
+
+
+def _photo_post(token: str, target: str, path: Path, cap: str,
+                mode: str | None):
+    """sendPhoto 요청 함수. 부를 때마다 파일을 새로 연다 (재시도 대비)."""
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    data = {"chat_id": target, "caption": cap}
+    if mode:
+        data["parse_mode"] = mode
+
+    def post():
+        with path.open("rb") as fh:
+            return requests.post(url, data=data,
+                                 files={"photo": (path.name, fh, "image/png")},
+                                 timeout=30)
+    return post
+
+
+# 앨범 상한. 텔레그램 sendMediaGroup 은 2~10장을 받는다.
+MEDIA_GROUP_MAX = 10
+# 앨범이 이 코드로 실패하면 개별 발송으로 폴백하지 않는다. 토큰(401)·
+# 차단(403)·방 없음(404)은 수신자 단위 문제라 사진을 한 장씩 보내도 같다.
+# 400 은 폴백한다 — 앨범 구성·캡션 파싱처럼 요청 모양 탓일 수 있다.
+_NO_FALLBACK = frozenset({401, 403, 404})
+
+
+def album_payload(items: list[tuple[Path, str, str | None]]
+                  ) -> tuple[list[dict], list[str]]:
+    """sendMediaGroup 의 media 배열과 첨부 이름. 네트워크 없음 (dry-run 이 쓴다).
+
+    items : [(경로, 캡션, parse_mode)] — 캡션은 이미 fit_caption 을 거친 것.
+    사진마다 캡션을 단다. 앨범에서는 넘겨 볼 때 사진별 캡션이 보인다.
+    """
+    media, names = [], []
+    for i, (_path, cap, mode) in enumerate(items):
+        name = f"photo{i}"
+        m = {"type": "photo", "media": f"attach://{name}", "caption": cap}
+        if mode:
+            m["parse_mode"] = mode
+        media.append(m)
+        names.append(name)
+    return media, names
+
+
+def _album_post(token: str, target: str,
+                items: list[tuple[Path, str, str | None]]):
+    url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+    media, names = album_payload(items)
+    data = {"chat_id": target, "media": json.dumps(media, ensure_ascii=False)}
+
+    def post():
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            files = {n: (p.name, stack.enter_context(p.open("rb")), "image/png")
+                     for n, (p, _c, _m) in zip(names, items)}
+            # 10장 x 약 110KB. 사진 1장(30초)보다 넉넉히 준다.
+            return requests.post(url, data=data, files=files, timeout=90)
+    return post
+
+
+def _one_by_one(token: str, target: str,
+                items: list[tuple[Path, str, str | None]],
+                retries: int) -> SendFailure | None:
+    """앨범 폴백. 사진을 순서대로 한 장씩. 한 장이라도 실패하면 거기서 멈춘다.
+
+    멈추는 이유: 네트워크가 죽었으면 남은 사진도 장당 재시도 x 타임아웃을
+    다 쓰고 같은 결과가 된다. 몇 장까지 갔는지는 실패 사유에 남긴다.
+    """
+    who = mask_chat_id(target)
+    for i, (path, cap, mode) in enumerate(items, 1):
+        fail = _deliver(who, f"개별 {i}/{len(items)} {path.name}",
+                        _photo_post(token, target, path, cap, mode), retries)
+        if fail is not None:
+            return SendFailure(who, fail.status,
+                               f"개별 발송 {i - 1}/{len(items)}장 후 실패: "
+                               f"{fail.error}")
+        time.sleep(0.4)
+    return None
+
+
+def send_album(items: list[tuple], chat_id: str | None = None,
+               token: str | None = None, retries: int = 3,
+               fallback: bool = True) -> SendReport:
+    """사진 여러 장을 앨범(sendMediaGroup)으로. 10장이 넘으면 앨범을 나눈다.
+
+    items : [(경로, 캡션)] 순서대로. 캡션은 장마다 1,024자로 줄인다.
+    수신자·재시도·실패 기록은 send_telegram 과 같다. 앨범이 실패한
+    수신자에게만 send_photo 방식으로 한 장씩 다시 보낸다 — 앨범을 이미
+    받은 수신자에게 같은 사진이 두 번 가면 안 된다. 폴백으로 받은 수신자는
+    실패가 아니고 `.fallback` 에 남는다. 1장뿐인 묶음은 sendPhoto 로 간다
+    (sendMediaGroup 은 2장 이상만 받는다).
+    """
+    token, targets = _targets(chat_id, token)
+    prepared = []
+    for path, caption in items:
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"사진 파일 없음: {path}")
+        cap, mode = fit_caption(caption)
+        prepared.append((path, cap, mode))
+    if not prepared:
+        return SendReport(sent=0)
+    groups = [prepared[i:i + MEDIA_GROUP_MAX]
+              for i in range(0, len(prepared), MEDIA_GROUP_MAX)]
+
+    sent = 0
+    failures: list[SendFailure] = []
+    used_fallback: list[str] = []
+    for target in targets:
+        who = mask_chat_id(target)
+        fail = None
+        for g in groups:
+            if len(g) == 1:
+                p, c, m = g[0]
+                fail = _deliver(who, f"사진 {p.name}",
+                                _photo_post(token, target, p, c, m), retries)
+            else:
+                fail = _deliver(who, f"앨범 {len(g)}장",
+                                _album_post(token, target, g), retries)
+                if (fail is not None and fallback
+                        and fail.status not in _NO_FALLBACK):
+                    log.warning("텔레그램 %s 앨범 실패 (%s) — 개별 발송으로 폴백",
+                                who, fail.status or "무응답")
+                    fail = _one_by_one(token, target, g, retries)
+                    if fail is None and who not in used_fallback:
+                        used_fallback.append(who)
+            if fail is not None:
+                break
+            time.sleep(0.4)
+        if fail is None:
+            sent += 1
+        else:
+            failures.append(fail)
+    if failures:
+        log.error("텔레그램 앨범 %d명 중 %d명 실패", len(targets), len(failures))
+    return SendReport(sent=sent, failures=tuple(failures),
+                      fallback=tuple(used_fallback))

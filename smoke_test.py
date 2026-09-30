@@ -8848,6 +8848,7 @@ def test_chart(tmp: Path):
     import dataclasses
     import importlib
     import io
+    import json as _j
     import os
     import sqlite3
 
@@ -8863,10 +8864,13 @@ def test_chart(tmp: Path):
     r_crash = screen_one("000001", "급락 & <우선>", fixture_crash())
 
     def t_config():
-        assert C.CHART_MIN_GRADE == "B" and C.CHART_MAX_COUNT == 5
+        assert C.CHART_MIN_GRADE is None and C.CHART_MAX_COUNT == 10
+        assert C.CHART_DISCLAIMER == "검증 중 · 투자 판단 근거 아님"
         assert DEFAULT.chart.min_grade == C.CHART_MIN_GRADE, "상수 미배선"
         assert DEFAULT.chart.max_count == C.CHART_MAX_COUNT, "상수 미배선"
-        assert DEFAULT.chart.min_grade in ch.GRADE_RANK, "알 수 없는 등급"
+        assert DEFAULT.chart.disclaimer == C.CHART_DISCLAIMER, "상수 미배선"
+        # 10선 전부가 앨범 1개에 들어가야 한다
+        assert DEFAULT.chart.max_count <= nt.MEDIA_GROUP_MAX
         # 매물대 구간이 P0(방법 C)와 같아야 차트의 POC 가 P0 와 맞는다
         assert DEFAULT.chart.bars == POC_MIN_LOOKBACK
         for k in DEFAULT.chart.fib_levels:
@@ -8884,22 +8888,21 @@ def test_chart(tmp: Path):
         else:
             raise AssertionError("잘못된 CHART_MIN_GRADE 를 받아들였다")
 
-    def t_select_grade_first():
-        """등급 순으로 자른 뒤 순위 순으로 돌려준다.
-
-        순위 순으로만 자르면 슬롯상 뒤에 오는 추세 트랙 A 가 앞쪽 B 에
-        밀려 빠진다 (2026-09-30 실데이터: 3~7위 B, 8~10위 A).
-        """
+    def t_select_rank_order():
+        """등급 필터 없이 추천 순위 순으로 max_count(10)까지."""
         grades = ["A", "A", "B", "B", "B", "B", "B", "A", "A", "S+"]
         jobs = [ch.ChartJob(i, f"{i:06d}", f"n{i}", g)
-                for i, g in enumerate(grades, 1)]
+                for i, g in reversed(list(enumerate(grades, 1)))]
         got = [j.rank for j in ch.select_targets(jobs)]
-        assert got == [1, 2, 8, 9, 10], got
+        assert got == list(range(1, 11)), got
         jobs.append(ch.ChartJob(11, "000011", "n11", "NONE"))
-        cfg = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
-            DEFAULT.chart, max_count=20))
-        got = [j.rank for j in ch.select_targets(jobs, cfg)]
-        assert got == list(range(1, 11)), f"NONE 이 섞였거나 순서 틀림 {got}"
+        got = [j.rank for j in ch.select_targets(jobs)]
+        assert got == list(range(1, 11)), f"상한 10 초과 또는 순서 틀림 {got}"
+        # min_grade 를 주면 필터가 살아난다 (순위 순 유지)
+        cfg_a = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
+            DEFAULT.chart, min_grade="A"))
+        got = [j.rank for j in ch.select_targets(jobs, cfg_a)]
+        assert got == [1, 2, 8, 9, 10], got
         cfg0 = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
             DEFAULT.chart, max_count=0))
         assert ch.select_targets(jobs, cfg0) == []
@@ -8971,13 +8974,14 @@ def test_chart(tmp: Path):
             ch._FONT.update(saved)
 
     def t_caption_content():
+        """사진 캡션 = 등급 · 점수 · 밴드 위치 · 피보 위치 (앨범용 4줄)."""
         cap = ch.chart_caption(r_crash, rank=3, flags={}, trade_date="2026-08-24")
-        for kw in (f"[{r_crash.grade}]", "매집", "추세", "LPS", "신용과열",
-                   "밴드 위치", "청산중심", "P0", "피보", "0.618=",
-                   "배제 플래그: 없음", "2026-08-24", "3. "):
+        for kw in (f"[{r_crash.grade}]", "매집", "추세", "밴드 위치",
+                   "청산중심", "피보 진행률", "0.618", "2026-08-24", "3. "):
             assert kw in cap, f"캡션에 '{kw}' 없음:\n{cap}"
+        assert cap.count("\n") == 3, f"4줄이 아님:\n{cap}"
+        assert "배제 플래그" not in cap, "플래그가 없는데 줄을 썼다"
         assert "&amp;" in cap and "&lt;우선&gt;" in cap, "종목명 이스케이프 누락"
-        assert "(프록시)" in cap, "신용잔고 프록시 표시 누락"
         warn = ch.chart_caption(r_crash, flags={"관리종목": True},
                                 exclusion="시가총액 500억 (하한 1,000억)")
         assert "⚠️ 배제 플래그: 관리종목, 시가총액" in warn, warn
@@ -8987,6 +8991,26 @@ def test_chart(tmp: Path):
         assert "기록 점수" not in same
         diff = ch.chart_caption(r_crash, recorded=(9.99, 0.0))
         assert "기록 점수 매집 9.99" in diff, diff
+        bare = ch.chart_caption(dataclasses.replace(r_crash, liq=None, fib=None))
+        assert "밴드 위치 -" in bare and "피보 -" in bare, bare
+
+    def t_album_items_disclaimer():
+        """첫 사진 캡션 맨 끝에만 면책 문구. 본문이 길어도 문구는 잘리지 않는다."""
+        tail = "검증 중 · 투자 판단 근거 아님"
+        outs = [ch.ChartOut(r, f"{r:06d}", f"n{r}", png, f"<b>{r}위</b> 캡션")
+                for r in (3, 1, 2)]
+        outs.append(ch.ChartOut(4, "000004", "실패", None, error="x"))
+        items = ch.album_items(outs)
+        assert [str(p) for p, _c in items] == [str(png)] * 3
+        caps = [c for _p, c in items]
+        assert caps[0].startswith("<b>1위</b>"), "순위 순이 아님"
+        assert caps[0].rstrip().endswith(f"<i>{tail}</i>"), caps[0]
+        assert all(tail not in c for c in caps[1:]), "문구가 첫 장 밖에도 붙음"
+        huge = [ch.ChartOut(1, "1", "n", png, "\n".join("줄" * 90 for _ in range(40)))]
+        cap0 = ch.album_items(huge)[0][1]
+        assert nt.caption_units(cap0) <= 1024, nt.caption_units(cap0)
+        assert cap0.endswith(f"<i>{tail}</i>"), "긴 본문에 문구가 잘렸다"
+        assert ch.album_items([]) == []
 
     def t_caption_limit():
         long = dataclasses.replace(r_crash, name="가" * 1500)
@@ -9041,6 +9065,9 @@ def test_chart(tmp: Path):
             if "photo" in files:
                 _n, fh, _t = files["photo"]
                 kw = {**kw, "_photo_bytes": len(fh.read())}
+            elif files:
+                kw = {**kw, "_files": {k: len(v[1].read())
+                                       for k, v in files.items()}}
             calls.append((url, kw))
             s = script.pop(0) if script else 200
             if isinstance(s, Exception):
@@ -9111,6 +9138,93 @@ def test_chart(tmp: Path):
                 if v is not None:
                     os.environ[k] = v
 
+    pngs = []
+    for i in range(11):
+        pp = tmp / f"alb{i}.png"
+        pp.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * (100 + i))
+        pngs.append(pp)
+
+    def _urls(calls):
+        return [u.rsplit("/", 1)[-1] for u, _kw in calls]
+
+    def t_album_request_shape():
+        """sendMediaGroup 1회 = 앨범 1개. 사진별 캡션 · 파일 전부 첨부."""
+        items = [(pngs[i], f"<b>{i}</b> & 캡션") for i in range(3)]
+        rep_, calls = _with_post([200], lambda: nt.send_album(
+            items, chat_id="1111", token="T"))
+        assert rep_ and rep_.sent == 1 and rep_.fallback == (), rep_
+        assert _urls(calls) == ["sendMediaGroup"], _urls(calls)
+        kw = calls[0][1]
+        media = _j.loads(kw["data"]["media"])
+        assert [m["media"] for m in media] == [
+            "attach://photo0", "attach://photo1", "attach://photo2"], media
+        assert all(m["type"] == "photo" and m["parse_mode"] == "HTML"
+                   for m in media)
+        assert media[1]["caption"] == "<b>1</b> & 캡션"
+        assert kw["_files"] == {"photo0": 108, "photo1": 109, "photo2": 110}, \
+            kw["_files"]
+        assert kw["data"]["chat_id"] == "1111"
+
+    def t_album_caption_limit():
+        long = "\n".join("줄" * 100 for _ in range(30))
+        _r, calls = _with_post([200], lambda: nt.send_album(
+            [(pngs[0], long), (pngs[1], "짧음")], chat_id="1", token="T"))
+        media = _j.loads(calls[0][1]["data"]["media"])
+        assert all(nt.caption_units(m["caption"]) <= 1024 for m in media)
+        media2, names = nt.album_payload([(pngs[0], "c", None)])
+        assert "parse_mode" not in media2[0] and names == ["photo0"]
+
+    def t_album_recipients_independent():
+        """수신자별 독립. 403 수신자는 폴백 없이 실패, 다른 수신자는 앨범."""
+        rep_, calls = _with_post([403, 200], lambda: nt.send_album(
+            [(pngs[0], "a"), (pngs[1], "b")], chat_id="1111,2222", token="T"))
+        assert _urls(calls) == ["sendMediaGroup", "sendMediaGroup"], _urls(calls)
+        assert rep_.sent == 1 and rep_.failures[0].chat == "****1111"
+        assert rep_.failures[0].status == 403 and rep_.fallback == ()
+
+    def t_album_fallback_to_photos():
+        """앨범이 400 이면 **그 수신자에게만** 한 장씩. 실패가 아니라 fallback."""
+        rep_, calls = _with_post([400, 200, 200, 200, 200], lambda: nt.send_album(
+            [(pngs[i], f"c{i}") for i in range(3)], chat_id="1111,2222",
+            token="T"))
+        assert _urls(calls) == ["sendMediaGroup", "sendPhoto", "sendPhoto",
+                                "sendPhoto", "sendMediaGroup"], _urls(calls)
+        assert rep_ and rep_.sent == 2, rep_
+        assert rep_.fallback == ("****1111",), rep_.fallback
+        caps = [kw["data"]["caption"] for _u, kw in calls[1:4]]
+        assert caps == ["c0", "c1", "c2"], "폴백 순서·캡션이 앨범과 다르다"
+        assert all(kw["data"]["chat_id"] == "1111" for _u, kw in calls[1:4])
+
+    def t_album_fallback_stops_on_failure():
+        """폴백 중 한 장이 실패하면 남은 사진은 보내지 않는다."""
+        rep_, calls = _with_post([500, 500, 500, 200, 400], lambda: nt.send_album(
+            [(pngs[i], f"c{i}") for i in range(3)], chat_id="1111", token="T"))
+        # 앨범 500 x3(재시도) -> 폴백 1장 200 -> 2장째 400(영구) -> 중단
+        assert _urls(calls) == ["sendMediaGroup"] * 3 + ["sendPhoto"] * 2, \
+            _urls(calls)
+        assert not rep_ and rep_.failures[0].status == 400
+        assert "개별 발송 1/3장 후 실패" in rep_.failures[0].error, rep_.failures
+        assert rep_.fallback == ()
+
+    def t_album_split_over_ten():
+        """11장 = 앨범 10장 + 남은 1장은 sendPhoto (앨범은 2장 이상)."""
+        rep_, calls = _with_post([200, 200], lambda: nt.send_album(
+            [(pp, "c") for pp in pngs], chat_id="1", token="T"))
+        assert _urls(calls) == ["sendMediaGroup", "sendPhoto"], _urls(calls)
+        assert len(_j.loads(calls[0][1]["data"]["media"])) == 10
+        assert rep_ and rep_.sent == 1
+
+    def t_album_preconditions():
+        try:
+            nt.send_album([(tmp / "nope.png", "c")], chat_id="1", token="T")
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("없는 파일을 보냈다")
+        r0, calls = _with_post([], lambda: nt.send_album([], chat_id="1",
+                                                          token="T"))
+        assert r0.sent == 0 and calls == []
+
     def t_send_telegram_unchanged():
         """_deliver 로 옮긴 뒤에도 텍스트 발송 규칙이 같다."""
         rep, calls = _with_post([429, 200, 200], lambda: nt.send_telegram(
@@ -9143,13 +9257,16 @@ def test_chart(tmp: Path):
         con.execute("INSERT INTO scans(d,ticker) VALUES(?,?)", (d, "000001"))
         con.commit()
 
-    def _sunday(dry: bool, text_ok=True, photo=None):
-        """일요일 경로(기록된 추천 발송)를 tmp 를 cwd 로 두고 태운다."""
+    def _sunday(dry: bool, text_ok=True, album=None):
+        """일요일 경로(기록된 추천 발송)를 tmp 를 cwd 로 두고 태운다.
+
+        album(items) 이 SendReport 를 돌려주거나 예외를 던진다. 기본은 성공.
+        """
         mod = importlib.import_module("run_screen")
         args = argparse.Namespace(force=False, dry_run=dry, with_fib=False,
                                   top=10, limit=None, min_amount=0.0)
         saved = (dict(mod.SUMMARY), mod.reco_send_allowed, mod.send_telegram,
-                 mod.send_photo, os.getcwd())
+                 mod.send_album, os.getcwd())
         sent_text: list[str] = []
         sent_photo: list[tuple] = []
 
@@ -9158,18 +9275,18 @@ def test_chart(tmp: Path):
             return nt.SendReport(sent=2) if text_ok else nt.SendReport(
                 sent=0, failures=(nt.SendFailure("****1111", 500, "x"),))
 
-        def fake_photo(path, caption, *a, **k):
-            sent_photo.append((path, caption))
-            if photo is None:
+        def fake_album(items, *a, **k):
+            sent_photo.append(list(items))
+            if album is None:
                 return nt.SendReport(sent=2)
-            return photo(path)
+            return album(items)
 
         buf = io.StringIO()
         try:
             mod.SUMMARY.clear()
             mod.reco_send_allowed = lambda *a, **k: (True, "send_dow")
             mod.send_telegram = fake_text
-            mod.send_photo = fake_photo
+            mod.send_album = fake_album
             os.chdir(tmp)               # data/charts 를 tmp 아래로
             with contextlib.redirect_stdout(buf):
                 rc = mod.mode_daily(st, args)
@@ -9178,57 +9295,58 @@ def test_chart(tmp: Path):
             os.chdir(saved[4])
             mod.SUMMARY.clear()
             mod.SUMMARY.update(saved[0])
-            (mod.reco_send_allowed, mod.send_telegram, mod.send_photo) = saved[1:4]
+            (mod.reco_send_allowed, mod.send_telegram, mod.send_album) = saved[1:4]
         return mod, rc, summary, sent_text, sent_photo, buf.getvalue()
 
     def t_daily_dry_run_files_only():
-        mod, rc, sm, texts, photos, out = _sunday(dry=True)
+        mod, rc, sm, texts, albums, out = _sunday(dry=True)
         assert rc == mod.EXIT_OK, rc
-        assert texts == [] and photos == [], "dry-run 인데 발송함"
+        assert texts == [] and albums == [], "dry-run 인데 발송함"
         c = sm["charts"]
-        assert c["eligible"] == 3, c            # NONE 제외, 상한 5 이내
-        assert c["made"] == 2 and c["sent"] == 0, c
+        assert c["eligible"] == 4, c            # 등급 필터 없음 (NONE 포함)
+        assert c["made"] == 3 and c["sent"] == 0, c
         assert [f["ticker"] for f in c["failed"]] == ["000009"], c["failed"]
         for f in c["files"]:
             assert (tmp / f).is_file(), f"PNG 없음 {f}"
-        assert "[차트 1." in out and "주간 추천" in out, out[:300]
+        assert c["album"]["photos"] == 3, c["album"]
+        assert 0 < c["album"]["caption_max"] <= 1024, c["album"]
+        assert "[차트 앨범 3장" in out and "주간 추천" in out, out[:300]
+        assert "검증 중 · 투자 판단 근거 아님" in out
         assert sm.get("reco_sent") is True
 
-    def t_daily_photo_fail_text_ok():
-        """사진 발송 실패: 텍스트는 이미 나갔고, 실패는 send_failed 로 드러난다."""
-        def fail(_p):
+    def t_daily_album_order_and_disclaimer():
+        _m, _rc, _sm, _t, albums, _o = _sunday(dry=False)
+        assert len(albums) == 1, f"앨범 {len(albums)}회 (1회여야)"
+        caps = [c for _p, c in albums[0]]
+        assert [c.split(".")[0][-1] for c in caps] == ["1", "3", "4"], caps
+        assert caps[0].endswith("<i>검증 중 · 투자 판단 근거 아님</i>"), caps[0]
+        assert sum("투자 판단" in c for c in caps) == 1
+
+    def t_daily_album_fail_text_ok():
+        """앨범(폴백 포함) 실패: 텍스트는 이미 나갔고, 실패는 send_failed 로."""
+        def fail(_items):
             return nt.SendReport(sent=1, failures=(
                 nt.SendFailure("****2222", 403, "blocked"),))
-        mod, rc, sm, texts, photos, _ = _sunday(dry=False, photo=fail)
+        mod, rc, sm, texts, albums, _ = _sunday(dry=False, album=fail)
         assert rc == mod.EXIT_OK, rc            # main 이 send_failed 로 2 로 올린다
         assert len(texts) == 1 and "주간 추천" in texts[0], "텍스트 미발송"
-        assert len(photos) == 2, photos
-        assert sm["send_failed"] == 2, sm.get("send_failed")
+        assert len(albums) == 1
+        assert sm["send_failed"] == 1, sm.get("send_failed")
         kinds = {f.get("kind") for f in sm["send_failures"]}
         assert kinds == {"chart"}, sm["send_failures"]
-        assert sm["charts"]["sent"] == 0
+        assert sm["charts"]["sent"] == 1
 
-    def t_daily_photo_total_fail_halts():
-        """한 장이 전 수신자에게 실패하면 남은 사진은 시도하지 않는다.
+    def t_daily_album_fallback_not_failure():
+        def fb(_items):
+            return nt.SendReport(sent=2, fallback=("****1111",))
+        mod, rc, sm, texts, _a, _ = _sunday(dry=False, album=fb)
+        assert rc == mod.EXIT_OK and not sm.get("send_failed"), sm
+        assert sm["charts"]["fallback"] == ["****1111"], sm["charts"]
 
-        토큰 오류·네트워크 전면 장애에서 장당 90초 x 수신자를 반복해
-        nightly 를 붙잡지 않게 한다. 텍스트는 이미 나갔다.
-        """
-        def dead(_p):
-            return nt.SendReport(sent=0, failures=(
-                nt.SendFailure("****1111", None, "ConnectionError"),
-                nt.SendFailure("****2222", None, "ConnectionError")))
-        mod, rc, sm, texts, photos, _ = _sunday(dry=False, photo=dead)
-        assert rc == mod.EXIT_OK and len(texts) == 1
-        assert len(photos) == 1, f"전원 실패 뒤에도 계속 보냄 {len(photos)}"
-        stages = [f["stage"] for f in sm["charts"]["failed"]]
-        assert stages.count("skipped") == 1 and "send" in stages, stages
-        assert sm["send_failed"] == 2, "시도하지 않은 사진을 실패로 셌다"
-
-    def t_daily_photo_exception_isolated():
-        def boom(_p):
+    def t_daily_album_exception_isolated():
+        def boom(_items):
             raise RuntimeError("네트워크 밖 예외")
-        mod, rc, sm, texts, photos, _ = _sunday(dry=False, photo=boom)
+        mod, rc, sm, texts, _a, _ = _sunday(dry=False, album=boom)
         assert rc == mod.EXIT_OK and len(texts) == 1
         assert not sm.get("send_failed"), "예외를 수신자 실패로 셌다"
         assert {f["stage"] for f in sm["charts"]["failed"]} == {"render", "send"}
@@ -9268,12 +9386,13 @@ def test_chart(tmp: Path):
 
     check("chart", "config 상수 배선", t_config)
     check("chart", "등급 하한 판정", t_grade_filter)
-    check("chart", "등급 우선 선정 + 상한", t_select_grade_first)
+    check("chart", "순위 순 10장 (등급 필터 없음)", t_select_rank_order)
     check("chart", "매물대 = POC 계산 (분리 후 불변)", t_volume_profile_same_as_poc)
     check("chart", "밴드·피보·P0 선 = 채점값 (앵커)", t_levels_anchor)
     check("chart", "PNG 생성 (범위 밖 · 신호 없음 포함)", t_render_png)
     check("chart", "한글 폰트 / 없으면 None", t_font)
     check("chart", "캡션 내용 + 이스케이프 + 경고", t_caption_content)
+    check("chart", "앨범 첫 장 면책 문구", t_album_items_disclaimer)
     check("chart", "캡션 1,024자 상한", t_caption_limit)
     check("chart", "7일 지난 폴더 정리", t_prune)
     check("chart", "sendPhoto 수신자별 독립", t_send_photo_recipients)
@@ -9281,11 +9400,19 @@ def test_chart(tmp: Path):
     check("chart", "sendPhoto 캡션 절단", t_send_photo_caption_cut)
     check("chart", "sendPhoto 전제조건", t_send_photo_preconditions)
     check("chart", "sendMessage 규칙 불변", t_send_telegram_unchanged)
+    check("chart", "앨범 요청 구성 (sendMediaGroup 1회)", t_album_request_shape)
+    check("chart", "앨범 캡션 1,024자 상한", t_album_caption_limit)
+    check("chart", "앨범 수신자별 독립 (403 폴백 없음)", t_album_recipients_independent)
+    check("chart", "앨범 실패 -> 그 수신자만 개별 폴백", t_album_fallback_to_photos)
+    check("chart", "폴백 중 실패 -> 중단", t_album_fallback_stops_on_failure)
+    check("chart", "10장 초과 분할", t_album_split_over_ten)
+    check("chart", "앨범 전제조건", t_album_preconditions)
     check("chart", "재계산 = 기록 채점 (기준일 절단)", t_rescreen_matches_record)
     check("chart", "daily --dry-run: 파일만, 발송 없음", t_daily_dry_run_files_only)
-    check("chart", "daily: 사진 실패해도 텍스트 정상", t_daily_photo_fail_text_ok)
-    check("chart", "daily: 전원 실패 시 남은 사진 중단", t_daily_photo_total_fail_halts)
-    check("chart", "daily: 사진 예외 격리", t_daily_photo_exception_isolated)
+    check("chart", "daily: 앨범 1회 · 순위 순 · 첫 장 면책", t_daily_album_order_and_disclaimer)
+    check("chart", "daily: 앨범 실패해도 텍스트 정상", t_daily_album_fail_text_ok)
+    check("chart", "daily: 폴백 수신은 실패 아님", t_daily_album_fallback_not_failure)
+    check("chart", "daily: 앨범 예외 격리", t_daily_album_exception_isolated)
     check("chart", "daily: 차트 단계 전체 실패 격리", t_daily_chart_module_down)
 
 
@@ -9442,7 +9569,7 @@ def test_send_day(tmp: Path):
                                   top=10, limit=None, min_amount=0.0,
                                   send_only=True,
                                   asof=_date.fromisoformat(asof))
-        saved = (dict(rs.SUMMARY), rs.send_telegram, rs.send_photo,
+        saved = (dict(rs.SUMMARY), rs.send_telegram, rs.send_album,
                  rs.run_daily, os.getcwd())
         texts, photos = [], []
         buf = io.StringIO()
@@ -9450,8 +9577,8 @@ def test_send_day(tmp: Path):
             rs.SUMMARY.clear()
             rs.send_telegram = lambda t, *a, **k: (texts.append(t),
                                                    nt.SendReport(sent=2))[1]
-            rs.send_photo = lambda p, c, *a, **k: (photos.append(p),
-                                                   nt.SendReport(sent=2))[1]
+            rs.send_album = lambda items, *a, **k: (photos.extend(items),
+                                                    nt.SendReport(sent=2))[1]
             rs.run_daily = lambda *a, **k: (_ for _ in ()).throw(
                 AssertionError("send-only 인데 스캔함"))
             os.chdir(tmp)
@@ -9462,7 +9589,7 @@ def test_send_day(tmp: Path):
             os.chdir(saved[4])
             rs.SUMMARY.clear()
             rs.SUMMARY.update(saved[0])
-            rs.send_telegram, rs.send_photo, rs.run_daily = saved[1:4]
+            rs.send_telegram, rs.send_album, rs.run_daily = saved[1:4]
         return rc, sm, texts, photos, buf.getvalue()
 
     # fixture_crash 의 마지막 봉은 2026-08-24(월). 다음 일요일은 08-30,
@@ -9500,7 +9627,7 @@ def test_send_day(tmp: Path):
         _recos(FRI)
         rc, sm, texts, photos, out = _daily(SUN2, dry=True)
         assert texts == [] and photos == [], "dry-run 인데 발송"
-        assert "주간 추천 1선" in out and "[차트 1." in out, out[:200]
+        assert "주간 추천 1선" in out and "[차트 앨범 1장" in out, out[:200]
         assert sm["charts"]["made"] == 1 and sm["charts"]["sent"] == 0
 
     def t_send_only_stale_recos_alert():

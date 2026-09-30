@@ -133,23 +133,27 @@ class GateConfig:
 
 # 추천 차트 이미지. 추천 10선을 **발송하는 날에만** 텍스트 뒤에 붙는다
 # (평일 daily 는 추천을 보내지 않으므로 차트도 없다 — 12장의 주 1회 리듬).
+# 텔레그램 앨범(sendMediaGroup) 1개로 보낸다. 앨범 상한이 10장이다.
 #
-# CHART_MIN_GRADE  이 등급 이상만 차트를 만든다. 등급 순서는 S+ > S > A > B.
-#                  10선은 NONE 을 뽑지 않으므로 "B" 면 등급으로는 전원이
-#                  통과하고, 실제로 거르는 것은 아래 개수 상한이다.
-# CHART_MAX_COUNT  발송 폭주 방지. 등급이 높은 순(같으면 추천 순위 순)으로
-#                  자른다. 순위 순으로만 자르면 슬롯 배치상 뒤에 오는 추세
-#                  트랙 A 등급이 앞쪽 B 등급에 밀려 빠진다.
-CHART_MIN_GRADE = "B"
-CHART_MAX_COUNT = 5
+# CHART_MIN_GRADE  None = 등급 필터 없음 (2026-10-01 부터). 등급 이름
+#                  ("S+"/"S"/"A"/"B")을 주면 그 이상만 남긴다.
+# CHART_MAX_COUNT  추천 **순위 순**으로 앞에서부터 자른다. 10 = 10선 전부.
+#                  한때 5장·등급 우선이었다(f2327db) — 10선 전부로 바꾸며
+#                  순위 순으로 되돌렸다. 앨범 상한(10)을 넘기면 앨범이
+#                  여러 개로 쪼개진다.
+# CHART_DISCLAIMER 앨범 첫 사진 캡션 맨 끝에 붙는다.
+CHART_MIN_GRADE: str | None = None
+CHART_MAX_COUNT = 10
+CHART_DISCLAIMER = "검증 중 · 투자 판단 근거 아님"
 
 
 @dataclass(frozen=True)
 class ChartConfig:
     """추천 차트 파라미터. 모듈 상수를 그대로 배선한다 (RECO_SEND_DOW 와 같은 방식)."""
 
-    min_grade: str = CHART_MIN_GRADE
+    min_grade: str | None = CHART_MIN_GRADE
     max_count: int = CHART_MAX_COUNT
+    disclaimer: str = CHART_DISCLAIMER
     bars: int = 120                  # 표시 봉 수. 매물대 POC 구간(120)과 같게 둔다
     fib_levels: tuple[float, ...] = (0.382, 0.5, 0.618, 0.786)
     # 매물대는 cost_basis.from_volume_profile 과 **같은 구간·같은 칸 수**로

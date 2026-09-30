@@ -32,7 +32,7 @@ from .config import Config, DEFAULT
 from .contracts import ScreenResult
 from .cost_basis import POC_MIN_LOOKBACK, volume_profile
 from .indicators import moving_averages
-from .notify import TELEGRAM_CAPTION_MAX, fit_caption, now_kst
+from .notify import TELEGRAM_CAPTION_MAX, caption_units, fit_caption, now_kst
 from .renderer import bar
 from .screener import HARD_EXCLUSION_FLAGS
 
@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 __all__ = ["GRADE_RANK", "grade_at_least", "ChartJob", "ChartOut",
            "jobs_from_picks", "jobs_from_rows", "select_targets",
            "korean_font", "render_chart", "chart_caption", "chart_path",
-           "prune_chart_dirs", "build_charts", "line_levels"]
+           "prune_chart_dirs", "build_charts", "line_levels", "album_items"]
 
 # 등급 순서. 작을수록 높다. NONE 은 차트 대상이 아니므로 없다.
 GRADE_RANK = {"S+": 0, "S": 1, "A": 2, "B": 3}
@@ -61,7 +61,6 @@ FIB = "#008300"
 VP = "#9c9a92"
 
 TRACK_KR = {"VALUE": "매집", "TREND": "추세", "BOTH": "시퀀스"}
-ALIGN_KR = {"GOLDEN": "정배열", "DEAD": "역배열", "MIXED": "혼재"}
 
 
 def grade_at_least(grade: str | None, min_grade: str) -> bool:
@@ -124,15 +123,15 @@ def jobs_from_rows(rows) -> list[ChartJob]:
 
 
 def select_targets(jobs: list[ChartJob], cfg: Config = DEFAULT) -> list[ChartJob]:
-    """등급 하한을 넘는 것 중 등급 높은 순으로 상한까지. 결과는 순위 순.
+    """추천 순위 순으로 max_count 까지. min_grade 가 있으면 그 이상만.
 
-    순위 순으로만 자르면 슬롯 배치(시퀀스 -> 매집 -> 추세) 때문에 뒤쪽의
-    추세 트랙 A 등급이 앞쪽 B 등급에 밀려 빠진다.
+    기본은 등급 필터 없음 · 10장 = 10선 전부 (config CHART_* 주석 참조).
     """
     c = cfg.chart
-    ok = [j for j in jobs if grade_at_least(j.grade, c.min_grade)]
-    ok.sort(key=lambda j: (GRADE_RANK[j.grade.strip()], j.rank))
-    return sorted(ok[:max(0, int(c.max_count))], key=lambda j: j.rank)
+    ok = [j for j in jobs
+          if c.min_grade is None or grade_at_least(j.grade, c.min_grade)]
+    ok.sort(key=lambda j: j.rank)
+    return ok[:max(0, int(c.max_count))]
 
 
 # ══════════════════════════ 폰트 ══════════════════════════
@@ -407,11 +406,6 @@ def _e(s) -> str:
     return html.escape(str(s), quote=False)
 
 
-def _g(v: float) -> str:
-    """점수 구성요소. 0.5 단위라 '1.25' / '3' 처럼 짧게."""
-    return f"{v:g}"
-
-
 def active_flags(flags: dict | None) -> list[str]:
     """켜져 있는 하드 배제 플래그 이름."""
     flags = flags or {}
@@ -423,7 +417,13 @@ def chart_caption(res: ScreenResult, rank: int | None = None,
                   recorded: tuple[float, float] | None = None,
                   trade_date: str | None = None, cfg: Config = DEFAULT,
                   limit: int = TELEGRAM_CAPTION_MAX) -> str:
-    """분석 요약 캡션. 상한을 넘으면 뒷줄부터 버린다 (중요한 줄을 앞에 둔다)."""
+    """사진 1장의 캡션: 등급 · 점수 · 밴드 위치 · 피보 위치.
+
+    앨범에서 사진을 넘길 때마다 보이는 글이라 4줄로 줄였다. 세부 구성요소
+    (LPS 항목별 점수·P0·추세)는 차트 제목과 선이 대신한다. 배제 플래그와
+    '기록과 다른 재계산'은 있을 때만 경고로 붙인다 — 없을 때 '없음'을 매
+    장마다 쓰면 10장이 같은 줄로 채워진다.
+    """
     head = f"{rank}. " if rank is not None else ""
     lines = [
         f"📈 <b>{head}{_e(res.name)}</b> ({res.ticker}) [{res.grade}] {res.mark}".rstrip(),
@@ -432,57 +432,53 @@ def chart_caption(res: ScreenResult, rank: int | None = None,
         + (f" ({trade_date})" if trade_date else ""),
     ]
 
-    # 배제 플래그를 앞에 둔다. 캡션이 잘려도 이 줄은 남아야 한다.
+    # 경고는 앞에 둔다. 캡션이 잘려도 남아야 한다.
     on = active_flags(flags)
     if exclusion and exclusion not in on:
         on.append(exclusion)
-    lines.append("⚠️ 배제 플래그: " + ", ".join(_e(x) for x in on)
-                 if on else "배제 플래그: 없음")
-
+    if on:
+        lines.append("⚠️ 배제 플래그: " + ", ".join(_e(x) for x in on))
     if recorded is not None:
         rv, rt = recorded
         if abs(rv - res.value_score) > 0.005 or abs(rt - res.trend_score) > 0.005:
-            lines.append(f"※ 기록 점수 매집 {rv:.2f} · 추세 {rt:.2f} — 오늘 데이터로 "
-                         "재계산한 값과 다름 (플래그·신용잔고 갱신)")
+            lines.append(f"※ 기록 점수 매집 {rv:.2f} · 추세 {rt:.2f} — 재계산과 다름")
 
     q = res.liq
-    if q is not None:
-        bd = q.breakdown
-        proxy = "(프록시)" if bd.get("credit_heat_note") else ""
-        lines.append(
-            f"LPS {q.score:.2f} = 신용과열 {_g(bd.get('credit_heat', 0))}{proxy}"
-            f" + 밴드 {_g(bd.get('band', 0))} + 투매거래량 {_g(bd.get('panic_volume', 0))}"
-            f" + 갭 {_g(bd.get('panic_gap', 0))} + 반대매매일 {_g(bd.get('margin_due', 0))}"
-            f" + 숏커버 {_g(bd.get('short_cover', 0))}")
-        if np.isfinite(q.band_pos):
-            gap = (res.price / q.band_mid - 1.0) * 100.0 if q.band_mid > 0 else float("nan")
-            lines.append(f"밴드 위치 {q.band_pos * 100:.0f}% {bar(q.band_pos)} "
-                         f"(0=-44% · 100=-16%) · 청산중심 {q.band_mid:,.0f} ({gap:+.1f}%)")
-        lines.append(f"P0 {q.cost_basis:,.0f}원 (방법 {q.basis_method} · 신뢰도 {q.confidence})")
+    if q is not None and np.isfinite(q.band_pos) and q.band_mid > 0:
+        gap = (res.price / q.band_mid - 1.0) * 100.0
+        lines.append(f"밴드 위치 {q.band_pos * 100:.0f}% {bar(q.band_pos)} · "
+                     f"청산중심 {q.band_mid:,.0f} ({gap:+.1f}%)")
     else:
-        lines.append("LPS - (평균단가 추정 불가)")
+        lines.append("밴드 위치 - (평균단가 추정 불가)")
 
     f = res.fib
     if f is not None:
         tgt = cfg.fib.target
         lines.append(
-            f"피보 {f.score:.2f} · 진행률 {f.ratio:.3f} · 구간 {_e(f.zone)} · "
-            f"{tgt:.3f}={f.levels.get(tgt, float('nan')):,.0f} "
-            f"{'이하✅' if f.below_target else '미도달'} · 근접 {f.nearest_level:.3f}"
-            f" ({f.nearest_gap_pct:.1f}%)"
+            f"피보 진행률 {f.ratio:.3f} · 구간 {_e(f.zone)} · {tgt:.3f} "
+            f"{'이하✅' if f.below_target else '미도달'}"
             + (" · ⚠️ 파동 붕괴" if f.wave_broken else ""))
     else:
         lines.append("피보 - (데이터 부족)")
 
-    t = res.trend
-    if t is not None:
-        cross = ""
-        if t.best_cross and t.best_cross.kind == "GOLDEN":
-            cross = f" · {t.best_cross.pair} GC D+{t.best_cross.bars_ago}"
-        lines.append(f"추세 {t.score:.2f} · {ALIGN_KR.get(t.alignment, t.alignment)}{cross}")
-
     text, _mode = fit_caption("\n".join(lines), limit)
     return text
+
+
+def album_items(outs: list, cfg: Config = DEFAULT,
+                limit: int = TELEGRAM_CAPTION_MAX) -> list[tuple[Path, str]]:
+    """생성된 차트 -> 앨범 항목 [(경로, 캡션)]. 순위 순.
+
+    첫 사진 캡션 맨 끝에 면책 문구를 붙인다. 본문을 (상한 - 문구 길이)로
+    먼저 줄이고 붙이므로, 합쳐도 1,024자를 넘지 않고 문구는 잘리지 않는다.
+    """
+    ready = sorted((o for o in outs if o.path is not None), key=lambda o: o.rank)
+    items = [(o.path, o.caption) for o in ready]
+    if items and cfg.chart.disclaimer:
+        tail = f"\n\n<i>{_e(cfg.chart.disclaimer)}</i>"
+        body, _m = fit_caption(items[0][1], limit - caption_units(tail))
+        items[0] = (items[0][0], body + tail)
+    return items
 
 
 # ══════════════════════════ 파일 ══════════════════════════
