@@ -55,11 +55,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
+from stocknews.config import DEFAULT                       # noqa: E402
 from stocknews.env import load_env                          # noqa: E402
 from stocknews.joblock import JobLock                      # noqa: E402
 from stocknews.store import Store                          # noqa: E402
-from stocknews.trading_day import (market_status, now_kst,  # noqa: E402
-                                   CLOSED_HOLIDAY, CLOSED_WEEKEND)
+from stocknews.trading_day import (as_date, market_status,  # noqa: E402
+                                   now_kst, CLOSED_HOLIDAY, CLOSED_WEEKEND)
 
 # 락 만료. 요구사항대로 2시간이다. 전 단계 합계가 이보다 길면 정상
 # 실행 중인 잡의 락을 다음 트리거가 빼앗는다 — 실측 최악은 backfill 이
@@ -187,6 +188,20 @@ STEPS: tuple[Step, ...] = (
     Step("exits", ["--mode", "exits"]),
 )
 
+# 발송 요일(RECO_SEND_DOW = 일요일)은 휴장이어도 이 단계만 돈다.
+#
+# 추천 10선은 일요일에만 나간다(AGENTS 12장). 그런데 휴장 판정이 단계 전에
+# 잡 전체를 끊어서, daily 의 '일요일 발송' 경로에 한 번도 닿지 못했다.
+# 2026-09-30 확인: 9월 내내 일요일 daily 실행 0건 — 추천이 아무 요일에도
+# 나가지 않고 있었다. 시세를 받는 단계(master·update·flags·credit·news)와
+# exits 는 휴장일에 할 일이 없으므로 돌지 않는다. `--send-only` 는 스캔을
+# 하지 않고 직전 거래일 recos 만 텍스트 + 차트로 보낸다. `--asof` 는 main()
+# 이 그날 날짜로 붙인다 — 자정을 넘긴 catch-up 에서 자식이 스스로 날짜를
+# 보면 월요일로 판정해 발송이 사라진다.
+SEND_DAY_STEPS: tuple[Step, ...] = (
+    Step("daily", ["--mode", "daily", "--send-only"]),
+)
+
 
 @dataclass(frozen=True)
 class Job:
@@ -217,6 +232,8 @@ class Job:
     quiet_ok: bool = False
     marker: str = ""
     cron: str = ""
+    # 휴장인 발송 요일에 전체 스킵 대신 돌 단계. 비어 있으면 휴장 = 스킵.
+    send_day_steps: tuple[Step, ...] = ()
 
     @property
     def marker_path(self) -> str:
@@ -229,7 +246,8 @@ def _one(name: str, args: list[str], **kw) -> tuple[Step, ...]:
 
 JOBS: dict[str, Job] = {
     "nightly": Job("nightly", "nightly", "\U0001f319", STEPS,
-                   marker=DONE_MARKER, cron="30 21 * * *"),
+                   marker=DONE_MARKER, cron="30 21 * * *",
+                   send_day_steps=SEND_DAY_STEPS),
     # 수집 전용. 발송하지 않으므로 중복이 나가도 사람에게 보이지는
     # 않지만, 같은 소스를 하루 두 번 긁을 이유가 없다.
     "news": Job("news", "news", "\U0001f4f0", _one("news", ["--mode", "news"]),
@@ -276,7 +294,25 @@ def apply_dry_jobs(job: Job, dry_jobs: set[str]) -> Job:
     if job.name.lower() not in dry_jobs:
         return job
     steps = tuple(replace(s, force_dry=True) for s in job.steps)
-    return replace(job, steps=steps)
+    send = tuple(replace(s, force_dry=True) for s in job.send_day_steps)
+    return replace(job, steps=steps, send_day_steps=send)
+
+
+def is_send_day_closed(job: Job, status: str, when) -> bool:
+    """휴장이지만 발송 요일 단계를 돌아야 하는가.
+
+    토요일처럼 발송 요일이 아닌 휴장일은 False (기존대로 전체 스킵).
+    """
+    return (bool(job.send_day_steps)
+            and status in (CLOSED_WEEKEND, CLOSED_HOLIDAY)
+            and as_date(when).weekday() == int(DEFAULT.gate.reco_send_dow) % 7)
+
+
+def send_day_job(job: Job, day: str) -> Job:
+    """발송 요일 단계만 가진 사본. 단계마다 `--asof <day>` 를 붙인다."""
+    steps = tuple(replace(s, args=[*s.args, "--asof", day])
+                  for s in job.send_day_steps)
+    return replace(job, label=f"{job.label} 추천 발송", steps=steps)
 
 
 class Log:
@@ -880,7 +916,12 @@ def main(argv: list[str] | None = None) -> int:
         when_s = (when if isinstance(when, str)
                   else f"{when:%Y-%m-%d}")
         log(f"거래일 판정 {when_s} -> {status}")
-        if status in (CLOSED_WEEKEND, CLOSED_HOLIDAY) and not args.force:
+        send_day = (not args.force) and is_send_day_closed(job, status, when)
+        if send_day:
+            job = send_day_job(job, when_s)
+            log(f"휴장({status})이지만 추천 발송 요일 — "
+                + ", ".join(s.name for s in job.steps) + " 단계만 실행")
+        elif status in (CLOSED_WEEKEND, CLOSED_HOLIDAY) and not args.force:
             log(f"휴장 — 스킵 ({status})")
             sent = _notify(noted(f"{job.emoji} {job.label} 스킵 "
                                  f"{started:%m/%d %H:%M} | 휴장({status})"),
@@ -928,8 +969,15 @@ def main(argv: list[str] | None = None) -> int:
         # 마커는 발송 뒤에 쓴다. 앞에 쓰면 알림이 새도 마커는 '완주'로 남아
         # 누락을 알 길이 없다 (2026-09-13).
         if job.once_per_day:
-            _mark_done(marker, day, rc_final,
-                       _with_alert(_outcome(results), sent))
+            outcome = _outcome(results)
+            if send_day:
+                # '오늘 이미 실행(...)' 스킵 알림이 무엇을 했던 날인지 말하게.
+                # 직전 거래일 기록이 없어 '없음' 알림만 나간 날은 따로 적는다.
+                if any((r.get("json") or {}).get("reason") == "no_recos"
+                       for r in results):
+                    outcome = "기록 없음"
+                outcome = f"추천 발송({outcome})"
+            _mark_done(marker, day, rc_final, _with_alert(outcome, sent))
         log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit {rc_final}")
         return rc_final
 

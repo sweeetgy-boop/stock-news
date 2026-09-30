@@ -9289,6 +9289,264 @@ def test_chart(tmp: Path):
     check("chart", "daily: 차트 단계 전체 실패 격리", t_daily_chart_module_down)
 
 
+# ═══════════════════ 발송 요일(일요일) 예외 — nightly · daily --send-only ═══════════════════
+def test_send_day(tmp: Path):
+    """일요일은 휴장이어도 daily --send-only 한 단계만 돈다. 토요일은 전체 스킵.
+
+    2026-09-30 확인: nightly 가 주말을 통째로 스킵해 9월 내내 일요일 daily
+    가 0건이었다 — 추천 10선이 어느 요일에도 나가지 않았다.
+    """
+    import argparse
+    import contextlib
+    import importlib
+    import importlib.util
+    import io
+    import json as _j
+    import os
+    import sqlite3
+    from datetime import date as _date
+
+    from stocknews import notify as nt
+    from stocknews.config import DEFAULT
+    from stocknews.screener import screen_one
+    from stocknews.store import Store
+
+    repo = Path(__file__).resolve().parent
+
+    def _nightly():
+        spec = importlib.util.spec_from_file_location(
+            "_nightly_sendday", str(repo / "nightly.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.modules.pop(spec.name, None)
+        return mod
+
+    nl = _nightly()
+    rs = importlib.import_module("run_screen")
+    SUN, SAT, MON = "2026-09-20", "2026-09-19", "2026-09-21"
+
+    def t_send_day_rule():
+        job = nl.JOBS["nightly"]
+        assert DEFAULT.gate.reco_send_dow == 6, "앵커: 일요일"
+        assert nl.is_send_day_closed(job, nl.CLOSED_WEEKEND, SUN)
+        assert not nl.is_send_day_closed(job, nl.CLOSED_WEEKEND, SAT), "토요일"
+        assert not nl.is_send_day_closed(job, "OPEN", MON), "거래일"
+        # 다른 잡은 예외가 없다 — 휴장이면 그대로 스킵
+        for name, j in nl.JOBS.items():
+            if name != "nightly":
+                assert not j.send_day_steps, f"{name} 에 발송 요일 단계가 있다"
+                assert not nl.is_send_day_closed(j, nl.CLOSED_WEEKEND, SUN)
+
+    def t_send_day_steps_only_daily():
+        job = nl.send_day_job(nl.JOBS["nightly"], SUN)
+        assert [s.name for s in job.steps] == ["daily"], job.steps
+        args = nl._build_args(job.steps[0], dry=True)
+        for tok in ("--send-only", "--asof", SUN, "--dry-run", "--json"):
+            assert tok in args, (tok, args)
+        assert args[args.index("--asof") + 1] == SUN
+        assert "추천 발송" in job.label
+        # 원본은 바뀌지 않는다
+        assert len(nl.JOBS["nightly"].steps) == len(nl.STEPS)
+        # 잡별 dry-run 이 발송 요일 단계에도 먹는다
+        dry = nl.apply_dry_jobs(nl.JOBS["nightly"], {"nightly"})
+        assert all(s.force_dry for s in dry.send_day_steps)
+        assert "--dry-run" in nl._build_args(
+            nl.send_day_job(dry, SUN).steps[0], dry=False)
+
+    def t_send_day_mode_exists():
+        for s in nl.SEND_DAY_STEPS:
+            assert s.args[1] in rs.MODES and s.name in nl._SENDING
+
+    def _drive(check_date, marker, runs=1, step_json=None):
+        """nightly.main 을 단계 실행 없이 태운다. (rc들, 실행된 단계, 마커, 알림)."""
+        root = tmp / "sendday"
+        root.mkdir(parents=True, exist_ok=True)
+        ran: list[list[str]] = []
+        sent: list[str] = []
+
+        def fake_step(step, dry, log, timeout):
+            ran.append(nl._build_args(step, dry))
+            return {"name": step.name, "rc": 0, "state": "ok", "note": "",
+                    "detail": "", "elapsed": 0.0, "json": step_json or {}}
+        saved = (nl.REPO, nl.load_env, nl.market_status, nl._run_step,
+                 nl._notify, nl._net_probe)
+        rcs = []
+        try:
+            nl.REPO = root
+            nl.load_env = lambda *a, **k: {"exists": True, "path": ""}
+            nl.market_status = lambda store, when: (
+                nl.CLOSED_WEEKEND if nl.as_date(when).weekday() >= 5 else "OPEN")
+            nl._run_step = fake_step
+            nl._notify = lambda text, log, enabled, why="": sent.append(text)
+            nl._net_probe = lambda: None
+            argv = ["--db", str(root / "q.db"), "--lock-dir", str(root / "locks"),
+                    "--check-date", check_date, "--done-marker", marker]
+            with contextlib.redirect_stderr(io.StringIO()):
+                for _ in range(runs):
+                    rcs.append(nl.main(argv))
+        finally:
+            (nl.REPO, nl.load_env, nl.market_status, nl._run_step,
+             nl._notify, nl._net_probe) = saved
+        done = _j.loads((root / marker).read_text(encoding="utf-8"))
+        return rcs, ran, done, sent
+
+    def t_sunday_runs_daily_only_once():
+        """일요일: daily 한 단계만. catch-up 으로 두 번 떠도 한 번만 돈다."""
+        rcs, ran, done, sent = _drive(SUN, "d_sun.json", runs=2)
+        assert rcs == [0, 0], rcs
+        assert len(ran) == 1, f"단계 실행 {len(ran)}회 (1회여야)"
+        assert ran[0][:3] == ["--mode", "daily", "--send-only"], ran[0]
+        assert SUN in ran[0]
+        assert done["reason"] == "추천 발송(완주)", done
+        assert "추천 발송 완료" in sent[0], sent[0]
+        assert "이미 실행(추천 발송(완주))" in sent[1], sent[1]
+
+    def t_sunday_no_recos_marker():
+        _rcs, _ran, done, _s = _drive(SUN, "d_sun_empty.json",
+                                      step_json={"reason": "no_recos"})
+        assert done["reason"] == "추천 발송(기록 없음)", done
+
+    def t_saturday_full_skip():
+        rcs, ran, done, sent = _drive(SAT, "d_sat.json")
+        assert rcs == [0] and ran == [], ran
+        assert done["reason"] == "휴장(CLOSED_WEEKEND)", done
+        assert "휴장" in sent[0]
+
+    def t_weekday_full_pipeline():
+        _rcs, ran, _done, _s = _drive(MON, "d_mon.json")
+        assert [a[1] for a in ran] == [s.args[1] for s in nl.STEPS], ran
+        assert not any("--send-only" in a for a in ran), "평일에 send-only"
+
+    # ── daily --send-only ──
+    db = tmp / "sendday.db"
+    st = Store(db)
+    st.upsert_prices("000001", fixture_crash(), allow_today=True)
+    r1 = screen_one("000001", "급락종목", fixture_crash())
+
+    def _recos(d):
+        with sqlite3.connect(db) as con:
+            con.execute("DELETE FROM recos")
+            if d:
+                con.execute(
+                    "INSERT INTO recos(d,rank,ticker,name,price,slot,grade,"
+                    "value_score,trend_score,reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (d, 1, "000001", "급락종목", 1.0, "VALUE", "A",
+                     r1.value_score, r1.trend_score, ""))
+            con.commit()
+
+    def _daily(asof: str, dry=True):
+        args = argparse.Namespace(force=False, dry_run=dry, with_fib=False,
+                                  top=10, limit=None, min_amount=0.0,
+                                  send_only=True,
+                                  asof=_date.fromisoformat(asof))
+        saved = (dict(rs.SUMMARY), rs.send_telegram, rs.send_photo,
+                 rs.run_daily, os.getcwd())
+        texts, photos = [], []
+        buf = io.StringIO()
+        try:
+            rs.SUMMARY.clear()
+            rs.send_telegram = lambda t, *a, **k: (texts.append(t),
+                                                   nt.SendReport(sent=2))[1]
+            rs.send_photo = lambda p, c, *a, **k: (photos.append(p),
+                                                   nt.SendReport(sent=2))[1]
+            rs.run_daily = lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("send-only 인데 스캔함"))
+            os.chdir(tmp)
+            with contextlib.redirect_stdout(buf):
+                rc = rs.mode_daily(st, args)
+            sm = dict(rs.SUMMARY)
+        finally:
+            os.chdir(saved[4])
+            rs.SUMMARY.clear()
+            rs.SUMMARY.update(saved[0])
+            rs.send_telegram, rs.send_photo, rs.run_daily = saved[1:4]
+        return rc, sm, texts, photos, buf.getvalue()
+
+    # fixture_crash 의 마지막 봉은 2026-08-24(월). 다음 일요일은 08-30,
+    # 그 직전 거래일은 08-28(금) — 기록을 그 날짜에 둔다.
+    FRI, SUN2 = "2026-08-28", "2026-08-30"
+
+    def t_prev_trading_day():
+        d = _date.fromisoformat
+        assert rs._prev_trading_day(st, d(SUN2)) == FRI
+        assert rs._prev_trading_day(st, d("2026-08-29")) == FRI   # 토
+        assert rs._prev_trading_day(st, d("2026-08-31")) == FRI   # 월
+        # 금요일이 기록된 휴장일이면 목요일
+        with sqlite3.connect(db) as con:
+            con.execute("INSERT INTO non_trading_days(d,reason,detected) "
+                        "VALUES(?,?,?)", (FRI, "test", "t"))
+            con.commit()
+        try:
+            assert rs._prev_trading_day(st, d(SUN2)) == "2026-08-27"
+        finally:
+            with sqlite3.connect(db) as con:
+                con.execute("DELETE FROM non_trading_days WHERE d=?", (FRI,))
+                con.commit()
+
+    def t_send_only_sends_friday_recos():
+        _recos(FRI)
+        rc, sm, texts, photos, out = _daily(SUN2, dry=False)
+        assert rc == rs.EXIT_OK, rc
+        assert len(texts) == 1 and "주간 추천 1선" in texts[0], texts
+        assert f"기준일 {FRI}" in texts[0]
+        assert len(photos) == 1, photos
+        assert sm["reco_sent"] is True and sm["trade_date"] == FRI, sm
+        assert sm["charts"]["made"] == 1
+
+    def t_send_only_dry_run():
+        _recos(FRI)
+        rc, sm, texts, photos, out = _daily(SUN2, dry=True)
+        assert texts == [] and photos == [], "dry-run 인데 발송"
+        assert "주간 추천 1선" in out and "[차트 1." in out, out[:200]
+        assert sm["charts"]["made"] == 1 and sm["charts"]["sent"] == 0
+
+    def t_send_only_stale_recos_alert():
+        """직전 거래일 기록이 없으면 '없음' 알림 1건만. 목요일 것을 보내지 않는다."""
+        _recos("2026-08-27")
+        rc, sm, texts, photos, _ = _daily(SUN2, dry=False)
+        assert rc == rs.EXIT_OK
+        assert len(texts) == 1 and "발송할 추천 없음" in texts[0], texts
+        assert "2026-08-28" in texts[0] and "2026-08-27" in texts[0], texts[0]
+        assert photos == [] and sm["reason"] == "no_recos", sm
+        assert sm["reco_sent"] is False
+        _recos(None)
+        _rc, sm2, texts2, _p, _ = _daily(SUN2, dry=False)
+        assert "마지막 기록 없음" in texts2[0], texts2[0]
+
+    def t_send_only_off_dow_silent():
+        _recos(FRI)
+        rc, sm, texts, photos, _ = _daily("2026-08-26", dry=False)   # 수
+        assert rc == rs.EXIT_OK and texts == [] and photos == []
+        assert sm["reason"] == "off_dow", sm
+
+    def t_asof_usage_error():
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rs.main(["--mode", "daily", "--asof", "2026/09/20",
+                         "--db", str(tmp / "x.db")])
+            except SystemExit as exc:
+                assert exc.code == rs.EXIT_USAGE, exc.code
+            else:
+                raise AssertionError("잘못된 --asof 를 받아들였다")
+
+    check("send-day", "일요일만 예외 (토요일·다른 잡 제외)", t_send_day_rule)
+    check("send-day", "발송 단계 = daily --send-only --asof", t_send_day_steps_only_daily)
+    check("send-day", "발송 단계 모드 존재", t_send_day_mode_exists)
+    check("send-day", "일요일: daily 1회 · 재기동은 마커 스킵", t_sunday_runs_daily_only_once)
+    check("send-day", "일요일 기록 없음 -> 마커 구분", t_sunday_no_recos_marker)
+    check("send-day", "토요일: 전체 스킵", t_saturday_full_skip)
+    check("send-day", "평일: 전체 단계 (send-only 없음)", t_weekday_full_pipeline)
+    check("send-day", "직전 거래일 = 금 (휴장이면 앞으로)", t_prev_trading_day)
+    check("send-day", "send-only: 금요일 추천 텍스트 + 차트", t_send_only_sends_friday_recos)
+    check("send-day", "send-only --dry-run: 발송 없음", t_send_only_dry_run)
+    check("send-day", "send-only: 금요일 기록 없음 -> 알림만", t_send_only_stale_recos_alert)
+    check("send-day", "send-only: 발송 요일 아니면 무음", t_send_only_off_dow_silent)
+    check("send-day", "--asof 형식 오류 = exit 64", t_asof_usage_error)
+
+
 # ══════════════════════════ 보고 ══════════════════════════
 def report() -> int:
     width = 62
@@ -9353,6 +9611,7 @@ def main() -> int:
         test_notify(tmp)
         test_reco_dow()
         test_chart(tmp)
+        test_send_day(tmp)
         test_trading_day(tmp)
         test_backtest(tmp)
         test_krx_credit()

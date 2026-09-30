@@ -331,6 +331,21 @@ def render_reco_stored(rows, asof, send_dow_label: str = "일요일") -> str:
     return "\n".join(head) + "\n\n".join(body) + "\n" + "\n".join(tail)
 
 
+def render_reco_missing(asof, expected: str | None, got: str | None) -> str:
+    """발송 요일인데 직전 거래일의 추천 기록이 없을 때 (nightly 일요일 단계).
+
+    조용히 넘어가면 '이번 주는 추천이 없나 보다'로 읽힌다. 실제로는 그날
+    daily 가 돌지 않았거나 실패한 것이므로 그 사실을 적는다.
+    """
+    return "\n".join([
+        "🗓 <b>[주간 추천]</b> 발송할 추천 없음",
+        f"• 기준일 {_e(expected or '판정 불가')} 의 추천 기록이 없습니다 "
+        f"(마지막 기록 {_e(got or '없음')})",
+        "• 그날 daily 가 돌지 않았거나 실패했습니다 — --mode runs 로 확인",
+        f"⏰ {asof:%Y-%m-%d %H:%M:%S}",
+    ])
+
+
 def render_daily_holdings(positions: list, price_map: dict | None, asof,
                           trade_date: str, scanned: int, picks: int,
                           send_dow_label: str = "일요일") -> str:

@@ -96,7 +96,8 @@ from stocknews.renderer import (render_daily_holdings, render_detail,
                                 render_evening_brief, render_exit_alert,
                                 render_exit_digest, render_fib_list,
                                 render_morning_brief, render_news_weekly,
-                                render_positions, render_reco_stored,
+                                render_positions, render_reco_missing,
+                                render_reco_stored,
                                 render_reconcile, render_top10,
                                 render_weekly)
 from stocknews.screener import screen_one
@@ -662,17 +663,85 @@ def _send_charts(store: Store, args, trade_date: str, picks=None,
              len(info["failed"]), " (dry-run: 발송 안 함)" if args.dry_run else "")
 
 
+def _iso_date(text: str):
+    """--asof 파서. 형식이 틀리면 exit 64 (인자 오류)."""
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"YYYY-MM-DD 가 아닙니다: {text!r}")
+
+
+def _prev_trading_day(store: Store, day) -> str | None:
+    """day **전** 의 마지막 거래일 (달력 기준). 일요일 -> 금요일.
+
+    `last_price_date()` 를 쓰지 않는다. 금요일 적재가 실패했으면 그 값이
+    목요일을 가리키고, 목요일 추천이 '금요일 추천'으로 나간다. 달력으로
+    '있어야 할 날'을 정하고, 기록이 그 날짜인지를 따로 확인한다.
+    휴장이 확실한 날(주말·공휴일·기록된 휴장일)만 건너뛴다.
+    """
+    d = day - timedelta(days=1)
+    for _ in range(14):
+        if not is_definitely_closed(store, d):
+            return d.isoformat()
+        d -= timedelta(days=1)
+    return None
+
+
+def _daily_send_only(store: Store, args, asof, send_ok: bool,
+                     dow_label: str) -> int:
+    """nightly 의 발송 요일(일요일) 단계. **스캔하지 않는다.**
+
+    직전 거래일에 기록된 recos 가 있으면 텍스트 + 차트를 보낸다. 없으면
+    "발송할 추천 없음" 알림 한 건만 보낸다 — 평소의 '0건이면 조용히'와
+    다르다. 이 경로의 0건은 '추천이 없다'가 아니라 '금요일 daily 가
+    기록을 남기지 못했다'는 뜻이라서 사람이 알아야 한다.
+    """
+    SUMMARY["send_only"] = True
+    if not send_ok:
+        # nightly 는 발송 요일에만 이 단계를 부른다. 다른 날 불렸다면 호출이
+        # 잘못된 것이므로 아무것도 보내지 않는다.
+        log.warning("--send-only 인데 발송 요일(%s)이 아님 — 생략", dow_label)
+        SUMMARY.update({"skipped": True, "reason": "off_dow"})
+        return EXIT_OK
+    expected = _prev_trading_day(store, asof.date())
+    rows = store.reco_history(days=1)
+    got = str(rows.iloc[0]["d"]) if rows is not None and len(rows) else None
+    SUMMARY.update({"trade_date": expected, "reco_date": got})
+    if expected is None or got != expected:
+        log.warning("발송할 추천 없음 — 기준일 %s 기록 없음 (마지막 기록 %s)",
+                    expected, got or "없음")
+        SUMMARY.update({"picks": 0, "skipped": True, "reason": "no_recos"})
+        _emit(render_reco_missing(asof, expected, got), args.dry_run)
+        return EXIT_OK
+    n = int(len(rows))
+    SUMMARY.update({"picks": n, "from_db": True})
+    log.info("주간 추천 발송: 기준일 %s 기록 %d건 (스캔 없음)", got, n)
+    _emit(render_reco_stored(rows, asof, dow_label), args.dry_run)
+    SUMMARY["reco_sent"] = True
+    _send_charts(store, args, got, rows=rows)
+    return EXIT_OK
+
+
+def _asof(args) -> datetime:
+    """판정 기준 시각. --asof 가 있으면 그 날짜에 지금 시각을 붙인다."""
+    now = now_kst()
+    day = getattr(args, "asof", None)
+    return datetime.combine(day, now.time()) if day else now
+
+
 def mode_daily(store: Store, args) -> int:
     """저녁 전종목 스캔 + 추천 10선.
 
     스캔과 기록은 매일, 추천 발송은 주 1회(`GateConfig.reco_send_dow`).
     채점 표본은 매일 쌓여야 하고, 사람의 결정은 주 1회여야 한다.
     """
-    asof = now_kst()
+    asof = _asof(args)
     send_ok, send_reason = reco_send_allowed(asof, DEFAULT, force=args.force)
     dow_label = reco_send_dow_label(DEFAULT)
     SUMMARY.update({"dow": asof.weekday(), "send_reason": send_reason,
                     "reco_sent": False})
+    if getattr(args, "send_only", False):
+        return _daily_send_only(store, args, asof, send_ok, dow_label)
 
     # 스캔 생략 판정과 발송 판정을 분리한다. 발송 요일(일요일)은 휴장이라
     # 스캔이 항상 생략되는데, 예전처럼 여기서 함께 return 하면 주간 발송이
@@ -1910,6 +1979,12 @@ def main(argv=None) -> int:
                     help="20일 평균 거래대금 하한(원)")
     ap.add_argument("--with-fib", action="store_true",
                     help="daily 모드에서 피보 목록도 함께 발송")
+    ap.add_argument("--send-only", action="store_true",
+                    help="daily: 스캔 없이 직전 거래일에 기록된 추천만 발송 "
+                         "(nightly 의 발송 요일 단계)")
+    ap.add_argument("--asof", type=_iso_date, default=None,
+                    help="daily: 발송 요일·직전 거래일 판정 기준일 "
+                         "(YYYY-MM-DD). nightly 가 넘긴다")
     ap.add_argument("--include-preferred", action="store_true",
                     help="우선주 포함 (기본 제외)")
     ap.add_argument("--days", type=int, default=420, help="backfill 적재 봉 수")
