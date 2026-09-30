@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -26,7 +27,8 @@ from .trading_day import is_definitely_closed, trading_days_between
 __all__ = ["AlertWindow", "WINDOWS", "AlertGate", "send_telegram", "now_kst",
            "TelegramNotConfigured", "DOW_KR", "reco_send_allowed",
            "reco_send_dow_label", "parse_chat_ids", "mask_chat_id",
-           "SendFailure", "SendReport"]
+           "SendFailure", "SendReport", "send_photo", "fit_caption",
+           "caption_units", "TELEGRAM_CAPTION_MAX"]
 
 log = logging.getLogger("notify")
 
@@ -373,63 +375,82 @@ def _retry_after(res, attempt: int) -> int:
         return 2 ** attempt + 1
 
 
-def _send_one(token: str, chat_id: str, chunks: list[str],
-              retries: int) -> SendFailure | None:
-    """수신자 한 명에게 분할된 청크를 순서대로 보낸다.
+def _deliver(who: str, what: str, post, retries: int) -> SendFailure | None:
+    """요청 1건을 재시도 규칙대로 보낸다. 성공 None, 실패 SendFailure.
 
-    성공하면 None, 실패하면 SendFailure 를 돌려준다. 응답 코드와
-    텔레그램이 준 description 을 그대로 로그에 남긴다 — 이게 없으면
-    400(방을 못 찾음)과 403(차단됨)을 구분할 수 없고, 그 둘은 사람이
-    해야 할 조치가 완전히 다르다.
+    post() 는 매 시도마다 새로 부른다 — 사진 업로드는 파일 핸들을 시도마다
+    다시 열어야 하기 때문이다(한 번 읽힌 스트림은 재전송되지 않는다).
+
+    응답 코드와 텔레그램이 준 description 을 그대로 로그에 남긴다 — 이게
+    없으면 400(방을 못 찾음)과 403(차단됨)을 구분할 수 없고, 그 둘은
+    사람이 해야 할 조치가 완전히 다르다.
 
     영구 실패는 즉시 포기한다. 세 번 더 두드려서 얻는 것이 없다.
     """
+    status: int | None = None
+    desc = ""
+    for attempt in range(retries):
+        try:
+            res = post()
+        except requests.RequestException as exc:
+            status, desc = None, f"{type(exc).__name__}: {exc}"
+            log.warning("텔레그램 %s 요청 실패 (%d/%d): %s",
+                        who, attempt + 1, retries, desc)
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+            continue
+
+        status = res.status_code
+        if status == 200:
+            log.info("텔레그램 %s 발송 200 (%s)", who, what)
+            return None
+        desc = _describe(res)
+        if status == 429:
+            wait = _retry_after(res, attempt)
+            log.warning("텔레그램 %s 발송 429 — %d초 후 재시도: %s",
+                        who, wait, desc)
+            time.sleep(wait)
+            continue
+        log.error("텔레그램 %s 발송 실패 %d: %s", who, status, desc)
+        if status in _PERMANENT:
+            return SendFailure(who, status, desc)
+        if attempt < retries - 1:
+            time.sleep(2 ** attempt)
+    # 재시도를 다 쓰고도 200 을 못 봤다.
+    log.error("텔레그램 %s 재시도 소진 (마지막 %s)", who, status or "무응답")
+    return SendFailure(who, status, desc or "재시도 소진")
+
+
+def _send_one(token: str, chat_id: str, chunks: list[str],
+              retries: int) -> SendFailure | None:
+    """수신자 한 명에게 분할된 청크를 순서대로 보낸다."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     who = mask_chat_id(chat_id)
     for idx, chunk in enumerate(chunks, 1):
-        status: int | None = None
-        desc = ""
-        for attempt in range(retries):
-            try:
-                res = requests.post(
-                    url,
-                    json={"chat_id": chat_id, "text": chunk,
-                          "parse_mode": "HTML",
-                          "disable_web_page_preview": True},
-                    timeout=10,
-                )
-            except requests.RequestException as exc:
-                status, desc = None, f"{type(exc).__name__}: {exc}"
-                log.warning("텔레그램 %s 요청 실패 (%d/%d): %s",
-                            who, attempt + 1, retries, desc)
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-                continue
-
-            status = res.status_code
-            if status == 200:
-                log.info("텔레그램 %s 발송 200 (청크 %d/%d)",
-                         who, idx, len(chunks))
-                break
-            desc = _describe(res)
-            if status == 429:
-                wait = _retry_after(res, attempt)
-                log.warning("텔레그램 %s 발송 429 — %d초 후 재시도: %s",
-                            who, wait, desc)
-                time.sleep(wait)
-                continue
-            log.error("텔레그램 %s 발송 실패 %d: %s", who, status, desc)
-            if status in _PERMANENT:
-                return SendFailure(who, status, desc)
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-        else:
-            # 재시도를 다 쓰고도 200 을 못 봤다.
-            log.error("텔레그램 %s 재시도 소진 (마지막 %s)",
-                      who, status or "무응답")
-            return SendFailure(who, status, desc or "재시도 소진")
+        fail = _deliver(
+            who, f"청크 {idx}/{len(chunks)}",
+            lambda chunk=chunk: requests.post(
+                url,
+                json={"chat_id": chat_id, "text": chunk,
+                      "parse_mode": "HTML",
+                      "disable_web_page_preview": True},
+                timeout=10,
+            ),
+            retries)
+        if fail is not None:
+            return fail
         time.sleep(0.4)  # 연속 발송 시 flood 방지
     return None
+
+
+def _targets(chat_id: str | None, token: str | None) -> tuple[str, list[str]]:
+    token = token or os.getenv("TELEGRAM_BOT_TOKEN")
+    targets = parse_chat_ids(chat_id or os.getenv("TELEGRAM_CHAT_ID"))
+    if not token or not targets:
+        raise TelegramNotConfigured(
+            "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정 — "
+            ".env 를 만드십시오 (.env.example 참조)")
+    return token, targets
 
 
 def send_telegram(text: str, chat_id: str | None = None,
@@ -442,13 +463,7 @@ def send_telegram(text: str, chat_id: str | None = None,
     반환값은 SendReport 다. `if send_telegram(...)` 처럼 bool 로 써도
     되고, 수신자별 실패 상세가 필요하면 .failures 를 본다.
     """
-    token = token or os.getenv("TELEGRAM_BOT_TOKEN")
-    targets = parse_chat_ids(chat_id or os.getenv("TELEGRAM_CHAT_ID"))
-    if not token or not targets:
-        raise TelegramNotConfigured(
-            "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정 — "
-            ".env 를 만드십시오 (.env.example 참조)")
-
+    token, targets = _targets(chat_id, token)
     chunks = _split(text)
     sent = 0
     failures: list[SendFailure] = []
@@ -460,4 +475,89 @@ def send_telegram(text: str, chat_id: str | None = None,
             failures.append(fail)
     if failures:
         log.error("텔레그램 %d명 중 %d명 실패", len(targets), len(failures))
+    return SendReport(sent=sent, failures=tuple(failures))
+
+
+# sendPhoto 캡션 상한. 텍스트 메시지(4096)와 달리 분할 발송이 없다 —
+# 넘으면 400 "message caption is too long" 으로 사진째 실패한다.
+TELEGRAM_CAPTION_MAX = 1024
+_TAG = re.compile(r"<[^>]+>")
+
+
+def caption_units(text: str) -> int:
+    """텔레그램이 세는 방식에 가까운 길이. UTF-16 코드 유닛 수.
+
+    텔레그램은 엔티티 파싱 뒤 글자 수를 UTF-16 으로 센다. 이모지(BMP 밖)는
+    2로 세므로 len() 보다 길게 나온다. 태그까지 세므로 실제보다 보수적이다.
+    """
+    return len(str(text).encode("utf-16-le")) // 2
+
+
+def fit_caption(text: str, limit: int = TELEGRAM_CAPTION_MAX
+                ) -> tuple[str, str | None]:
+    """캡션을 상한 안으로 줄인다. (캡션, parse_mode).
+
+    줄 단위로 뒤에서부터 버린다. 태그가 줄을 넘지 않게 조판하므로 줄을
+    통째로 버리면 HTML 이 깨지지 않는다. 첫 줄 하나가 이미 상한을 넘는
+    극단적인 경우만 태그를 벗기고 평문으로 자른다 — 태그나 `&amp;` 중간을
+    자르면 400 "can't parse entities" 로 사진까지 못 보낸다.
+    """
+    text = str(text or "")
+    if caption_units(text) <= limit:
+        return text, "HTML"
+    lines = text.split("\n")
+    more = "…"
+    while len(lines) > 1:
+        lines.pop()
+        cand = "\n".join(lines + [more])
+        if caption_units(cand) <= limit:
+            return cand, "HTML"
+    plain = html.unescape(_TAG.sub("", lines[0]))
+    while plain and caption_units(plain + more) > limit:
+        plain = plain[:-1]
+    return plain + more, None
+
+
+def send_photo(path, caption: str = "", chat_id: str | None = None,
+               token: str | None = None, retries: int = 3) -> SendReport:
+    """사진 1장 + 캡션. 수신자·재시도·실패 기록은 send_telegram 과 같다.
+
+    캡션은 1,024자(UTF-16) 상한이라 `fit_caption` 으로 줄 단위로 줄인다.
+    파일이 없으면 FileNotFoundError — 네트워크에 가기 전에 멈춘다.
+    """
+    token, targets = _targets(chat_id, token)
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"사진 파일 없음: {path}")
+    cap, mode = fit_caption(caption)
+    if cap != (caption or ""):
+        log.warning("캡션 %d -> %d (상한 %d) — 뒷줄을 잘랐습니다",
+                    caption_units(caption), caption_units(cap),
+                    TELEGRAM_CAPTION_MAX)
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    data = {"caption": cap}
+    if mode:
+        data["parse_mode"] = mode
+
+    def post_to(target: str):
+        def post():
+            with path.open("rb") as fh:
+                return requests.post(
+                    url, data={**data, "chat_id": target},
+                    files={"photo": (path.name, fh, "image/png")},
+                    timeout=30)
+        return post
+
+    sent = 0
+    failures: list[SendFailure] = []
+    for target in targets:
+        fail = _deliver(mask_chat_id(target), f"사진 {path.name}",
+                        post_to(target), retries)
+        if fail is None:
+            sent += 1
+        else:
+            failures.append(fail)
+        time.sleep(0.4)  # 연속 발송 시 flood 방지
+    if failures:
+        log.error("텔레그램 사진 %d명 중 %d명 실패", len(targets), len(failures))
     return SendReport(sent=sent, failures=tuple(failures))

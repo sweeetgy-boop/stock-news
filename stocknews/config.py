@@ -131,6 +131,37 @@ class GateConfig:
     reco_send_dow: int = RECO_SEND_DOW  # 추천 10선 발송 요일
 
 
+# 추천 차트 이미지. 추천 10선을 **발송하는 날에만** 텍스트 뒤에 붙는다
+# (평일 daily 는 추천을 보내지 않으므로 차트도 없다 — 12장의 주 1회 리듬).
+#
+# CHART_MIN_GRADE  이 등급 이상만 차트를 만든다. 등급 순서는 S+ > S > A > B.
+#                  10선은 NONE 을 뽑지 않으므로 "B" 면 등급으로는 전원이
+#                  통과하고, 실제로 거르는 것은 아래 개수 상한이다.
+# CHART_MAX_COUNT  발송 폭주 방지. 등급이 높은 순(같으면 추천 순위 순)으로
+#                  자른다. 순위 순으로만 자르면 슬롯 배치상 뒤에 오는 추세
+#                  트랙 A 등급이 앞쪽 B 등급에 밀려 빠진다.
+CHART_MIN_GRADE = "B"
+CHART_MAX_COUNT = 5
+
+
+@dataclass(frozen=True)
+class ChartConfig:
+    """추천 차트 파라미터. 모듈 상수를 그대로 배선한다 (RECO_SEND_DOW 와 같은 방식)."""
+
+    min_grade: str = CHART_MIN_GRADE
+    max_count: int = CHART_MAX_COUNT
+    bars: int = 120                  # 표시 봉 수. 매물대 POC 구간(120)과 같게 둔다
+    fib_levels: tuple[float, ...] = (0.382, 0.5, 0.618, 0.786)
+    # 매물대는 cost_basis.from_volume_profile 과 **같은 구간·같은 칸 수**로
+    # 센다. 다르게 세면 P0(방법 C)가 차트의 최다 매물대 막대와 어긋난다.
+    vp_bins: int = 40
+    vp_top: int = 3                  # 우측에 그릴 상위 구간 수
+    out_dir: str = "data/charts"     # 그 아래 YYYYMMDD/ (기준 거래일)
+    keep_days: int = 7               # 폴더 이름 날짜가 이보다 오래되면 정리
+    font: str = "Malgun Gothic"      # 맑은 고딕. 없으면 경고 후 기본 폰트
+    dpi: int = 110
+
+
 # 보유기간 규칙. **거래일 기준**이다. 달력일로 세면 주말·연휴에 카운터가
 # 앞서가서, 실제로는 3거래일밖에 안 지난 포지션이 만료 처리된다.
 #
@@ -682,6 +713,7 @@ class Config:
     news_freq: NewsFreqConfig = NewsFreqConfig()
     news_dedup: NewsDedupConfig = NewsDedupConfig()
     dividend: DividendConfig = DividendConfig()
+    chart: ChartConfig = ChartConfig()
 
 
 DEFAULT = Config()

@@ -8836,6 +8836,459 @@ def test_imports():
     check("import", "수동 플래그 파일 없음 처리", t_manual_flags_missing)
 
 
+# ══════════════════════════ 추천 차트 + 사진 발송 ══════════════════════════
+def test_chart(tmp: Path):
+    """추천 차트 PNG · 캡션 · 사진 발송 · daily 연동의 실패 격리.
+
+    앵커는 '차트가 채점 값을 그대로 옮기는가'다. 밴드 3선은 P0 x 0.84 /
+    0.70 / 0.56, 피보선은 FibSignal.levels, 매물대 최다 구간은 P0(방법 C).
+    """
+    import argparse
+    import contextlib
+    import dataclasses
+    import importlib
+    import io
+    import os
+    import sqlite3
+
+    from stocknews import chart as ch
+    from stocknews import config as C
+    from stocknews import notify as nt
+    from stocknews.config import DEFAULT
+    from stocknews.cost_basis import (POC_MIN_LOOKBACK, from_volume_profile,
+                                      volume_profile)
+    from stocknews.screener import screen_one
+    from stocknews.store import Store
+
+    r_crash = screen_one("000001", "급락 & <우선>", fixture_crash())
+
+    def t_config():
+        assert C.CHART_MIN_GRADE == "B" and C.CHART_MAX_COUNT == 5
+        assert DEFAULT.chart.min_grade == C.CHART_MIN_GRADE, "상수 미배선"
+        assert DEFAULT.chart.max_count == C.CHART_MAX_COUNT, "상수 미배선"
+        assert DEFAULT.chart.min_grade in ch.GRADE_RANK, "알 수 없는 등급"
+        # 매물대 구간이 P0(방법 C)와 같아야 차트의 POC 가 P0 와 맞는다
+        assert DEFAULT.chart.bars == POC_MIN_LOOKBACK
+        for k in DEFAULT.chart.fib_levels:
+            assert k in DEFAULT.fib.levels, f"피보 {k} 가 채점 레벨에 없음"
+
+    def t_grade_filter():
+        assert ch.grade_at_least("S+", "B") and ch.grade_at_least("B", "B")
+        assert not ch.grade_at_least("NONE", "B")
+        assert not ch.grade_at_least("B", "A")
+        assert ch.grade_at_least("A", "A") and ch.grade_at_least("S", "A")
+        try:
+            ch.grade_at_least("A", "C")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("잘못된 CHART_MIN_GRADE 를 받아들였다")
+
+    def t_select_grade_first():
+        """등급 순으로 자른 뒤 순위 순으로 돌려준다.
+
+        순위 순으로만 자르면 슬롯상 뒤에 오는 추세 트랙 A 가 앞쪽 B 에
+        밀려 빠진다 (2026-09-30 실데이터: 3~7위 B, 8~10위 A).
+        """
+        grades = ["A", "A", "B", "B", "B", "B", "B", "A", "A", "S+"]
+        jobs = [ch.ChartJob(i, f"{i:06d}", f"n{i}", g)
+                for i, g in enumerate(grades, 1)]
+        got = [j.rank for j in ch.select_targets(jobs)]
+        assert got == [1, 2, 8, 9, 10], got
+        jobs.append(ch.ChartJob(11, "000011", "n11", "NONE"))
+        cfg = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
+            DEFAULT.chart, max_count=20))
+        got = [j.rank for j in ch.select_targets(jobs, cfg)]
+        assert got == list(range(1, 11)), f"NONE 이 섞였거나 순서 틀림 {got}"
+        cfg0 = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
+            DEFAULT.chart, max_count=0))
+        assert ch.select_targets(jobs, cfg0) == []
+
+    def t_volume_profile_same_as_poc():
+        """분리한 volume_profile 이 방법 C 의 수치를 바꾸지 않았다."""
+        for df in (fixture_crash(), fixture_golden_cross(), fixture_flat()):
+            edges, agg = volume_profile(df, 120, 40)
+            k = int(agg.argmax())
+            near(from_volume_profile(df, 120, 40), (edges[k] + edges[k + 1]) / 2,
+                 tol=1e-9, label="POC")
+            assert len(edges) == 41 and len(agg) == 40
+        assert volume_profile(fixture_crash().head(20)) is None, "30봉 미만"
+
+    def t_levels_anchor():
+        q, f = r_crash.liq, r_crash.fib
+        assert q is not None and f is not None, "픽스처가 신호를 못 냈다"
+        lv = {(x["kind"], x["key"]): x["price"] for x in ch.line_levels(r_crash)}
+        near(lv[("band", "hi")], q.cost_basis * 0.84, tol=1e-6, label="-16%")
+        near(lv[("band", "mid")], q.cost_basis * 0.70, tol=1e-6, label="-30%")
+        near(lv[("band", "lo")], q.cost_basis * 0.56, tol=1e-6, label="-44%")
+        near(lv[("p0", "p0")], q.cost_basis, tol=1e-9, label="P0")
+        near(lv[("fib", 0.618)], 454_710.0, tol=0.5, label="피보 0.618 앵커")
+        for k in (0.382, 0.5, 0.786):
+            near(lv[("fib", k)], f.levels[k], tol=1e-9, label=f"피보 {k}")
+        assert ("fib", 0.236) not in lv, "지정하지 않은 레벨이 그려짐"
+
+    def t_render_png():
+        p = ch.render_chart(r_crash, fixture_crash(), tmp / "c" / "a.png",
+                            trade_date="2026-08-24")
+        head = p.read_bytes()[:8]
+        assert head == b"\x89PNG\r\n\x1a\n", head
+        assert p.stat().st_size > 20_000, f"PNG 가 비정상적으로 작다 {p.stat().st_size}"
+        # 범위 밖 레벨이 있어도 그려야 한다 (가장자리 주석 경로)
+        far = dataclasses.replace(r_crash.fib, levels={
+            **r_crash.fib.levels, 0.382: 5_000_000.0, 0.5: 10.0})
+        p2 = ch.render_chart(dataclasses.replace(r_crash, fib=far),
+                             fixture_crash(), tmp / "c" / "b.png")
+        assert p2.read_bytes()[:4] == b"\x89PNG"
+        # 피보/밴드가 없는 결과도 죽지 않는다
+        r_gc = screen_one("000002", "추세", fixture_golden_cross())
+        bare = dataclasses.replace(r_gc, liq=None, fib=None)
+        assert ch.render_chart(bare, fixture_golden_cross(),
+                               tmp / "c" / "c.png").is_file()
+
+    def t_font():
+        """맑은 고딕이 있으면 잡고, 없으면 None (경고 후 기본 폰트)."""
+        saved = dict(ch._FONT)
+        env = {k: os.environ.get(k) for k in ("WINDIR", "SystemRoot")}
+        try:
+            ch._FONT.clear()
+            got = ch.korean_font()
+            win = Path(env["WINDIR"] or env["SystemRoot"] or r"C:\Windows")
+            if (win / "Fonts" / "malgun.ttf").is_file():
+                assert got, "malgun.ttf 가 있는데 폰트를 못 잡았다"
+            ch._FONT.clear()
+            for k in env:
+                os.environ[k] = str(tmp / "nofonts")
+            cfg = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
+                DEFAULT.chart, font="__없는폰트__"))
+            assert ch.korean_font(cfg) is None, "없는 폰트를 찾았다고 함"
+        finally:
+            for k, v in env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            ch._FONT.clear()
+            ch._FONT.update(saved)
+
+    def t_caption_content():
+        cap = ch.chart_caption(r_crash, rank=3, flags={}, trade_date="2026-08-24")
+        for kw in (f"[{r_crash.grade}]", "매집", "추세", "LPS", "신용과열",
+                   "밴드 위치", "청산중심", "P0", "피보", "0.618=",
+                   "배제 플래그: 없음", "2026-08-24", "3. "):
+            assert kw in cap, f"캡션에 '{kw}' 없음:\n{cap}"
+        assert "&amp;" in cap and "&lt;우선&gt;" in cap, "종목명 이스케이프 누락"
+        assert "(프록시)" in cap, "신용잔고 프록시 표시 누락"
+        warn = ch.chart_caption(r_crash, flags={"관리종목": True},
+                                exclusion="시가총액 500억 (하한 1,000억)")
+        assert "⚠️ 배제 플래그: 관리종목, 시가총액" in warn, warn
+        # 재계산 값이 기록과 다르면 알린다. 같으면 조용하다.
+        same = ch.chart_caption(r_crash, recorded=(r_crash.value_score,
+                                                   r_crash.trend_score))
+        assert "기록 점수" not in same
+        diff = ch.chart_caption(r_crash, recorded=(9.99, 0.0))
+        assert "기록 점수 매집 9.99" in diff, diff
+
+    def t_caption_limit():
+        long = dataclasses.replace(r_crash, name="가" * 1500)
+        cap = ch.chart_caption(long)
+        assert nt.caption_units(cap) <= nt.TELEGRAM_CAPTION_MAX, \
+            nt.caption_units(cap)
+        lines = "\n".join(f"<b>줄{i}</b> " + "x" * 60 for i in range(40))
+        fit, mode = nt.fit_caption(lines)
+        assert nt.caption_units(fit) <= 1024 and mode == "HTML"
+        assert fit.count("<b>") == fit.count("</b>"), "태그가 잘렸다"
+        assert fit.endswith("…")
+        one = "<b>" + "&amp;" * 600 + "</b>"
+        fit1, mode1 = nt.fit_caption(one)
+        assert mode1 is None and "<" not in fit1 and "&amp;" not in fit1, \
+            "한 줄 초과는 평문으로 잘라야 한다"
+        assert nt.caption_units(fit1) <= 1024
+        assert nt.caption_units("📈") == 2, "BMP 밖 문자는 2 로 센다"
+        short, m = nt.fit_caption("a\nb")
+        assert short == "a\nb" and m == "HTML"
+
+    def t_prune():
+        root = tmp / "charts_prune"
+        for name in ("20260901", "20260922", "20260923", "20260929",
+                     "notes", "2026093"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        (root / "20260901" / "x.png").write_bytes(b"x")
+        (root / "20260801.png").write_bytes(b"x")          # 파일은 대상 아님
+        gone = ch.prune_chart_dirs(root=root, today=datetime(2026, 9, 30).date())
+        assert gone == ["20260901", "20260922"], gone
+        left = sorted(p.name for p in root.iterdir())
+        assert left == sorted(["2026093", "20260801.png", "20260923",
+                               "20260929", "notes"]), left
+        assert ch.prune_chart_dirs(root=tmp / "없음") == []
+        p = ch.chart_path("2026-09-25", 3, "005930")
+        assert p.as_posix().endswith("data/charts/20260925/03_005930.png"), p
+
+    class _Res:
+        def __init__(self, status, body=None):
+            self.status_code = status
+            self._body = body or {"ok": status == 200}
+            self.text = str(self._body)
+
+        def json(self):
+            return self._body
+
+    def _fake_post(script):
+        """(url, kwargs) 를 기록하고 script 순서대로 응답한다."""
+        calls = []
+
+        def post(url, **kw):
+            files = kw.get("files") or {}
+            if "photo" in files:
+                _n, fh, _t = files["photo"]
+                kw = {**kw, "_photo_bytes": len(fh.read())}
+            calls.append((url, kw))
+            s = script.pop(0) if script else 200
+            if isinstance(s, Exception):
+                raise s
+            return _Res(s, {"description": f"code {s}"} if s != 200 else None)
+        return post, calls
+
+    def _with_post(script, fn):
+        saved = (nt.requests.post, nt.time.sleep)
+        post, calls = _fake_post(script)
+        nt.requests.post = post
+        nt.time.sleep = lambda *_a, **_k: None
+        try:
+            return fn(), calls
+        finally:
+            nt.requests.post, nt.time.sleep = saved
+
+    png = tmp / "photo.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 500)
+
+    def t_send_photo_recipients():
+        """수신자별 독립. 한 명의 403 이 다른 수신자를 막지 않는다."""
+        rep, calls = _with_post([200, 403], lambda: nt.send_photo(
+            png, "<b>캡션</b>", chat_id="1111,2222", token="T"))
+        assert rep.sent == 1 and len(rep.failures) == 1, rep
+        assert rep.failures[0].status == 403 and rep.failures[0].chat == "****2222"
+        assert not rep, "실패가 있는데 참"
+        assert all(u.endswith("/sendPhoto") for u, _ in calls), calls
+        assert calls[0][1]["data"]["parse_mode"] == "HTML"
+        assert calls[0][1]["data"]["chat_id"] == "1111"
+
+    def t_send_photo_retry_reopens_file():
+        """재시도마다 파일을 다시 연다 (읽힌 스트림을 재전송하면 빈 파일)."""
+        rep, calls = _with_post([500, 200], lambda: nt.send_photo(
+            png, "c", chat_id="1111", token="T"))
+        assert rep and rep.sent == 1, rep
+        assert len(calls) == 2
+        sizes = [kw["_photo_bytes"] for _u, kw in calls]
+        assert sizes == [508, 508], f"재시도에 빈 파일이 나갔다 {sizes}"
+        rep2, calls2 = _with_post([400], lambda: nt.send_photo(
+            png, "c", chat_id="1111", token="T"))
+        assert len(calls2) == 1 and rep2.failures[0].status == 400, "영구 실패 재시도"
+
+    def t_send_photo_caption_cut():
+        big = "\n".join("줄" * 100 for _ in range(30))
+        _rep, calls = _with_post([200], lambda: nt.send_photo(
+            png, big, chat_id="1", token="T"))
+        cap = calls[0][1]["data"]["caption"]
+        assert nt.caption_units(cap) <= 1024, nt.caption_units(cap)
+
+    def t_send_photo_preconditions():
+        try:
+            nt.send_photo(tmp / "nope.png", "c", chat_id="1", token="T")
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("없는 파일을 보냈다")
+        saved = {k: os.environ.pop(k, None)
+                 for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")}
+        try:
+            nt.send_photo(png, "c")
+        except nt.TelegramNotConfigured:
+            pass
+        else:
+            raise AssertionError("토큰 없이 발송 시도")
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def t_send_telegram_unchanged():
+        """_deliver 로 옮긴 뒤에도 텍스트 발송 규칙이 같다."""
+        rep, calls = _with_post([429, 200, 200], lambda: nt.send_telegram(
+            "x", chat_id="1111,2222", token="T"))
+        assert rep and rep.sent == 2, rep
+        assert len(calls) == 3 and calls[0][0].endswith("/sendMessage")
+        rep2, calls2 = _with_post(
+            [nt.requests.ConnectionError("down")] * 3,
+            lambda: nt.send_telegram("x", chat_id="1111", token="T"))
+        assert rep2.failures[0].status is None and len(calls2) == 3
+
+    # ── daily 연동 ──
+    db = tmp / "chart_daily.db"
+    st = Store(db)
+    st.upsert_prices("000001", fixture_crash(), allow_today=True)
+    st.upsert_prices("000002", fixture_golden_cross(), allow_today=True)
+    d = fixture_crash().index[-1].strftime("%Y-%m-%d")
+    r2 = screen_one("000002", "추세종목", fixture_golden_cross())
+    with sqlite3.connect(db) as con:
+        rows = [(d, 1, "000001", r_crash.name, 1.0, "VALUE", "A",
+                 r_crash.value_score, r_crash.trend_score, ""),
+                (d, 2, "000009", "시세없음", 1.0, "VALUE", "A", 8.0, 1.0, ""),
+                (d, 3, "000002", "추세종목", 1.0, "TREND", "B",
+                 r2.value_score, r2.trend_score, ""),
+                (d, 4, "000001", "등급없음", 1.0, "FILL", "NONE", 1.0, 1.0, "")]
+        con.executemany(
+            "INSERT INTO recos(d,rank,ticker,name,price,slot,grade,"
+            "value_score,trend_score,reason) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+        # 스냅샷이 있어야 daily 가 스캔을 생략하고 '기록된 추천 발송'으로 간다
+        con.execute("INSERT INTO scans(d,ticker) VALUES(?,?)", (d, "000001"))
+        con.commit()
+
+    def _sunday(dry: bool, text_ok=True, photo=None):
+        """일요일 경로(기록된 추천 발송)를 tmp 를 cwd 로 두고 태운다."""
+        mod = importlib.import_module("run_screen")
+        args = argparse.Namespace(force=False, dry_run=dry, with_fib=False,
+                                  top=10, limit=None, min_amount=0.0)
+        saved = (dict(mod.SUMMARY), mod.reco_send_allowed, mod.send_telegram,
+                 mod.send_photo, os.getcwd())
+        sent_text: list[str] = []
+        sent_photo: list[tuple] = []
+
+        def fake_text(text, *a, **k):
+            sent_text.append(text)
+            return nt.SendReport(sent=2) if text_ok else nt.SendReport(
+                sent=0, failures=(nt.SendFailure("****1111", 500, "x"),))
+
+        def fake_photo(path, caption, *a, **k):
+            sent_photo.append((path, caption))
+            if photo is None:
+                return nt.SendReport(sent=2)
+            return photo(path)
+
+        buf = io.StringIO()
+        try:
+            mod.SUMMARY.clear()
+            mod.reco_send_allowed = lambda *a, **k: (True, "send_dow")
+            mod.send_telegram = fake_text
+            mod.send_photo = fake_photo
+            os.chdir(tmp)               # data/charts 를 tmp 아래로
+            with contextlib.redirect_stdout(buf):
+                rc = mod.mode_daily(st, args)
+            summary = dict(mod.SUMMARY)
+        finally:
+            os.chdir(saved[4])
+            mod.SUMMARY.clear()
+            mod.SUMMARY.update(saved[0])
+            (mod.reco_send_allowed, mod.send_telegram, mod.send_photo) = saved[1:4]
+        return mod, rc, summary, sent_text, sent_photo, buf.getvalue()
+
+    def t_daily_dry_run_files_only():
+        mod, rc, sm, texts, photos, out = _sunday(dry=True)
+        assert rc == mod.EXIT_OK, rc
+        assert texts == [] and photos == [], "dry-run 인데 발송함"
+        c = sm["charts"]
+        assert c["eligible"] == 3, c            # NONE 제외, 상한 5 이내
+        assert c["made"] == 2 and c["sent"] == 0, c
+        assert [f["ticker"] for f in c["failed"]] == ["000009"], c["failed"]
+        for f in c["files"]:
+            assert (tmp / f).is_file(), f"PNG 없음 {f}"
+        assert "[차트 1." in out and "주간 추천" in out, out[:300]
+        assert sm.get("reco_sent") is True
+
+    def t_daily_photo_fail_text_ok():
+        """사진 발송 실패: 텍스트는 이미 나갔고, 실패는 send_failed 로 드러난다."""
+        def fail(_p):
+            return nt.SendReport(sent=1, failures=(
+                nt.SendFailure("****2222", 403, "blocked"),))
+        mod, rc, sm, texts, photos, _ = _sunday(dry=False, photo=fail)
+        assert rc == mod.EXIT_OK, rc            # main 이 send_failed 로 2 로 올린다
+        assert len(texts) == 1 and "주간 추천" in texts[0], "텍스트 미발송"
+        assert len(photos) == 2, photos
+        assert sm["send_failed"] == 2, sm.get("send_failed")
+        kinds = {f.get("kind") for f in sm["send_failures"]}
+        assert kinds == {"chart"}, sm["send_failures"]
+        assert sm["charts"]["sent"] == 0
+
+    def t_daily_photo_total_fail_halts():
+        """한 장이 전 수신자에게 실패하면 남은 사진은 시도하지 않는다.
+
+        토큰 오류·네트워크 전면 장애에서 장당 90초 x 수신자를 반복해
+        nightly 를 붙잡지 않게 한다. 텍스트는 이미 나갔다.
+        """
+        def dead(_p):
+            return nt.SendReport(sent=0, failures=(
+                nt.SendFailure("****1111", None, "ConnectionError"),
+                nt.SendFailure("****2222", None, "ConnectionError")))
+        mod, rc, sm, texts, photos, _ = _sunday(dry=False, photo=dead)
+        assert rc == mod.EXIT_OK and len(texts) == 1
+        assert len(photos) == 1, f"전원 실패 뒤에도 계속 보냄 {len(photos)}"
+        stages = [f["stage"] for f in sm["charts"]["failed"]]
+        assert stages.count("skipped") == 1 and "send" in stages, stages
+        assert sm["send_failed"] == 2, "시도하지 않은 사진을 실패로 셌다"
+
+    def t_daily_photo_exception_isolated():
+        def boom(_p):
+            raise RuntimeError("네트워크 밖 예외")
+        mod, rc, sm, texts, photos, _ = _sunday(dry=False, photo=boom)
+        assert rc == mod.EXIT_OK and len(texts) == 1
+        assert not sm.get("send_failed"), "예외를 수신자 실패로 셌다"
+        assert {f["stage"] for f in sm["charts"]["failed"]} == {"render", "send"}
+
+    def t_daily_chart_module_down():
+        """차트 단계 전체가 죽어도 텍스트 발송과 종료 코드는 그대로다."""
+        saved = ch.build_charts
+        ch.build_charts = lambda *a, **k: (_ for _ in ()).throw(
+            ImportError("matplotlib 없음"))
+        try:
+            mod, rc, sm, texts, photos, _ = _sunday(dry=False)
+        finally:
+            ch.build_charts = saved
+        assert rc == mod.EXIT_OK and len(texts) == 1 and photos == []
+        assert "ImportError" in sm["charts"]["error"], sm["charts"]
+
+    def t_rescreen_matches_record():
+        """일요일 재계산 = 기록 시점 채점 (같은 입력, 기준일까지)."""
+        from stocknews.daily import exclusion_of, scan_context, screen_ticker
+        ctx = scan_context(st, quiet=True)
+        # 차트는 배제 판정 없이 분석값을 받는다. 이 DB 는 거래일이 320일이라
+        # 250봉 픽스처가 '상장 1년 미만'으로 배제되는데, 그 사유는 캡션용으로
+        # 따로 잡혀야 한다.
+        res, ohlcv = screen_ticker(st, "000001", "x", ctx, until=d,
+                                   apply_exclusion=False)
+        assert "상장" in (exclusion_of("000001", ohlcv, ctx) or ""), \
+            "배제 사유를 못 잡았다"
+        excl, _ = screen_ticker(st, "000001", "x", ctx, until=d)
+        assert excl.excluded, "apply_exclusion=True 인데 배제되지 않음"
+        assert res is not None and ohlcv.index[-1].strftime("%Y-%m-%d") == d
+        near(res.value_score, r_crash.value_score, tol=1e-9, label="매집")
+        near(res.trend_score, r_crash.trend_score, tol=1e-9, label="추세")
+        early = fixture_crash().index[-10].strftime("%Y-%m-%d")
+        _r, cut = screen_ticker(st, "000001", "x", ctx, until=early,
+                                apply_exclusion=False)
+        assert cut.index[-1].strftime("%Y-%m-%d") == early, "기준일 뒤 봉이 섞임"
+
+    check("chart", "config 상수 배선", t_config)
+    check("chart", "등급 하한 판정", t_grade_filter)
+    check("chart", "등급 우선 선정 + 상한", t_select_grade_first)
+    check("chart", "매물대 = POC 계산 (분리 후 불변)", t_volume_profile_same_as_poc)
+    check("chart", "밴드·피보·P0 선 = 채점값 (앵커)", t_levels_anchor)
+    check("chart", "PNG 생성 (범위 밖 · 신호 없음 포함)", t_render_png)
+    check("chart", "한글 폰트 / 없으면 None", t_font)
+    check("chart", "캡션 내용 + 이스케이프 + 경고", t_caption_content)
+    check("chart", "캡션 1,024자 상한", t_caption_limit)
+    check("chart", "7일 지난 폴더 정리", t_prune)
+    check("chart", "sendPhoto 수신자별 독립", t_send_photo_recipients)
+    check("chart", "sendPhoto 재시도 = 파일 재오픈", t_send_photo_retry_reopens_file)
+    check("chart", "sendPhoto 캡션 절단", t_send_photo_caption_cut)
+    check("chart", "sendPhoto 전제조건", t_send_photo_preconditions)
+    check("chart", "sendMessage 규칙 불변", t_send_telegram_unchanged)
+    check("chart", "재계산 = 기록 채점 (기준일 절단)", t_rescreen_matches_record)
+    check("chart", "daily --dry-run: 파일만, 발송 없음", t_daily_dry_run_files_only)
+    check("chart", "daily: 사진 실패해도 텍스트 정상", t_daily_photo_fail_text_ok)
+    check("chart", "daily: 전원 실패 시 남은 사진 중단", t_daily_photo_total_fail_halts)
+    check("chart", "daily: 사진 예외 격리", t_daily_photo_exception_isolated)
+    check("chart", "daily: 차트 단계 전체 실패 격리", t_daily_chart_module_down)
+
+
 # ══════════════════════════ 보고 ══════════════════════════
 def report() -> int:
     width = 62
@@ -8899,6 +9352,7 @@ def main() -> int:
         test_watchlist(st)
         test_notify(tmp)
         test_reco_dow()
+        test_chart(tmp)
         test_trading_day(tmp)
         test_backtest(tmp)
         test_krx_credit()

@@ -29,15 +29,94 @@ import pandas as pd
 from .config import Config, DEFAULT
 from .contracts import ScreenResult
 from .data import load_index
-from .screener import rank_results, screen_one
+from .screener import check_exclusion, rank_results, screen_one
 from .sector_metrics import collect_sector_metrics
 
 log = logging.getLogger(__name__)
 
-__all__ = ["scan_all", "select_recommendations", "run_daily",
+__all__ = ["scan_all", "scan_context", "screen_ticker", "exclusion_of",
+           "select_recommendations", "run_daily",
            "market_context", "collect_market_context"]
 
 SLOT_PLAN = (("SEQ", 2), ("VALUE", 5), ("TREND", 3))
+
+
+SCAN_BARS = 420   # 종목별로 읽는 봉 수. 피보 1년(252) + 이평 여유
+
+
+def scan_context(store, quiet: bool = False) -> dict:
+    """스캔 입력 중 종목과 무관한 것. 한 번만 읽어 종목별로 넘긴다.
+
+    `scan_all` 과 차트용 재계산(`screen_ticker`)이 같이 쓴다. 둘이 입력을
+    따로 모으면 차트가 발송된 점수와 다른 계산을 그리게 된다.
+    """
+    meta = store.ticker_meta()
+    # 배제 플래그를 한 번만 읽어 종목별로 넘긴다. 비어 있으면(공급원 미구동)
+    # 배제가 걸리지 않으므로 잡주가 상위에 올라올 수 있다.
+    all_flags = store.load_flags()
+    if not all_flags and not quiet:
+        log.warning("배제 플래그가 비어 있다 — 'flags' 모드를 먼저 실행하라")
+
+    # 수동 주입 신용잔고. 있는 종목만 LPS credit_heat 가 만점까지 열린다.
+    # 없으면 프록시 캡(1.25점)이 걸려 매집 점수 상한이 8.49점이 된다.
+    credit_map = store.load_credit_ratios()
+    if credit_map and not quiet:
+        log.info("신용잔고 실측 %d종목 적용 (나머지는 프록시)", len(credit_map))
+
+    # '상장 1년 미만' 배제는 DB 에 1년치가 실제로 있을 때만 의미가 있다.
+    # 백필이 덜 된 상태에서 봉 수로 판정하면 전 종목이 신규상장으로
+    # 배제되어 추천이 0건 나온다. 원인 파악이 어려운 함정이다.
+    market_bars = len(store.existing_dates())
+    check_listing = market_bars >= 252
+    if not check_listing and not quiet:
+        log.warning("DB 거래일 %d일 (<252) — '상장 1년 미만' 배제를 비활성",
+                    market_bars)
+    return {"meta": meta, "flags": all_flags, "credit": credit_map,
+            "check_listing": check_listing}
+
+
+def exclusion_of(code: str, ohlcv, ctx: dict) -> str | None:
+    """`screen_one` 이 내렸을 배제 사유. 스캔과 같은 입력으로 판정한다."""
+    meta = ctx["meta"]
+    mc = None
+    if code in meta.index:
+        v = meta.at[code, "market_cap"]
+        mc = float(v) if pd.notna(v) else None
+    listed = len(ohlcv) if (ctx["check_listing"] and ohlcv is not None) else None
+    return check_exclusion(ctx["flags"].get(code), mc, listed)
+
+
+def screen_ticker(store, code: str, name: str, ctx: dict,
+                  cfg: Config = DEFAULT, until=None,
+                  apply_exclusion: bool = True):
+    """한 종목을 스캔과 같은 입력으로 채점한다. (결과, 시세) 또는 (None, 시세).
+
+    until : 이 날짜(포함)까지의 봉만 쓴다. 일요일에 금요일 기록을
+            재현할 때 기준일 뒤 봉이 섞이지 않게 한다.
+    apply_exclusion=False 면 배제 판정을 건너뛰고 분석값을 채운다.
+            차트는 기록 뒤에 배제 사유가 생긴 종목도 그려서 경고해야
+            하는데, 배제된 결과에는 피보·밴드가 비어 있다.
+    """
+    ohlcv = store.load_ohlcv(code, days=SCAN_BARS)
+    if ohlcv is not None and until is not None:
+        ohlcv = ohlcv[ohlcv.index <= pd.Timestamp(str(until))]
+    if ohlcv is None or len(ohlcv) < cfg.ma.long + 30:
+        return None, ohlcv
+    meta = ctx["meta"]
+    mc = None
+    if code in meta.index:
+        v = meta.at[code, "market_cap"]
+        mc = float(v) if pd.notna(v) else None
+    listed = len(ohlcv) if ctx["check_listing"] else None
+    res = screen_one(
+        code, name, ohlcv,
+        credit=None, investor=None, shorting=None,
+        credit_ratio=ctx["credit"].get(code),
+        flags=ctx["flags"].get(code) if apply_exclusion else None,
+        market_cap=mc if apply_exclusion else None,
+        listed_days=listed if apply_exclusion else None, cfg=cfg,
+    )
+    return res, ohlcv
 
 
 def scan_all(store, tickers: dict, cfg: Config = DEFAULT,
@@ -47,27 +126,7 @@ def scan_all(store, tickers: dict, cfg: Config = DEFAULT,
     종목 하나가 터져도 배치가 죽지 않게 예외를 개별 격리한다.
     이게 없으면 신규상장/액면분할 종목 하나 때문에 매일 배치가 실패한다.
     """
-    meta = store.ticker_meta()
-    # 배제 플래그를 한 번만 읽어 종목별로 넘긴다. 비어 있으면(공급원 미구동)
-    # 배제가 걸리지 않으므로 잡주가 상위에 올라올 수 있다.
-    all_flags = store.load_flags()
-    if not all_flags:
-        log.warning("배제 플래그가 비어 있다 — 'flags' 모드를 먼저 실행하라")
-
-    # 수동 주입 신용잔고. 있는 종목만 LPS credit_heat 가 만점까지 열린다.
-    # 없으면 프록시 캡(1.25점)이 걸려 매집 점수 상한이 8.49점이 된다.
-    credit_map = store.load_credit_ratios()
-    if credit_map:
-        log.info("신용잔고 실측 %d종목 적용 (나머지는 프록시)", len(credit_map))
-
-    # '상장 1년 미만' 배제는 DB 에 1년치가 실제로 있을 때만 의미가 있다.
-    # 백필이 덜 된 상태에서 봉 수로 판정하면 전 종목이 신규상장으로
-    # 배제되어 추천이 0건 나온다. 원인 파악이 어려운 함정이다.
-    market_bars = len(store.existing_dates())
-    check_listing = market_bars >= 252
-    if not check_listing:
-        log.warning("DB 거래일 %d일 (<252) — '상장 1년 미만' 배제를 비활성",
-                    market_bars)
+    ctx = scan_context(store)
 
     results: list[ScreenResult] = []
     errors: list[tuple] = []
@@ -79,21 +138,9 @@ def scan_all(store, tickers: dict, cfg: Config = DEFAULT,
             log.info("  스캔 진행 %d/%d (통과 %d, 배제 %d, 실패 %d)",
                      i, total, len(results) - excluded_n, excluded_n, len(errors))
         try:
-            ohlcv = store.load_ohlcv(code, days=420)
-            if ohlcv is None or len(ohlcv) < cfg.ma.long + 30:
+            res, _ = screen_ticker(store, code, name, ctx, cfg)
+            if res is None:
                 continue
-            mc = None
-            listed = len(ohlcv)
-            if code in meta.index:
-                v = meta.at[code, "market_cap"]
-                mc = float(v) if pd.notna(v) else None
-            res = screen_one(
-                code, name, ohlcv,
-                credit=None, investor=None, shorting=None,
-                credit_ratio=credit_map.get(code), flags=all_flags.get(code),
-                market_cap=mc,
-                listed_days=listed if check_listing else None, cfg=cfg,
-            )
             if res.excluded:
                 excluded_n += 1
             results.append(res)
