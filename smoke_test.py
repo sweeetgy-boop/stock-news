@@ -9657,36 +9657,80 @@ def test_obv(tmp: Path):
             assert word not in bull + bear, f"OBV 줄에 판정 문구 '{word}'"
 
     def t_chart_fit_is_recorded_slope():
-        """차트의 점선 = scans 에 기록되는 바로 그 기울기."""
+        """차트의 점선 = scans 에 기록되는 바로 그 기울기. 첫 봉 = 0 리베이스."""
         df = fixture_golden_cross()
         sig = evaluate_obv(df, oc)
         disp = df.tail(DEFAULT.chart.bars)
-        start, ser, since = ch.obv_display(disp)
-        assert start == 0 and since is None
+        ser, traces = ch.obv_display(disp)
+        assert traces == [] and len(ser) == DEFAULT.chart.bars
+        assert ser.iloc[0] == 0.0, "120봉 시작점이 0 이 아니다"
         k, _b = obv_fit(ser.iloc[-(oc.window + 1):])
         near(k / disp["거래량"].iloc[-oc.window:].mean(), sig.slope, tol=1e-9,
              label="차트 회귀선")
 
+    def _panel(res, df):
+        from matplotlib.figure import Figure
+        ax = Figure().add_subplot()
+        ch.draw_obv_panel(ax, res, df)
+        return ax
+
+    def t_panel_ratios():
+        assert tuple(DEFAULT.chart.panel_ratios) == (6, 2, 2), \
+            "메인:거래량:OBV 높이 비율"
+        df = fixture_golden_cross()
+        r = dataclasses.replace(screen_one("000002", "추세", df),
+                                obv=evaluate_obv(df, oc))
+        p = ch.render_chart(r, df, tmp / "obv" / "ratio.png")
+        from PIL import Image
+        w_px, h_px = Image.open(p).size
+        near(h_px / DEFAULT.chart.dpi, 4.5 * 10 / 6 + 1.07 + 0.49, tol=0.02,
+             label="그림 높이(in)")
+
+    def t_panel_line_rebased():
+        df = fixture_golden_cross().tail(120)
+        r = dataclasses.replace(screen_one("000002", "추세", df),
+                                obv=evaluate_obv(df, oc))
+        ax = _panel(r, df)
+        ys = [ln.get_ydata() for ln in ax.lines]
+        obv_line = [y for y in ys if len(y) == 120]
+        assert obv_line and float(obv_line[0][0]) == 0.0, "첫 봉 0 리베이스 아님"
+        assert any(len(y) == oc.window + 1 for y in ys), "회귀선 없음"
+        txt = " ".join(t.get_text() for t in ax.texts)
+        assert "OBV 20일" in txt and ch.OBV_EXCLUDED_NOTE not in txt, txt
+
+    def t_panel_null_note_only():
+        """분할 흔적 NULL -> 선·눈금 없이 문구 하나만."""
+        df = fixture_golden_cross().copy()
+        df.iloc[-5:, :4] *= 5
+        df.iloc[-5:, df.columns.get_loc("거래량")] *= 0.2
+        for reason in ("split", "price_gap"):
+            r = dataclasses.replace(screen_one("000002", "추세", df),
+                                    obv=ObvSignal(None, None, None, reason))
+            ax = _panel(r, df.tail(120))
+            assert len(ax.lines) == 0, f"{reason}: 선을 그렸다"
+            assert [t.get_text() for t in ax.texts] == [
+                "OBV 계산 제외(수정주가 구간)"], [t.get_text() for t in ax.texts]
+            assert list(ax.get_yticks()) == [], "눈금이 남았다"
+        r = dataclasses.replace(screen_one("000002", "추세", df),
+                                obv=evaluate_obv(df, oc))
+        assert r.obv.null_reason == "split"
+        assert ch.render_chart(r, df, tmp / "obv" / "null.png").is_file()
+
     def t_chart_split_in_display():
-        """표시 구간에 흔적이 있으면 그 날부터 다시 센다. PNG 는 생긴다."""
+        """흔적이 20일 창 밖 · 표시 구간 안: 선은 첫 봉 0 부터, 흔적 날 표시."""
         df = fixture_golden_cross().copy()
         df.iloc[-40:, :4] *= 5
         df.iloc[-40:, df.columns.get_loc("거래량")] *= 0.2
-        start, ser, since = ch.obv_display(df.tail(120))
-        assert since == df.index[-40] and start == 80 and len(ser) == 40
-        r = screen_one("000002", "추세", df)
-        r = dataclasses.replace(r, obv=evaluate_obv(df, oc))
+        ser, traces = ch.obv_display(df.tail(120))
+        assert [d for d, _k in traces] == [df.index[-40]], traces
+        assert ser.iloc[0] == 0.0 and len(ser) == 120
+        r = dataclasses.replace(screen_one("000002", "추세", df),
+                                obv=evaluate_obv(df, oc))
         assert r.obv.slope is not None, "흔적이 창 밖인데 NULL"
+        ax = _panel(r, df.tail(120))
+        assert any("분할 흔적" in t.get_text() for t in ax.texts)
         p = ch.render_chart(r, df, tmp / "obv" / "split.png")
         assert p.read_bytes()[:4] == b"\x89PNG"
-        # 흔적이 마지막 봉 -> NULL + 점 하나짜리 선도 죽지 않는다
-        df2 = fixture_golden_cross().copy()
-        df2.iloc[-1:, :4] *= 0.2
-        df2.iloc[-1:, df2.columns.get_loc("거래량")] *= 5
-        r2 = dataclasses.replace(screen_one("000002", "추세", df2),
-                                 obv=evaluate_obv(df2, oc))
-        assert r2.obv.null_reason == "split"
-        assert ch.render_chart(r2, df2, tmp / "obv" / "last.png").is_file()
 
     check("obv", "config 배선 · 가격제한폭 밖", t_config)
     check("obv", "OBV 누적 앵커", t_series_anchor)
@@ -9702,6 +9746,9 @@ def test_obv(tmp: Path):
     check("obv", "OBV 값과 무관하게 10선·등급 동일", t_recos_unchanged_with_obv)
     check("obv", "앨범 캡션 한 줄", t_caption_line)
     check("obv", "차트 회귀선 = 기록 기울기", t_chart_fit_is_recorded_slope)
+    check("obv", "차트: 높이 비율 6:2:2", t_panel_ratios)
+    check("obv", "차트: OBV 첫 봉 0 리베이스 + 회귀선", t_panel_line_rebased)
+    check("obv", "차트: NULL 은 문구만", t_panel_null_note_only)
     check("obv", "차트: 표시 구간 분할 흔적", t_chart_split_in_display)
 
 

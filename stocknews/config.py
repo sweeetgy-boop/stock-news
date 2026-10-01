@@ -164,6 +164,9 @@ class ChartConfig:
     keep_days: int = 7               # 폴더 이름 날짜가 이보다 오래되면 정리
     font: str = "Malgun Gothic"      # 맑은 고딕. 없으면 경고 후 기본 폰트
     dpi: int = 110
+    # 세로 비율 메인 : 거래량 : OBV. OBV 는 거래량과 y축을 공유하지 않는
+    # 별도 패널이다(한 패널에 두면 이중 y축이 된다).
+    panel_ratios: tuple[float, float, float] = (6, 2, 2)
 
 
 # 보유기간 규칙. **거래일 기준**이다. 달력일로 세면 주말·연휴에 카운터가

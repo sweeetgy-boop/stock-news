@@ -44,7 +44,8 @@ __all__ = ["GRADE_RANK", "grade_at_least", "ChartJob", "ChartOut",
            "jobs_from_picks", "jobs_from_rows", "select_targets",
            "korean_font", "render_chart", "chart_caption", "chart_path",
            "prune_chart_dirs", "build_charts", "line_levels", "album_items",
-           "obv_line", "obv_display"]
+           "obv_line", "obv_display", "obv_panel_note", "draw_obv_panel",
+           "OBV_EXCLUDED_NOTE"]
 
 # 등급 순서. 작을수록 높다. NONE 은 차트 대상이 아니므로 없다.
 GRADE_RANK = {"S+": 0, "S": 1, "A": 2, "B": 3}
@@ -67,6 +68,8 @@ TRACK_KR = {"VALUE": "매집", "TREND": "추세", "BOTH": "시퀀스"}
 OBV_NULL_KR = {"split": "분할 흔적", "price_gap": "가격 단절",
                "short": "봉 부족", "no_volume": "거래량 없음"}
 DIV_KR = {1: "강세", -1: "약세", 0: "없음"}
+# 분할 흔적(split · price_gap)으로 NULL 인 종목의 OBV 패널 문구. 선은 없다.
+OBV_EXCLUDED_NOTE = "OBV 계산 제외(수정주가 구간)"
 
 
 def grade_at_least(grade: str | None, min_grade: str) -> bool:
@@ -213,19 +216,66 @@ def _spread(ys: list[float], gap: float) -> list[float]:
 
 
 def obv_display(df: pd.DataFrame, cfg: Config = DEFAULT):
-    """표시 구간의 OBV 선. (시작 위치, OBV 시리즈, 기준 날짜 또는 None).
+    """표시 구간(120봉)의 OBV. (첫 봉 = 0 으로 리베이스한 시리즈, 흔적 목록).
 
-    표시 구간 안에 분할 흔적이 있으면 마지막 흔적 날부터 0 으로 다시 센다.
-    그 앞을 이어 그리면 단위가 다른 거래량이 한 선에 섞인다.
+    OBV 의 수준은 시작점에 따라 달라지는 임의의 값이라, 표시 구간 첫 봉을
+    0 으로 둔다. 흔적 목록은 20일 창 밖이라 NULL 이 아닌데 표시 구간에는
+    들어 있는 분할 흔적이다 — 그 날 선에 단위가 바뀌므로 표시만 한다.
     """
-    traces = split_traces(df["종가"], df["거래량"], cfg.obv)
-    start, since = 0, None
+    return (obv_series(df["종가"], df["거래량"]),
+            split_traces(df["종가"], df["거래량"], cfg.obv))
+
+
+def obv_panel_note(sig: ObvSignal | None) -> str | None:
+    """OBV 패널에 선 대신 문구만 쓸 경우 그 문구. 선을 그리면 None."""
+    if sig is None or sig.slope is not None:
+        return None
+    if sig.null_reason in ("split", "price_gap"):
+        return OBV_EXCLUDED_NOTE
+    return obv_line(sig)
+
+
+def draw_obv_panel(axo, res: ScreenResult, df: pd.DataFrame,
+                   cfg: Config = DEFAULT, label_x: float | None = None) -> None:
+    """OBV 패널. 기록·표시 전용 — 채점과 무관하다.
+
+    - 선: 표시 구간 첫 봉 = 0. 굵은 점선 = scans.obv_slope20 을 만든 회귀선.
+    - NULL(분할 흔적) 종목: 선·눈금·격자 없이 OBV_EXCLUDED_NOTE 만.
+    """
+    note = obv_panel_note(res.obv)
+    if note is not None:
+        axo.grid(False)
+        axo.set_yticks([])
+        axo.text(0.5, 0.5, note, transform=axo.transAxes, ha="center",
+                 va="center", fontsize=9.5, color=INK2, zorder=6)
+        return
+
+    n = len(df)
+    x = np.arange(n)
+    ser, traces = obv_display(df, cfg)
+    axo.axhline(0, color=GRID, linewidth=1.0, zorder=1)
+    axo.plot(x, ser.to_numpy(float), color=INK2, linewidth=1.3, zorder=3)
+    sig = res.obv
+    w = int(cfg.obv.window)
+    if sig is not None and sig.slope is not None and n >= w + 1:
+        k_, b_ = obv_fit(ser.iloc[-(w + 1):])
+        axo.plot(x[-(w + 1):], b_ + k_ * np.arange(w + 1), color=INK,
+                 linewidth=2.0, linestyle="--", zorder=4)
+    notes = obv_line(sig).split(" / ")
+    for d, _k in traces:
+        axo.axvline(int(df.index.get_loc(d)), color=INK2, linewidth=0.9,
+                    linestyle=":", zorder=2)
     if traces:
-        last = traces[-1][0]
-        start = int(df.index.get_loc(last))
-        since = pd.Timestamp(last)
-    sub = df.iloc[start:]
-    return start, obv_series(sub["종가"], sub["거래량"]), since
+        notes.append(f"{pd.Timestamp(traces[-1][0]):%m/%d} 분할 흔적(점선)")
+    # 선과 겹치지 않게 우측 여백(빈 봉 자리)에 쓴다. 가격 라벨과 같은 열.
+    axo.text(n + 0.8 if label_x is None else label_x, 0.5, "\n".join(notes),
+             transform=axo.get_xaxis_transform(), va="center", ha="left",
+             fontsize=8, color=INK2, zorder=6)
+    axo.set_ylabel("OBV")
+    from matplotlib.ticker import FuncFormatter
+    axo.yaxis.set_major_formatter(
+        FuncFormatter(lambda v, _p: f"{v / 1e4:,.0f}만" if v else "0"))
+    axo.locator_params(axis="y", nbins=3)
 
 
 def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
@@ -276,12 +326,18 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
     with rc_context(rc), warnings.catch_warnings():
         # 폰트가 없으면 글리프마다 경고가 난다. 위에서 한 번 알렸다.
         warnings.filterwarnings("ignore", message=r"Glyph .* missing")
-        fig = Figure(figsize=(12, 8.2), dpi=c.dpi, facecolor=SURFACE)
+        # 제목·범례 영역(위 1.07in)과 날짜 눈금(아래 0.49in)은 높이와 무관하게
+        # 고정이고, 메인 패널이 예전(4.5in)과 같은 크기가 되도록 전체를 늘린다.
+        ratios = [float(r) for r in c.panel_ratios]
+        fig_h = 4.5 * sum(ratios) / ratios[0] + 1.07 + 0.49
+        fig = Figure(figsize=(12, fig_h), dpi=c.dpi, facecolor=SURFACE)
         FigureCanvasAgg(fig)
-        gs = fig.add_gridspec(3, 2, height_ratios=[4, 1, 0.85],
+        top_y = lambda inch: 1.0 - inch / fig_h   # noqa: E731 - 위에서 inch 아래
+        gs = fig.add_gridspec(3, 2, height_ratios=ratios,
                               width_ratios=[6.2, 1],
                               hspace=0.04, wspace=0.015,
-                              left=0.075, right=0.985, top=0.87, bottom=0.06)
+                              left=0.075, right=0.985, top=top_y(1.07),
+                              bottom=0.49 / fig_h)
         ax = fig.add_subplot(gs[0, 0])
         axv = fig.add_subplot(gs[1, 0], sharex=ax)
         axo = fig.add_subplot(gs[2, 0], sharex=ax)
@@ -369,35 +425,10 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
         axv.locator_params(axis="y", nbins=3)
         axv.tick_params(labelbottom=False)
 
-        # ── OBV (기록·표시 전용) ──
-        # 거래량 막대 위에 겹치지 않고 바로 아래 띠로 둔다. 한 패널에 두면
-        # y축이 둘(일 거래량 · 누적 거래량)이 되어 두 눈금이 관계있는 것처럼
-        # 읽힌다. 수준은 의미가 없으므로 표시 구간 시작을 0 으로 둔다.
-        # 굵은 점선 = scans.obv_slope20 을 만든 바로 그 회귀선.
-        o_start, o_ser, o_since = obv_display(df, cfg)
-        axo.axhline(0, color=GRID, linewidth=1.0, zorder=1)
-        axo.plot(x[o_start:], o_ser.to_numpy(float), color=INK2,
-                 linewidth=1.3, zorder=3)
-        sig = res.obv
-        w = int(cfg.obv.window)
-        notes = []
-        if sig is not None and sig.slope is not None and len(o_ser) >= w + 1:
-            k_, b_ = obv_fit(o_ser.iloc[-(w + 1):])
-            axo.plot(x[-(w + 1):], b_ + k_ * np.arange(w + 1), color=INK,
-                     linewidth=2.0, linestyle="--", zorder=4)
-        notes += obv_line(sig).split(" / ")
-        if o_since is not None and sig is not None and sig.slope is not None:
-            notes.append(f"{o_since:%m/%d} 분할 흔적 이후")
-        # 선과 겹치지 않게 우측 여백(빈 봉 자리)에 쓴다. 가격 라벨과 같은 열.
-        axo.text(right, 0.5, "\n".join(notes),
-                 transform=axo.get_xaxis_transform(), va="center", ha="left",
-                 fontsize=8, color=INK2, zorder=6)
-        axo.set_ylabel("OBV")
-        axo.yaxis.set_major_formatter(
-            FuncFormatter(lambda v, _p: f"{v / 1e4:,.0f}만" if v else "0"))
-        axo.locator_params(axis="y", nbins=3)
-        if len(o_ser) < 2:            # 흔적이 마지막 봉이면 선이 점 하나다
-            axo.set_yticks([])
+        # ── OBV 패널 (기록·표시 전용) ──
+        # 거래량과 y축을 공유하지 않는 별도 패널. 한 패널에 두면 y축이
+        # 둘(일 거래량 · 누적 거래량)이 되어 두 눈금이 관계있는 것처럼 읽힌다.
+        draw_obv_panel(axo, res, df, cfg, label_x=right)
         ticks = sorted(set(np.linspace(0, n - 1, 7).astype(int).tolist()))
         axo.set_xticks(ticks)
         axo.set_xticklabels([df.index[i].strftime("%y/%m/%d" if k == 0 else "%m/%d")
@@ -429,7 +460,7 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
                      ha="center", fontsize=8, color=INK2)
 
         # ── 제목 · 범례 ──
-        fig.text(0.075, 0.962,
+        fig.text(0.075, top_y(0.31),
                  f"{res.name} ({res.ticker})   {res.grade} 등급   "
                  f"매집 {res.value_score:.2f} · 추세 {res.trend_score:.2f}",
                  fontsize=14, fontweight="bold", color=INK, ha="left")
@@ -440,7 +471,7 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
             sub.append(f"피보 진행률 {res.fib.ratio:.3f}")
         if res.liq is not None and np.isfinite(res.liq.band_pos):
             sub.append(f"밴드 위치 {res.liq.band_pos * 100:.0f}%")
-        fig.text(0.075, 0.929, " · ".join(sub), fontsize=9.5, color=INK2, ha="left")
+        fig.text(0.075, top_y(0.58), " · ".join(sub), fontsize=9.5, color=INK2, ha="left")
 
         from matplotlib.lines import Line2D
         handles = [Line2D([], [], color=cc, lw=1.4, label=f"MA{m}")
@@ -448,7 +479,7 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
         handles += [Line2D([], [], color=BAND, lw=1.4, ls="--", label="청산밴드 -16/-30/-44%"),
                     Line2D([], [], color=FIB, lw=1.3, ls="dotted", label="피보 되돌림"),
                     Line2D([], [], color=INK, lw=1.4, ls="-.", label="P0 신용 평균단가(추정)")]
-        fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.07, 0.917),
+        fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.07, top_y(0.68)),
                    ncol=6, frameon=False, fontsize=8.5, handlelength=2.2,
                    columnspacing=1.4, labelcolor=INK2)
 
