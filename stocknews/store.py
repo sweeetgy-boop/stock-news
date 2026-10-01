@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS scans (
   band_mid REAL, band_pos REAL,
   cross_pair TEXT, cross_bars_ago INTEGER,
   confluence INTEGER, sequence_confirm INTEGER,
+  obv_slope20 REAL,                  -- 기록 전용. NULL = 분할 흔적/봉 부족
+  obv_divergence INTEGER,            -- 기록 전용. +1 강세 -1 약세 0 없음
   PRIMARY KEY (d, ticker)
 );
 CREATE INDEX IF NOT EXISTS ix_scans_ticker ON scans(ticker);
@@ -473,6 +475,10 @@ class Store:
         # 상수 DEFAULT 를 기존 행에 그대로 보여주므로 행 재작성이 없다.
         ("prices", "source", "TEXT NOT NULL DEFAULT 'pykrx'"),
         ("prices", "is_final", "INTEGER NOT NULL DEFAULT 0"),
+        # OBV 20일 기울기·다이버전스. 기록 전용 — 어떤 판정도 읽지 않는다.
+        # 이 컬럼이 생기기 전 스냅샷은 NULL 로 남는다(소급 계산 없음).
+        ("scans", "obv_slope20", "REAL"),
+        ("scans", "obv_divergence", "INTEGER"),
     )
 
     def _init(self) -> None:
@@ -941,7 +947,7 @@ class Store:
         for r in results:
             if r.excluded:
                 continue
-            f, q, t = r.fib, r.liq, r.trend
+            f, q, t, ob = r.fib, r.liq, r.trend, r.obv
             cross = t.best_cross if (t and t.best_cross
                                      and t.best_cross.kind == "GOLDEN") else None
             rows.append((
@@ -956,6 +962,7 @@ class Store:
                 cross.pair if cross else None,
                 cross.bars_ago if cross else None,
                 int(r.confluence), int(r.sequence_confirm),
+                ob.slope if ob else None, ob.divergence if ob else None,
             ))
         if not rows:
             return 0
@@ -965,8 +972,8 @@ class Store:
                 "INSERT INTO scans(d,ticker,name,price,value_score,trend_score,"
                 "grade,track,lps,trend_raw,fib_score,fib_ratio,fib_below,"
                 "fib_target_price,band_mid,band_pos,cross_pair,cross_bars_ago,"
-                "confluence,sequence_confirm) "
-                "VALUES(" + ",".join("?" * 20) + ")", rows)
+                "confluence,sequence_confirm,obv_slope20,obv_divergence) "
+                "VALUES(" + ",".join("?" * 22) + ")", rows)
             con.commit()
         return len(rows)
 

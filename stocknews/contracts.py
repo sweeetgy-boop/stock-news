@@ -89,6 +89,25 @@ class LiquidationSignal:
 
 
 @dataclass(frozen=True)
+class ObvSignal:
+    """OBV 20일 흐름. **기록·표시 전용** — 점수·등급·슬롯·게이트·exits 금지.
+
+    slope 가 None 이면 그 종목 OBV 는 NULL 이다. 사유는 null_reason.
+      split      창 안에 가격 비율과 거래량 비율이 역수로 튄 날 (분할 흔적)
+      price_gap  창 안에 가격제한폭 밖 점프. 거래량은 역수가 아니지만 가격
+                 시계열이 끊겨 20일 변화율·OBV 부호가 둘 다 무의미하다
+      short      봉 부족
+      no_volume  창 안 거래량 평균이 0
+    """
+
+    slope: Optional[float]          # 20일 OBV 회귀 기울기 / 20일 평균 거래량
+    divergence: Optional[int]       # +1 강세 / -1 약세 / 0 없음 / None 판정불가
+    price_ret_pct: Optional[float]  # 같은 창의 종가 변화율(%)
+    null_reason: Optional[str] = None
+    split_dates: tuple = ()         # 창 안 분할 흔적 날짜 (YYYY-MM-DD)
+
+
+@dataclass(frozen=True)
 class ScreenResult:
     """한 종목에 대한 최종 스크리닝 산출물."""
 
@@ -110,6 +129,9 @@ class ScreenResult:
     mark: str = ""                  # ⭐⭐⭐ 🔵 등
     reasons: tuple = ()
     excluded: Optional[str] = None  # 배제 사유(있으면 발송 금지)
+    # 기록·표시 전용. screen_one 은 채우지 않는다 — 채점이 끝난 뒤
+    # daily.screen_ticker 가 덧붙인다. 그래서 점수 경로가 볼 수 없다.
+    obv: Optional[ObvSignal] = None
 
 
 # ══════════════════════════ 포지션 / 청산 ══════════════════════════

@@ -9,6 +9,8 @@
   - 밴드·피보·P0 는 ScreenResult 의 값을 그대로 쓰고,
   - 매물대는 P0(방법 C)와 같은 함수·같은 구간·같은 칸 수로 센다
     (`cost_basis.volume_profile`).
+예외는 하단 OBV 띠와 캡션 마지막 줄이다. 채점에 쓰지 않는 기록 전용
+지표이고, 값은 `scans.obv_slope20` 에 기록되는 것과 같다.
 
 실패는 종목 단위로 격리한다. 차트는 부가 정보이고, 차트 한 장 때문에
 텍스트 발송이 막히면 주객이 바뀐다.
@@ -29,9 +31,9 @@ import numpy as np
 import pandas as pd
 
 from .config import Config, DEFAULT
-from .contracts import ScreenResult
+from .contracts import ObvSignal, ScreenResult
 from .cost_basis import POC_MIN_LOOKBACK, volume_profile
-from .indicators import moving_averages
+from .indicators import moving_averages, obv_fit, obv_series, split_traces
 from .notify import TELEGRAM_CAPTION_MAX, caption_units, fit_caption, now_kst
 from .renderer import bar
 from .screener import HARD_EXCLUSION_FLAGS
@@ -41,7 +43,8 @@ log = logging.getLogger(__name__)
 __all__ = ["GRADE_RANK", "grade_at_least", "ChartJob", "ChartOut",
            "jobs_from_picks", "jobs_from_rows", "select_targets",
            "korean_font", "render_chart", "chart_caption", "chart_path",
-           "prune_chart_dirs", "build_charts", "line_levels", "album_items"]
+           "prune_chart_dirs", "build_charts", "line_levels", "album_items",
+           "obv_line", "obv_display"]
 
 # 등급 순서. 작을수록 높다. NONE 은 차트 대상이 아니므로 없다.
 GRADE_RANK = {"S+": 0, "S": 1, "A": 2, "B": 3}
@@ -61,6 +64,9 @@ FIB = "#008300"
 VP = "#9c9a92"
 
 TRACK_KR = {"VALUE": "매집", "TREND": "추세", "BOTH": "시퀀스"}
+OBV_NULL_KR = {"split": "분할 흔적", "price_gap": "가격 단절",
+               "short": "봉 부족", "no_volume": "거래량 없음"}
+DIV_KR = {1: "강세", -1: "약세", 0: "없음"}
 
 
 def grade_at_least(grade: str | None, min_grade: str) -> bool:
@@ -206,9 +212,25 @@ def _spread(ys: list[float], gap: float) -> list[float]:
     return out
 
 
+def obv_display(df: pd.DataFrame, cfg: Config = DEFAULT):
+    """표시 구간의 OBV 선. (시작 위치, OBV 시리즈, 기준 날짜 또는 None).
+
+    표시 구간 안에 분할 흔적이 있으면 마지막 흔적 날부터 0 으로 다시 센다.
+    그 앞을 이어 그리면 단위가 다른 거래량이 한 선에 섞인다.
+    """
+    traces = split_traces(df["종가"], df["거래량"], cfg.obv)
+    start, since = 0, None
+    if traces:
+        last = traces[-1][0]
+        start = int(df.index.get_loc(last))
+        since = pd.Timestamp(last)
+    sub = df.iloc[start:]
+    return start, obv_series(sub["종가"], sub["거래량"]), since
+
+
 def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
                  cfg: Config = DEFAULT, trade_date: str | None = None) -> Path:
-    """최근 N봉 캔들 + MA + 청산밴드 + 피보 + P0 + 매물대(상위 3) PNG."""
+    """최근 N봉 캔들 + MA + 청산밴드 + 피보 + P0 + 매물대(상위 3) + OBV 띠 PNG."""
     from matplotlib import rc_context
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -254,16 +276,18 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
     with rc_context(rc), warnings.catch_warnings():
         # 폰트가 없으면 글리프마다 경고가 난다. 위에서 한 번 알렸다.
         warnings.filterwarnings("ignore", message=r"Glyph .* missing")
-        fig = Figure(figsize=(12, 7.4), dpi=c.dpi, facecolor=SURFACE)
+        fig = Figure(figsize=(12, 8.2), dpi=c.dpi, facecolor=SURFACE)
         FigureCanvasAgg(fig)
-        gs = fig.add_gridspec(2, 2, height_ratios=[4, 1], width_ratios=[6.2, 1],
+        gs = fig.add_gridspec(3, 2, height_ratios=[4, 1, 0.85],
+                              width_ratios=[6.2, 1],
                               hspace=0.04, wspace=0.015,
-                              left=0.075, right=0.985, top=0.855, bottom=0.07)
+                              left=0.075, right=0.985, top=0.87, bottom=0.06)
         ax = fig.add_subplot(gs[0, 0])
         axv = fig.add_subplot(gs[1, 0], sharex=ax)
+        axo = fig.add_subplot(gs[2, 0], sharex=ax)
         axp = fig.add_subplot(gs[0, 1], sharey=ax)
-        fig.add_subplot(gs[1, 1]).axis("off")
-        for a in (ax, axv, axp):
+        fig.add_subplot(gs[1:, 1]).axis("off")
+        for a in (ax, axv, axo, axp):
             a.set_facecolor(SURFACE)
             for s in a.spines.values():
                 s.set_color(GRID)
@@ -343,9 +367,40 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
         axv.yaxis.set_major_formatter(
             FuncFormatter(lambda v, _p: f"{v / 1e4:,.0f}만" if v else "0"))
         axv.locator_params(axis="y", nbins=3)
+        axv.tick_params(labelbottom=False)
+
+        # ── OBV (기록·표시 전용) ──
+        # 거래량 막대 위에 겹치지 않고 바로 아래 띠로 둔다. 한 패널에 두면
+        # y축이 둘(일 거래량 · 누적 거래량)이 되어 두 눈금이 관계있는 것처럼
+        # 읽힌다. 수준은 의미가 없으므로 표시 구간 시작을 0 으로 둔다.
+        # 굵은 점선 = scans.obv_slope20 을 만든 바로 그 회귀선.
+        o_start, o_ser, o_since = obv_display(df, cfg)
+        axo.axhline(0, color=GRID, linewidth=1.0, zorder=1)
+        axo.plot(x[o_start:], o_ser.to_numpy(float), color=INK2,
+                 linewidth=1.3, zorder=3)
+        sig = res.obv
+        w = int(cfg.obv.window)
+        notes = []
+        if sig is not None and sig.slope is not None and len(o_ser) >= w + 1:
+            k_, b_ = obv_fit(o_ser.iloc[-(w + 1):])
+            axo.plot(x[-(w + 1):], b_ + k_ * np.arange(w + 1), color=INK,
+                     linewidth=2.0, linestyle="--", zorder=4)
+        notes += obv_line(sig).split(" / ")
+        if o_since is not None and sig is not None and sig.slope is not None:
+            notes.append(f"{o_since:%m/%d} 분할 흔적 이후")
+        # 선과 겹치지 않게 우측 여백(빈 봉 자리)에 쓴다. 가격 라벨과 같은 열.
+        axo.text(right, 0.5, "\n".join(notes),
+                 transform=axo.get_xaxis_transform(), va="center", ha="left",
+                 fontsize=8, color=INK2, zorder=6)
+        axo.set_ylabel("OBV")
+        axo.yaxis.set_major_formatter(
+            FuncFormatter(lambda v, _p: f"{v / 1e4:,.0f}만" if v else "0"))
+        axo.locator_params(axis="y", nbins=3)
+        if len(o_ser) < 2:            # 흔적이 마지막 봉이면 선이 점 하나다
+            axo.set_yticks([])
         ticks = sorted(set(np.linspace(0, n - 1, 7).astype(int).tolist()))
-        axv.set_xticks(ticks)
-        axv.set_xticklabels([df.index[i].strftime("%y/%m/%d" if k == 0 else "%m/%d")
+        axo.set_xticks(ticks)
+        axo.set_xticklabels([df.index[i].strftime("%y/%m/%d" if k == 0 else "%m/%d")
                              for k, i in enumerate(ticks)])
 
         # ── 매물대 (상위 구간만) ──
@@ -374,7 +429,7 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
                      ha="center", fontsize=8, color=INK2)
 
         # ── 제목 · 범례 ──
-        fig.text(0.075, 0.955,
+        fig.text(0.075, 0.962,
                  f"{res.name} ({res.ticker})   {res.grade} 등급   "
                  f"매집 {res.value_score:.2f} · 추세 {res.trend_score:.2f}",
                  fontsize=14, fontweight="bold", color=INK, ha="left")
@@ -385,7 +440,7 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
             sub.append(f"피보 진행률 {res.fib.ratio:.3f}")
         if res.liq is not None and np.isfinite(res.liq.band_pos):
             sub.append(f"밴드 위치 {res.liq.band_pos * 100:.0f}%")
-        fig.text(0.075, 0.918, " · ".join(sub), fontsize=9.5, color=INK2, ha="left")
+        fig.text(0.075, 0.929, " · ".join(sub), fontsize=9.5, color=INK2, ha="left")
 
         from matplotlib.lines import Line2D
         handles = [Line2D([], [], color=cc, lw=1.4, label=f"MA{m}")
@@ -393,7 +448,7 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
         handles += [Line2D([], [], color=BAND, lw=1.4, ls="--", label="청산밴드 -16/-30/-44%"),
                     Line2D([], [], color=FIB, lw=1.3, ls="dotted", label="피보 되돌림"),
                     Line2D([], [], color=INK, lw=1.4, ls="-.", label="P0 신용 평균단가(추정)")]
-        fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.07, 0.905),
+        fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.07, 0.917),
                    ncol=6, frameon=False, fontsize=8.5, handlelength=2.2,
                    columnspacing=1.4, labelcolor=INK2)
 
@@ -412,14 +467,27 @@ def active_flags(flags: dict | None) -> list[str]:
     return [key for key, _label in HARD_EXCLUSION_FLAGS if flags.get(key)]
 
 
+def obv_line(sig: ObvSignal | None) -> str:
+    """OBV 한 줄. 기록 전용 지표라 판정 문구 없이 방향·값·다이버전스만."""
+    if sig is None:
+        return "OBV - (미계산)"
+    if sig.slope is None:
+        return f"OBV - ({OBV_NULL_KR.get(sig.null_reason, sig.null_reason)})"
+    arrow = "▲" if sig.slope > 0 else ("▼" if sig.slope < 0 else "―")
+    return (f"OBV 20일 {arrow} {sig.slope:+.2f} / "
+            f"다이버전스: {DIV_KR.get(sig.divergence, '-')}")
+
+
 def chart_caption(res: ScreenResult, rank: int | None = None,
                   flags: dict | None = None, exclusion: str | None = None,
                   recorded: tuple[float, float] | None = None,
                   trade_date: str | None = None, cfg: Config = DEFAULT,
                   limit: int = TELEGRAM_CAPTION_MAX) -> str:
-    """사진 1장의 캡션: 등급 · 점수 · 밴드 위치 · 피보 위치.
+    """사진 1장의 캡션: 등급 · 점수 · 밴드 위치 · 피보 위치 · OBV.
 
-    앨범에서 사진을 넘길 때마다 보이는 글이라 4줄로 줄였다. 세부 구성요소
+    앨범에서 사진을 넘길 때마다 보이는 글이라 5줄로 줄였다. OBV 는 기록
+    전용이라 맨 끝에 둔다 — 캡션이 상한을 넘으면 뒷줄부터 버려지므로
+    가장 먼저 빠진다. 세부 구성요소
     (LPS 항목별 점수·P0·추세)는 차트 제목과 선이 대신한다. 배제 플래그와
     '기록과 다른 재계산'은 있을 때만 경고로 붙인다 — 없을 때 '없음'을 매
     장마다 쓰면 10장이 같은 줄로 채워진다.
@@ -460,6 +528,8 @@ def chart_caption(res: ScreenResult, rank: int | None = None,
             + (" · ⚠️ 파동 붕괴" if f.wave_broken else ""))
     else:
         lines.append("피보 - (데이터 부족)")
+
+    lines.append(obv_line(res.obv))
 
     text, _mode = fit_caption("\n".join(lines), limit)
     return text

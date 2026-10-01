@@ -8974,12 +8974,13 @@ def test_chart(tmp: Path):
             ch._FONT.update(saved)
 
     def t_caption_content():
-        """사진 캡션 = 등급 · 점수 · 밴드 위치 · 피보 위치 (앨범용 4줄)."""
+        """사진 캡션 = 등급 · 점수 · 밴드 위치 · 피보 위치 · OBV (앨범용 5줄)."""
         cap = ch.chart_caption(r_crash, rank=3, flags={}, trade_date="2026-08-24")
         for kw in (f"[{r_crash.grade}]", "매집", "추세", "밴드 위치",
                    "청산중심", "피보 진행률", "0.618", "2026-08-24", "3. "):
             assert kw in cap, f"캡션에 '{kw}' 없음:\n{cap}"
-        assert cap.count("\n") == 3, f"4줄이 아님:\n{cap}"
+        assert cap.count("\n") == 4, f"5줄이 아님:\n{cap}"
+        assert cap.rsplit("\n", 1)[1].startswith("OBV"), "OBV 가 마지막 줄이 아님"
         assert "배제 플래그" not in cap, "플래그가 없는데 줄을 썼다"
         assert "&amp;" in cap and "&lt;우선&gt;" in cap, "종목명 이스케이프 누락"
         warn = ch.chart_caption(r_crash, flags={"관리종목": True},
@@ -9416,6 +9417,294 @@ def test_chart(tmp: Path):
     check("chart", "daily: 차트 단계 전체 실패 격리", t_daily_chart_module_down)
 
 
+# ══════════════════════════ OBV (기록·표시 전용) ══════════════════════════
+def _obv_frame(close, volume) -> pd.DataFrame:
+    close = np.asarray(close, dtype=float)
+    return _frame(close, spread=0.0, volume=np.asarray(volume, dtype=float))
+
+
+def test_obv(tmp: Path):
+    """OBV 20일 기울기 · 다이버전스 · 분할 흔적 NULL · 기록 전용 증명.
+
+    앵커: 매일 상승 + 거래량 일정 -> 정규화 기울기 정확히 +1.0 (하락 -1.0).
+    """
+    import dataclasses
+    import inspect
+    import sqlite3
+
+    from stocknews import chart as ch
+    from stocknews.config import DEFAULT, ObvConfig
+    from stocknews.contracts import ObvSignal
+    from stocknews.indicators import (evaluate_obv, obv_fit, obv_series,
+                                      split_traces)
+    from stocknews.screener import screen_one
+    from stocknews.store import Store
+
+    oc = DEFAULT.obv
+
+    def t_config():
+        assert isinstance(oc, ObvConfig) and oc.window == 20
+        assert 1.30 < oc.split_price_jump and 1 / oc.split_price_jump < 0.70, \
+            "분할 판정이 가격제한폭(±30%) 안의 정상 거래일에 닿는다"
+
+    def t_series_anchor():
+        c = pd.Series([100.0, 101, 101, 99, 102])
+        v = pd.Series([10.0, 20, 30, 40, 50])
+        assert obv_series(c, v).tolist() == [0.0, 20.0, 20.0, -20.0, 30.0]
+
+    def t_slope_unit():
+        up = evaluate_obv(_obv_frame(np.arange(100, 130), np.full(30, 5e5)), oc)
+        near(up.slope, 1.0, tol=1e-9, label="매일 상승")
+        dn = evaluate_obv(_obv_frame(np.arange(130, 100, -1), np.full(30, 5e5)), oc)
+        near(dn.slope, -1.0, tol=1e-9, label="매일 하락")
+        flat = evaluate_obv(_obv_frame(np.full(30, 100.0), np.full(30, 5e5)), oc)
+        assert flat.slope == 0.0 and flat.divergence == 0, flat
+        # 창 밖(21봉 이전)의 거래량은 기울기에 영향이 없다
+        v = np.full(30, 5e5)
+        v[:9] = 9e9
+        near(evaluate_obv(_obv_frame(np.arange(100, 130), v), oc).slope, 1.0,
+             tol=1e-9, label="창 밖 거래량")
+
+    def t_slope_manual():
+        """독립 산식(순수 파이썬 OLS)과 대조."""
+        rng = np.random.default_rng(7)
+        c = 10_000 * np.cumprod(1 + rng.normal(0, 0.02, 60))
+        v = rng.integers(1e5, 9e5, 60).astype(float)
+        sig = evaluate_obv(_obv_frame(np.round(c), v), oc)
+        cc, vv = list(np.round(c)[-21:]), list(v[-21:])
+        o = [0.0]
+        for i in range(1, 21):
+            d = cc[i] - cc[i - 1]
+            o.append(o[-1] + (vv[i] if d > 0 else -vv[i] if d < 0 else 0.0))
+        xm, ym = 10.0, sum(o) / 21
+        k = (sum((i - xm) * (o[i] - ym) for i in range(21))
+             / sum((i - xm) ** 2 for i in range(21)))
+        near(sig.slope, k / (sum(vv[1:]) / 20), tol=1e-9, label="OLS/평균거래량")
+        near(sig.price_ret_pct, (cc[-1] / cc[0] - 1) * 100, tol=1e-9, label="20일 수익률")
+
+    def _zigzag(up_pct, dn_pct, up_vol, dn_vol, n=40):
+        c, v = [10_000.0], [1e6]
+        for i in range(1, n):
+            up = i % 2 == 1
+            c.append(c[-1] * (1 + (up_pct if up else -dn_pct) / 100))
+            v.append(up_vol if up else dn_vol)
+        return _obv_frame(np.round(c), v)
+
+    def t_divergence():
+        bull = evaluate_obv(_zigzag(1.0, 2.0, 3e6, 1e6), oc)
+        assert bull.price_ret_pct <= -oc.div_price_pct, bull
+        assert bull.slope >= oc.div_slope and bull.divergence == 1, bull
+        bear = evaluate_obv(_zigzag(2.0, 1.0, 1e6, 3e6), oc)
+        assert bear.price_ret_pct >= oc.div_price_pct, bear
+        assert bear.slope <= -oc.div_slope and bear.divergence == -1, bear
+        # 같은 방향(하락 + OBV 하락)은 다이버전스가 아니다
+        same = evaluate_obv(_zigzag(1.0, 2.0, 1e6, 3e6), oc)
+        assert same.divergence == 0, same
+        # 임계값은 config 가 정한다
+        hi = dataclasses.replace(oc, div_slope=99.0)
+        assert evaluate_obv(_zigzag(1.0, 2.0, 3e6, 1e6), hi).divergence == 0
+
+    def t_split_null():
+        base_c = np.linspace(10_000, 11_000, 40)
+        base_v = np.full(40, 1e6)
+        # 병합 5:1 — 가격 x5 · 거래량 x0.2 (역수)
+        c, v = base_c.copy(), base_v.copy()
+        c[-8:] *= 5
+        v[-8:] *= 0.2
+        df = _obv_frame(c, v)
+        sig = evaluate_obv(df, oc)
+        assert sig.slope is None and sig.divergence is None, sig
+        assert sig.null_reason == "split", sig
+        assert sig.split_dates == (df.index[-8].strftime("%Y-%m-%d"),), sig
+        # 분할 1:2 — 가격 x0.5 · 거래량 x2.6 (자연 변동 포함)
+        c, v = base_c.copy(), base_v.copy()
+        c[-3:] *= 0.5
+        v[-3:] *= 2.6
+        assert evaluate_obv(_obv_frame(c, v), oc).null_reason == "split"
+        # 가격만 점프(거래량 그대로) -> price_gap 도 NULL
+        c = base_c.copy()
+        c[-5:] *= 5
+        g = evaluate_obv(_obv_frame(c, base_v), oc)
+        assert g.slope is None and g.null_reason == "price_gap", g
+        # 창 밖(21봉 이전) 흔적은 무관
+        c, v = base_c.copy(), base_v.copy()
+        c[-25:] *= 5
+        v[-25:] *= 0.2
+        assert evaluate_obv(_obv_frame(c, v), oc).slope is not None
+        # 하한가(-30%) + 거래량 급증은 정상 거래일이다
+        c, v = base_c.copy(), base_v.copy()
+        c[-4:] *= 0.70
+        v[-4] *= 3.0
+        ok = evaluate_obv(_obv_frame(c, v), oc)
+        assert ok.slope is not None, f"하한가를 분할로 봤다 {ok}"
+        assert split_traces(pd.Series(c), pd.Series(v), oc) == []
+
+    def t_short():
+        assert evaluate_obv(None, oc).null_reason == "short"
+        s = evaluate_obv(_obv_frame(np.arange(100, 120), np.full(20, 1e5)), oc)
+        assert s.slope is None and s.null_reason == "short", s
+        z = evaluate_obv(_obv_frame(np.arange(100, 130), np.zeros(30)), oc)
+        assert z.slope is None and z.null_reason in ("no_volume", "price_gap"), z
+
+    def _fake_store(df):
+        class _S:
+            def load_ohlcv(self, code, days=400):
+                return df
+        return _S()
+
+    def t_attached_after_scoring():
+        """screen_one 은 OBV 를 모른다. screen_ticker 가 채점 뒤에 붙인다."""
+        from stocknews.daily import screen_ticker
+        df = fixture_golden_cross()
+        bare = screen_one("000002", "추세", df)
+        assert bare.obv is None, "screen_one 이 OBV 를 채웠다 (점수 경로 노출)"
+        ctx = {"meta": pd.DataFrame(columns=["market_cap"]), "flags": {},
+               "credit": {}, "check_listing": False}
+        res, _ = screen_ticker(_fake_store(df), "000002", "추세", ctx)
+        assert isinstance(res.obv, ObvSignal) and res.obv.slope is not None
+        for f in ("value_score", "trend_score", "grade", "track", "mark",
+                  "confluence", "sequence_confirm", "reasons", "excluded"):
+            assert getattr(res, f) == getattr(bare, f), f"{f} 가 달라졌다"
+
+    def t_store_roundtrip():
+        st = Store(tmp / "obv.db")
+        r = screen_one("000002", "추세", fixture_golden_cross())
+        sig = ObvSignal(0.4321, 1, -7.5)
+        rows = [dataclasses.replace(r, obv=sig),
+                dataclasses.replace(r, ticker="000003",
+                                    obv=ObvSignal(None, None, None, "split")),
+                dataclasses.replace(r, ticker="000004")]
+        assert st.save_scan("2026-08-24", rows) == 3
+        con = sqlite3.connect(st.path)
+        try:
+            got = dict((t, (a, b)) for t, a, b in con.execute(
+                "SELECT ticker,obv_slope20,obv_divergence FROM scans"))
+        finally:
+            con.close()
+        assert got["000002"] == (0.4321, 1), got
+        assert got["000003"] == (None, None), "NULL 이어야 한다"
+        assert got["000004"] == (None, None), got
+
+    def t_migration():
+        """컬럼이 없던 기존 DB 에 ALTER 로 붙는다. 과거 행은 NULL."""
+        p = tmp / "obv_old.db"
+        con = sqlite3.connect(p)
+        con.execute("CREATE TABLE scans (d TEXT NOT NULL, ticker TEXT NOT NULL,"
+                    " name TEXT, price REAL, PRIMARY KEY (d, ticker))")
+        con.execute("INSERT INTO scans VALUES('2026-08-01','000001','x',1.0)")
+        con.commit()
+        con.close()
+        st = Store(p)
+        con = sqlite3.connect(st.path)
+        try:
+            cols = [r[1] for r in con.execute("PRAGMA table_info(scans)")]
+            old = con.execute("SELECT obv_slope20, obv_divergence FROM scans"
+                              ).fetchone()
+        finally:
+            con.close()
+        assert "obv_slope20" in cols and "obv_divergence" in cols, cols
+        assert old == (None, None), old
+
+    def t_record_only():
+        """기록 전용 증명. 점수·등급·슬롯·게이트·exits 에 OBV 참조가 없다."""
+        from stocknews import (cost_basis, daily, exits, fibonacci, indicators,
+                               liquidation, notify, screener, store)
+        for mod in (screener, liquidation, fibonacci, cost_basis, exits, notify):
+            assert "obv" not in inspect.getsource(mod).lower(), \
+                f"{mod.__name__} 가 OBV 를 참조한다 (기록 전용 위반)"
+        for fn in (indicators.evaluate_trend, screener.screen_one,
+                   screener._grade_and_mark, screener.rank_results,
+                   screener.check_exclusion, daily.select_recommendations,
+                   daily.scan_all, daily.run_daily, store.Store.save_recos):
+            assert "obv" not in inspect.getsource(fn).lower(), \
+                f"{fn.__qualname__} 가 OBV 를 참조한다 (기록 전용 위반)"
+        # screen_ticker 는 screen_one 이 끝난 뒤에만 OBV 를 붙인다
+        src = inspect.getsource(daily.screen_ticker)
+        assert src.index("screen_one(") < src.index("evaluate_obv("), \
+            "OBV 계산이 채점보다 앞에 있다"
+        # OBV 블록은 점수·선정 모듈을 import 하지 않는다
+        isrc = inspect.getsource(indicators)
+        for bad in ("from .screener", "from .daily", "from .exits",
+                    "from .notify", "from .liquidation"):
+            assert bad not in isrc, f"indicators 가 {bad} 를 한다"
+
+    def t_recos_unchanged_with_obv():
+        """OBV 를 붙여도 10선 선정·등급이 같다 (값을 극단으로 흔들어도)."""
+        from stocknews.daily import select_recommendations
+        base = [screen_one(f"{i:06d}", f"n{i}", df) for i, df in enumerate(
+            (fixture_crash(), fixture_golden_cross(), fixture_flat()))]
+        meta = pd.DataFrame({"sector": ["a", "b", "c"]},
+                            index=[r.ticker for r in base])
+        want = [(s, r.ticker, r.grade) for s, r in
+                select_recommendations(base, meta)]
+        for sig in (ObvSignal(9.9, 1, -50.0), ObvSignal(-9.9, -1, 50.0),
+                    ObvSignal(None, None, None, "split")):
+            got = [(s, r.ticker, r.grade) for s, r in select_recommendations(
+                [dataclasses.replace(r, obv=sig) for r in base], meta)]
+            assert got == want, f"OBV {sig} 가 선정을 바꿨다"
+
+    def t_caption_line():
+        r = screen_one("000001", "급락", fixture_crash())
+        bull = ch.chart_caption(dataclasses.replace(
+            r, obv=ObvSignal(0.4321, 1, -7.5)))
+        assert bull.endswith("OBV 20일 ▲ +0.43 / 다이버전스: 강세"), bull
+        bear = ch.obv_line(ObvSignal(-0.3, -1, 8.0))
+        assert bear == "OBV 20일 ▼ -0.30 / 다이버전스: 약세", bear
+        assert ch.obv_line(ObvSignal(0.1, 0, 1.0)).endswith("다이버전스: 없음")
+        assert ch.obv_line(ObvSignal(None, None, None, "split")) == "OBV - (분할 흔적)"
+        assert ch.obv_line(None) == "OBV - (미계산)"
+        for word in ("매수", "매도", "추천", "신호"):
+            assert word not in bull + bear, f"OBV 줄에 판정 문구 '{word}'"
+
+    def t_chart_fit_is_recorded_slope():
+        """차트의 점선 = scans 에 기록되는 바로 그 기울기."""
+        df = fixture_golden_cross()
+        sig = evaluate_obv(df, oc)
+        disp = df.tail(DEFAULT.chart.bars)
+        start, ser, since = ch.obv_display(disp)
+        assert start == 0 and since is None
+        k, _b = obv_fit(ser.iloc[-(oc.window + 1):])
+        near(k / disp["거래량"].iloc[-oc.window:].mean(), sig.slope, tol=1e-9,
+             label="차트 회귀선")
+
+    def t_chart_split_in_display():
+        """표시 구간에 흔적이 있으면 그 날부터 다시 센다. PNG 는 생긴다."""
+        df = fixture_golden_cross().copy()
+        df.iloc[-40:, :4] *= 5
+        df.iloc[-40:, df.columns.get_loc("거래량")] *= 0.2
+        start, ser, since = ch.obv_display(df.tail(120))
+        assert since == df.index[-40] and start == 80 and len(ser) == 40
+        r = screen_one("000002", "추세", df)
+        r = dataclasses.replace(r, obv=evaluate_obv(df, oc))
+        assert r.obv.slope is not None, "흔적이 창 밖인데 NULL"
+        p = ch.render_chart(r, df, tmp / "obv" / "split.png")
+        assert p.read_bytes()[:4] == b"\x89PNG"
+        # 흔적이 마지막 봉 -> NULL + 점 하나짜리 선도 죽지 않는다
+        df2 = fixture_golden_cross().copy()
+        df2.iloc[-1:, :4] *= 0.2
+        df2.iloc[-1:, df2.columns.get_loc("거래량")] *= 5
+        r2 = dataclasses.replace(screen_one("000002", "추세", df2),
+                                 obv=evaluate_obv(df2, oc))
+        assert r2.obv.null_reason == "split"
+        assert ch.render_chart(r2, df2, tmp / "obv" / "last.png").is_file()
+
+    check("obv", "config 배선 · 가격제한폭 밖", t_config)
+    check("obv", "OBV 누적 앵커", t_series_anchor)
+    check("obv", "정규화 기울기 ±1.0 앵커", t_slope_unit)
+    check("obv", "독립 산식 검산 (OLS)", t_slope_manual)
+    check("obv", "다이버전스 강세/약세/없음", t_divergence)
+    check("obv", "분할 흔적 -> NULL (역수 · 가격단절 · 하한가 제외)", t_split_null)
+    check("obv", "봉 부족 · 거래량 0 -> NULL", t_short)
+    check("obv", "채점 뒤 부착 · 점수 불변", t_attached_after_scoring)
+    check("obv", "scans 저장 (NULL 포함)", t_store_roundtrip)
+    check("obv", "기존 DB 마이그레이션", t_migration)
+    check("obv", "기록 전용 증명 (참조 부재)", t_record_only)
+    check("obv", "OBV 값과 무관하게 10선·등급 동일", t_recos_unchanged_with_obv)
+    check("obv", "앨범 캡션 한 줄", t_caption_line)
+    check("obv", "차트 회귀선 = 기록 기울기", t_chart_fit_is_recorded_slope)
+    check("obv", "차트: 표시 구간 분할 흔적", t_chart_split_in_display)
+
+
 # ═══════════════════ 발송 요일(일요일) 예외 — nightly · daily --send-only ═══════════════════
 def test_send_day(tmp: Path):
     """일요일은 휴장이어도 daily --send-only 한 단계만 돈다. 토요일은 전체 스킵.
@@ -9738,6 +10027,7 @@ def main() -> int:
         test_notify(tmp)
         test_reco_dow()
         test_chart(tmp)
+        test_obv(tmp)
         test_send_day(tmp)
         test_trading_day(tmp)
         test_backtest(tmp)

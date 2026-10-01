@@ -706,6 +706,40 @@ class NewsDedupConfig:
 
 
 @dataclass(frozen=True)
+class ObvConfig:
+    """OBV 파라미터. **기록·표시 전용이다.**
+
+    여기서 나온 값은 `scans.obv_slope20` / `scans.obv_divergence` 와 차트·
+    앨범 캡션에만 쓴다. LPS·피보·추세 점수, 등급, 슬롯, 게이트, exits 어디에도
+    쓰지 않는다(스모크가 강제). 표본이 쌓인 뒤 '거래량 흐름이 추천 성적과
+    관계가 있었나'를 되짚기 위한 것이고, 지금 판단에 넣으면 검증되지 않은
+    축을 하나 더 얹는 셈이 된다. 아래 임계값도 그래서 튜닝 전 초기값이다.
+
+    window          기울기·가격 변화율 구간(거래일). 봉 window+1 개를 본다.
+    split_price_jump  전일 대비 종가 비율이 이 값 이상 / 1/이 값 이하면 분할
+                    흔적 후보. 가격제한폭(±30%)으로는 0.70~1.30 이 한계라
+                    1.45 는 정상 거래일이 닿지 않는다. 2026-10-01 운영 DB 실측
+                    으로 이 밖의 날 75건은 전부 액면병합·분할·정리매매였다.
+    split_recip_tol 후보일의 (가격 비율 x 거래량 비율)이 [1/tol, tol] 안이고
+                    거래량이 반대 방향으로 움직였으면 '역수' 로 본다. 같은 날
+                    자연 변동이 섞이므로 reconcile 의 0.5% 처럼 좁힐 수 없다.
+    div_price_pct   다이버전스의 가격 조건. 20일 변화율 절대값이 이 이상.
+    div_slope       다이버전스의 OBV 조건. 정규화 기울기 절대값이 이 이상.
+                    둘 다 2026-09-30 운영 DB 2,459종목 분포의 대략 1·3사분위
+                    (가격 -7.3% / +5.3%, 기울기 -0.21 / +0.31)에서 잡았다.
+                    그때 강세 56 · 약세 15 = 2.9%. 0.10 이면 7.6% 가 걸려
+                    '여부'가 아니라 소음이 된다. 기울기 원값은 그대로 기록되므로
+                    임계값은 나중에 바꿔도 과거 스냅샷에서 다시 셀 수 있다.
+    """
+
+    window: int = 20
+    split_price_jump: float = 1.45
+    split_recip_tol: float = 3.0
+    div_price_pct: float = 5.0
+    div_slope: float = 0.25
+
+
+@dataclass(frozen=True)
 class Config:
     ma: MAConfig = MAConfig()
     fib: FibConfig = FibConfig()
@@ -718,6 +752,7 @@ class Config:
     news_dedup: NewsDedupConfig = NewsDedupConfig()
     dividend: DividendConfig = DividendConfig()
     chart: ChartConfig = ChartConfig()
+    obv: ObvConfig = ObvConfig()
 
 
 DEFAULT = Config()

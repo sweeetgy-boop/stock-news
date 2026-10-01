@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 from datetime import datetime
 
@@ -29,6 +30,7 @@ import pandas as pd
 from .config import Config, DEFAULT
 from .contracts import ScreenResult
 from .data import load_index
+from .indicators import evaluate_obv
 from .screener import check_exclusion, rank_results, screen_one
 from .sector_metrics import collect_sector_metrics
 
@@ -116,6 +118,11 @@ def screen_ticker(store, code: str, name: str, ctx: dict,
         market_cap=mc if apply_exclusion else None,
         listed_days=listed if apply_exclusion else None, cfg=cfg,
     )
+    # OBV 는 채점이 **끝난 뒤** 덧붙인다(기록·표시 전용). screen_one 안에서
+    # 계산하면 점수 경로가 그 값을 볼 수 있게 된다. 배제 종목은 scans 에
+    # 기록되지 않으므로 계산하지 않는다.
+    if not res.excluded:
+        res = dataclasses.replace(res, obv=evaluate_obv(ohlcv, cfg.obv))
     return res, ohlcv
 
 
