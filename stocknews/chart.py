@@ -230,8 +230,6 @@ def obv_panel_note(sig: ObvSignal | None) -> str | None:
     """OBV 패널에 선 대신 문구만 쓸 경우 그 문구. 선을 그리면 None."""
     if sig is None or sig.slope is not None:
         return None
-    if sig.null_reason in ("split", "price_gap"):
-        return OBV_EXCLUDED_NOTE
     return obv_line(sig)
 
 
@@ -261,7 +259,12 @@ def draw_obv_panel(axo, res: ScreenResult, df: pd.DataFrame,
         k_, b_ = obv_fit(ser.iloc[-(w + 1):])
         axo.plot(x[-(w + 1):], b_ + k_ * np.arange(w + 1), color=INK,
                  linewidth=2.0, linestyle="--", zorder=4)
-    notes = obv_line(sig).split(" / ")
+    # 차트 라벨은 캡션보다 한 단계 자세하다 — 기록된 기울기 값까지 쓴다.
+    if sig is not None and sig.slope is not None:
+        notes = [f"OBV 20일 {_obv_arrow(sig.slope)} {sig.slope:+.2f}",
+                 f"다이버전스 {DIV_KR.get(sig.divergence, '-')}"]
+    else:
+        notes = [obv_line(sig)]
     for d, _k in traces:
         axo.axvline(int(df.index.get_loc(d)), color=INK2, linewidth=0.9,
                     linestyle=":", zorder=2)
@@ -498,15 +501,24 @@ def active_flags(flags: dict | None) -> list[str]:
     return [key for key, _label in HARD_EXCLUSION_FLAGS if flags.get(key)]
 
 
+def _obv_arrow(slope: float) -> str:
+    return "▲" if slope > 0 else ("▼" if slope < 0 else "―")
+
+
 def obv_line(sig: ObvSignal | None) -> str:
-    """OBV 한 줄. 기록 전용 지표라 판정 문구 없이 방향·값·다이버전스만."""
+    """앨범 캡션의 OBV 한 줄. 기록 전용이라 판정 문구 없이 방향·다이버전스만.
+
+      OBV 20일 ▲ · 다이버전스 강세
+      OBV 계산 제외(수정주가 구간)        분할 흔적(split · price_gap) NULL
+    """
     if sig is None:
         return "OBV - (미계산)"
     if sig.slope is None:
+        if sig.null_reason in ("split", "price_gap"):
+            return OBV_EXCLUDED_NOTE
         return f"OBV - ({OBV_NULL_KR.get(sig.null_reason, sig.null_reason)})"
-    arrow = "▲" if sig.slope > 0 else ("▼" if sig.slope < 0 else "―")
-    return (f"OBV 20일 {arrow} {sig.slope:+.2f} / "
-            f"다이버전스: {DIV_KR.get(sig.divergence, '-')}")
+    return (f"OBV 20일 {_obv_arrow(sig.slope)} · "
+            f"다이버전스 {DIV_KR.get(sig.divergence, '-')}")
 
 
 def chart_caption(res: ScreenResult, rank: int | None = None,

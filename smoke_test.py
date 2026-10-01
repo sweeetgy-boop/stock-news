@@ -9647,14 +9647,33 @@ def test_obv(tmp: Path):
         r = screen_one("000001", "급락", fixture_crash())
         bull = ch.chart_caption(dataclasses.replace(
             r, obv=ObvSignal(0.4321, 1, -7.5)))
-        assert bull.endswith("OBV 20일 ▲ +0.43 / 다이버전스: 강세"), bull
+        assert bull.endswith("\nOBV 20일 ▲ · 다이버전스 강세"), bull
+        assert bull.count("\n") == 4, "기존 4줄 아래 한 줄이 아니다"
         bear = ch.obv_line(ObvSignal(-0.3, -1, 8.0))
-        assert bear == "OBV 20일 ▼ -0.30 / 다이버전스: 약세", bear
-        assert ch.obv_line(ObvSignal(0.1, 0, 1.0)).endswith("다이버전스: 없음")
-        assert ch.obv_line(ObvSignal(None, None, None, "split")) == "OBV - (분할 흔적)"
+        assert bear == "OBV 20일 ▼ · 다이버전스 약세", bear
+        assert ch.obv_line(ObvSignal(0.1, 0, 1.0)) == "OBV 20일 ▲ · 다이버전스 없음"
+        for why in ("split", "price_gap"):
+            assert ch.obv_line(ObvSignal(None, None, None, why)) == \
+                "OBV 계산 제외(수정주가 구간)", why
+        assert ch.obv_line(ObvSignal(None, None, None, "short")) == "OBV - (봉 부족)"
         assert ch.obv_line(None) == "OBV - (미계산)"
         for word in ("매수", "매도", "추천", "신호"):
             assert word not in bull + bear, f"OBV 줄에 판정 문구 '{word}'"
+
+    def t_caption_limit_with_obv():
+        """OBV 줄이 붙어도 1,024자 상한. 넘치면 마지막 줄(OBV)부터 빠진다."""
+        from stocknews.notify import TELEGRAM_CAPTION_MAX, caption_units
+        r = dataclasses.replace(screen_one("000001", "급락", fixture_crash()),
+                                obv=ObvSignal(0.4, 1, -7.5))
+        cap = ch.chart_caption(r, rank=10, trade_date="2026-09-30")
+        assert caption_units(cap) <= TELEGRAM_CAPTION_MAX
+        long = ch.chart_caption(r, exclusion="가" * 980)
+        assert caption_units(long) <= TELEGRAM_CAPTION_MAX, caption_units(long)
+        assert "다이버전스" not in long, "넘쳤는데 OBV 줄이 남았다"
+        outs = [ch.ChartOut(i, f"{i:06d}", f"n{i}", tmp / "x.png", cap)
+                for i in range(1, 11)]
+        for _p, c in ch.album_items(outs):
+            assert caption_units(c) <= TELEGRAM_CAPTION_MAX
 
     def t_chart_fit_is_recorded_slope():
         """차트의 점선 = scans 에 기록되는 바로 그 기울기. 첫 봉 = 0 리베이스."""
@@ -9745,6 +9764,7 @@ def test_obv(tmp: Path):
     check("obv", "기록 전용 증명 (참조 부재)", t_record_only)
     check("obv", "OBV 값과 무관하게 10선·등급 동일", t_recos_unchanged_with_obv)
     check("obv", "앨범 캡션 한 줄", t_caption_line)
+    check("obv", "앨범 캡션 1,024자 상한 (OBV 포함)", t_caption_limit_with_obv)
     check("obv", "차트 회귀선 = 기록 기울기", t_chart_fit_is_recorded_slope)
     check("obv", "차트: 높이 비율 6:2:2", t_panel_ratios)
     check("obv", "차트: OBV 첫 봉 0 리베이스 + 회귀선", t_panel_line_rebased)
