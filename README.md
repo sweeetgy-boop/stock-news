@@ -240,7 +240,7 @@ Windows 작업 스케줄러를 쓴다면 같은 시각에 동일 명령을 등�
 [하루 2~3회] news → 수집 → 정규화 → 사건 클러스터 → 종목태깅 → 중요도
                   └─ news / news_tickers 테이블
 [06:20] brief-morning  밤사이 해외 + 매크로 + 내 종목 + 주요 공시
-[18:20] brief-evening  국내 공시·수급·테마·시황 + 추천 10선 교차
+[18:20] brief-evening  국내 공시·수급·테마·시황 + 추천 10선 교차 + 관심종목 차트 앨범
                        + 📌 관심종목 현황 (config.WATCHLIST · 표시·뉴스태깅 전용,
                          점수·추천·청산 어디에도 안 쓰임. 보유 아님)
 [금 18:40] brief-weekly 이번 주 vs 지난 주 테마 건수 변화
@@ -370,6 +370,24 @@ LLM 은 쓰지 않는다. 전부 규칙 기반이다.
   만들고 보내지 않는다.
 - 한글은 맑은 고딕(`ChartConfig.font`). 없으면 경고 한 줄 후 기본 폰트로
   그린다(한글이 □ 로 나온다).
+
+### 저녁 브리핑 관심종목 차트 앨범
+
+`brief-evening` 은 텍스트 브리핑을 보낸 **뒤에** 관심종목 차트 앨범 1개를 붙인다
+(`run_screen._send_watch_charts` → 추천 앨범과 같은 `_send_charts` · `chart.py`).
+
+```
+대상     config.WATCHLIST 중 당일 스캔 등급이 WATCHLIST_ALBUM_GRADES(S+/S/A/B)인 종목
+         NONE · 스캔 제외(스냅샷에 없음)는 뺀다. 0개면 앨범 없이 텍스트만
+'당일'   최신 스캔일 == 최신 거래일일 때만. daily 가 실패해 스냅샷이 지난 것이면
+         앨범 없음 (watch_charts.skipped = stale_scan)
+정렬     등급 높은 순 → max(매집, 추세) → min(매집, 추세) → 코드. WATCHLIST_ALBUM_MAX(10)장까지
+그림     추천 차트와 같다 (MA · 밴드 · 피보 · 매물대 · OBV 패널). 파일은 W01_티커.png
+캡션     추천 앨범과 같은 5줄. 첫 장 맨 위 "📌 관심종목 차트 N종목 (스캔 … · 추천 아님)",
+         첫 장 맨 끝 "검증 중 · 투자 판단 근거 아님"
+실패     텍스트는 이미 나갔다. 앨범 실패 수신자만 사진 개별 폴백(send_album), 그래도
+         못 받으면 send_failed. --json 의 watch_charts 에 대상·파일·캡션 최대 길이
+```
 
 ### OBV (기록·표시 전용)
 

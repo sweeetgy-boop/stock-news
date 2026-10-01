@@ -9772,6 +9772,219 @@ def test_obv(tmp: Path):
     check("obv", "차트: 표시 구간 분할 흔적", t_chart_split_in_display)
 
 
+# ══════════════════════════ 저녁 브리핑 관심종목 앨범 ══════════════════════════
+def test_watch_album(tmp: Path):
+    """brief-evening 텍스트 뒤 관심종목 차트 앨범 — 대상 · 정렬 · 격리."""
+    import argparse
+    import dataclasses
+    import contextlib
+    import importlib
+    import io
+    import os
+    import sqlite3
+
+    from stocknews import chart as ch
+    from stocknews import config as C
+    from stocknews import notify as nt
+    from stocknews.config import DEFAULT, watchlist_codes
+    from stocknews.screener import screen_one
+    from stocknews.store import Store
+
+    codes = list(watchlist_codes())
+
+    def t_config():
+        assert C.WATCHLIST_ALBUM_GRADES == ("S+", "S", "A", "B")
+        assert C.WATCHLIST_ALBUM_MAX == 10
+        assert DEFAULT.chart.watch_grades == C.WATCHLIST_ALBUM_GRADES, "미배선"
+        assert DEFAULT.chart.watch_max == C.WATCHLIST_ALBUM_MAX, "미배선"
+        assert set(DEFAULT.chart.watch_grades) <= set(ch.GRADE_RANK)
+        assert DEFAULT.chart.watch_max <= nt.MEDIA_GROUP_MAX, "앨범 한도 초과"
+
+    def _scans(rows):
+        return pd.DataFrame(rows, columns=["ticker", "name", "grade",
+                                           "value_score", "trend_score"])
+
+    def t_select_and_order():
+        rows = [(codes[0], "a", "B", 7.0, 1.0),
+                (codes[1], "b", "A", 3.0, 8.5),
+                (codes[2], "c", "S+", 9.0, 2.0),
+                (codes[3], "d", "A", 8.6, 1.0),      # A 중 max 8.6 > 8.5
+                (codes[4], "e", "NONE", 9.9, 9.9),    # NONE 제외
+                ("000001", "관심 아님", "S+", 9.9, 9.9),  # 관심종목 아님
+                (codes[5], "f", "A", 8.5, 2.0)]       # codes[1] 과 max 동률
+        jobs = ch.watchlist_jobs(_scans(rows))
+        got = [(j.ticker, j.grade) for j in jobs]
+        # A 셋: max 8.6 > (8.5, 8.5). 8.5 동률은 min 큰 쪽(3.0 > 2.0)이 먼저
+        want = [(codes[2], "S+"), (codes[3], "A"), (codes[1], "A"),
+                (codes[5], "A"), (codes[0], "B")]
+        assert got == want, got
+        assert [j.rank for j in jobs] == [1, 2, 3, 4, 5]
+        assert jobs[0].recorded == (9.0, 2.0), "기록 점수 미전달"
+        assert ch.watchlist_jobs(_scans([])) == []
+
+    def t_cap_ten():
+        rows = [(c, c, "B", 7.0 + i / 100, 0.0) for i, c in enumerate(codes[:13])]
+        jobs = ch.watchlist_jobs(_scans(rows))
+        assert len(jobs) == 10, len(jobs)
+        assert jobs[0].ticker == codes[12], "점수 높은 순이 아님"
+        cfg = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
+            DEFAULT.chart, watch_grades=("S+", "S")))
+        assert ch.watchlist_jobs(_scans(rows), cfg) == [], "등급 설정 미반영"
+        bad = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
+            DEFAULT.chart, watch_grades=("C",)))
+        try:
+            ch.watchlist_jobs(_scans(rows), bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("없는 등급을 받아들였다")
+
+    def t_path_prefix_and_header():
+        p = ch.chart_path("2026-09-30", 1, "403870", root=tmp, prefix="W")
+        assert p.name == "W01_403870.png" and p.parent.name == "20260930", p
+        outs = [ch.ChartOut(i, f"{i:06d}", f"n{i}", tmp / "x.png", f"캡션{i}\n둘째")
+                for i in (2, 1)]
+        head = ch.watchlist_header(2, "2026-09-30")
+        items = ch.album_items(outs, header=head)
+        assert items[0][1].startswith(head + "\n캡션1"), items[0][1]
+        assert items[0][1].endswith("<i>검증 중 · 투자 판단 근거 아님</i>")
+        assert items[1][1] == "캡션2\n둘째", "머리말이 첫 장 밖에 붙었다"
+        long = [ch.ChartOut(1, "1", "n", tmp / "x.png", "\n".join(["가" * 90] * 20))]
+        cap = ch.album_items(long, header=head)[0][1]
+        assert nt.caption_units(cap) <= nt.TELEGRAM_CAPTION_MAX
+        assert cap.startswith(head) and cap.endswith("근거 아님</i>")
+
+    # ── brief-evening 연동 ──
+    def _store(name, grades, scan_d=None):
+        st = Store(tmp / name)
+        st.upsert_prices(codes[0], fixture_crash(), allow_today=True)
+        st.upsert_prices(codes[1], fixture_golden_cross(), allow_today=True)
+        d = scan_d or fixture_crash().index[-1].strftime("%Y-%m-%d")
+        r0 = screen_one(codes[0], "w0", fixture_crash())
+        r1 = screen_one(codes[1], "w1", fixture_golden_cross())
+        with sqlite3.connect(st.path) as con:
+            for code, g, r in ((codes[0], grades[0], r0), (codes[1], grades[1], r1),
+                               ("000001", "S+", r0)):
+                con.execute("INSERT INTO scans(d,ticker,name,grade,value_score,"
+                            "trend_score) VALUES(?,?,?,?,?,?)",
+                            (d, code, code, g, r.value_score, r.trend_score))
+            con.commit()
+        return st
+
+    def _evening(st, dry, album=None):
+        mod = importlib.import_module("run_screen")
+        args = argparse.Namespace(dry_run=dry, no_collect=True, news_hours=16,
+                                  force=False)
+        saved = (dict(mod.SUMMARY), mod.send_telegram, mod.send_album, os.getcwd())
+        order: list = []
+
+        def fake_text(text, *a, **k):
+            order.append(("text", text))
+            return nt.SendReport(sent=2)
+
+        def fake_album(items, *a, **k):
+            order.append(("album", list(items)))
+            return nt.SendReport(sent=2) if album is None else album(items)
+
+        buf = io.StringIO()
+        try:
+            mod.SUMMARY.clear()
+            mod.send_telegram, mod.send_album = fake_text, fake_album
+            os.chdir(tmp)
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                rc = mod.mode_brief_evening(st, args)
+            sm = dict(mod.SUMMARY)
+        finally:
+            os.chdir(saved[3])
+            mod.SUMMARY.clear()
+            mod.SUMMARY.update(saved[0])
+            mod.send_telegram, mod.send_album = saved[1], saved[2]
+        return mod, rc, sm, order, buf.getvalue()
+
+    def t_evening_dry_run():
+        st = _store("wa_dry.db", ("A", "B"))
+        mod, rc, sm, order, out = _evening(st, dry=True)
+        assert rc == mod.EXIT_OK and order == [], "dry-run 인데 발송함"
+        w = sm["watch_charts"]
+        assert w["eligible"] == 2 and w["made"] == 2 and w["sent"] == 0, w
+        assert w["tickers"] == [codes[0], codes[1]], w["tickers"]
+        assert w["album"]["photos"] == 2 and 0 < w["album"]["caption_max"] <= 1024
+        names = [Path(f).name for f in w["files"]]
+        assert names == [f"W01_{codes[0]}.png", f"W02_{codes[1]}.png"], names
+        for f in w["files"]:
+            assert (tmp / f).is_file(), f
+        assert "[관심종목 차트 앨범 2장" in out and "관심종목 차트 2종목" in out
+        assert "검증 중 · 투자 판단 근거 아님" in out
+        assert "charts" not in sm, "추천 앨범 키를 건드렸다"
+
+    def t_evening_text_then_album():
+        st = _store("wa_live.db", ("B", "A"))
+        mod, rc, sm, order, _ = _evening(st, dry=False)
+        assert rc == mod.EXIT_OK
+        assert [k for k, _v in order] == ["text", "album"], [k for k, _v in order]
+        caps = [c for _p, c in order[1][1]]
+        assert f"({codes[1]})" in caps[0] and f"({codes[0]})" in caps[1], \
+            "등급 높은 순(A -> B)이 아니다"
+        assert caps[0].startswith("📌 <b>관심종목 차트 2종목</b>"), caps[0]
+        assert caps[0].endswith("<i>검증 중 · 투자 판단 근거 아님</i>")
+        assert sum("투자 판단" in c for c in caps) == 1
+        assert all("OBV" in c for c in caps), "OBV 줄 없음"
+
+    def t_evening_album_fail_text_ok():
+        st = _store("wa_fail.db", ("A", "B"))
+
+        def fail(_items):
+            return nt.SendReport(sent=1, failures=(
+                nt.SendFailure("****2222", 400, "bad"),))
+        mod, rc, sm, order, _ = _evening(st, dry=False, album=fail)
+        assert rc == mod.EXIT_OK and order[0][0] == "text"
+        assert sm["send_failed"] == 1
+        assert {f.get("kind") for f in sm["send_failures"]} == {"chart"}
+
+        def boom(_items):
+            raise RuntimeError("네트워크 밖 예외")
+        mod, rc, sm, order, _ = _evening(st, dry=False, album=boom)
+        assert rc == mod.EXIT_OK and order[0][0] == "text"
+        assert not sm.get("send_failed")
+        assert any(f["stage"] == "send" for f in sm["watch_charts"]["failed"])
+
+    def t_evening_zero_targets():
+        st = _store("wa_zero.db", ("NONE", "NONE"))
+        mod, rc, sm, order, _ = _evening(st, dry=False)
+        assert rc == mod.EXIT_OK
+        assert [k for k, _v in order] == ["text"], "대상 0인데 앨범을 보냈다"
+        assert sm["watch_charts"]["eligible"] == 0, sm["watch_charts"]
+
+    def t_evening_stale_scan():
+        st = _store("wa_stale.db", ("A", "A"), scan_d="2026-08-20")
+        mod, rc, sm, order, _ = _evening(st, dry=False)
+        assert [k for k, _v in order] == ["text"], "지난 스냅샷으로 앨범을 보냈다"
+        assert sm["watch_charts"]["skipped"].startswith("stale_scan"), sm
+
+    def t_evening_chart_module_down():
+        saved = ch.watchlist_jobs
+        ch.watchlist_jobs = lambda *a, **k: (_ for _ in ()).throw(
+            ImportError("matplotlib 없음"))
+        try:
+            st = _store("wa_down.db", ("A", "B"))
+            mod, rc, sm, order, _ = _evening(st, dry=False)
+        finally:
+            ch.watchlist_jobs = saved
+        assert rc == mod.EXIT_OK and [k for k, _v in order] == ["text"]
+        assert "ImportError" in sm["watch_charts"]["error"], sm["watch_charts"]
+
+    check("watch-album", "config 상수 배선 · 한도", t_config)
+    check("watch-album", "대상(관심·등급) + 정렬", t_select_and_order)
+    check("watch-album", "최대 10장 · 등급 설정 반영", t_cap_ten)
+    check("watch-album", "파일 접두사 W · 첫 장 머리말/면책", t_path_prefix_and_header)
+    check("watch-album", "brief-evening --dry-run: 파일만", t_evening_dry_run)
+    check("watch-album", "텍스트 -> 앨범 1회 순서", t_evening_text_then_album)
+    check("watch-album", "앨범 실패·예외에도 텍스트 정상", t_evening_album_fail_text_ok)
+    check("watch-album", "대상 0개 -> 텍스트만", t_evening_zero_targets)
+    check("watch-album", "지난 스냅샷 -> 앨범 없음", t_evening_stale_scan)
+    check("watch-album", "차트 모듈 실패 격리", t_evening_chart_module_down)
+
+
 # ═══════════════════ 발송 요일(일요일) 예외 — nightly · daily --send-only ═══════════════════
 def test_send_day(tmp: Path):
     """일요일은 휴장이어도 daily --send-only 한 단계만 돈다. 토요일은 전체 스킵.
@@ -10095,6 +10308,7 @@ def main() -> int:
         test_reco_dow()
         test_chart(tmp)
         test_obv(tmp)
+        test_watch_album(tmp)
         test_send_day(tmp)
         test_trading_day(tmp)
         test_backtest(tmp)

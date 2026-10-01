@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import Config, DEFAULT
+from .config import Config, DEFAULT, watchlist_codes
 from .contracts import ObvSignal, ScreenResult
 from .cost_basis import POC_MIN_LOOKBACK, volume_profile
 from .indicators import moving_averages, obv_fit, obv_series, split_traces
@@ -45,7 +45,7 @@ __all__ = ["GRADE_RANK", "grade_at_least", "ChartJob", "ChartOut",
            "korean_font", "render_chart", "chart_caption", "chart_path",
            "prune_chart_dirs", "build_charts", "line_levels", "album_items",
            "obv_line", "obv_display", "obv_panel_note", "draw_obv_panel",
-           "OBV_EXCLUDED_NOTE"]
+           "OBV_EXCLUDED_NOTE", "watchlist_jobs", "watchlist_header"]
 
 # 등급 순서. 작을수록 높다. NONE 은 차트 대상이 아니므로 없다.
 GRADE_RANK = {"S+": 0, "S": 1, "A": 2, "B": 3}
@@ -141,6 +141,44 @@ def select_targets(jobs: list[ChartJob], cfg: Config = DEFAULT) -> list[ChartJob
           if c.min_grade is None or grade_at_least(j.grade, c.min_grade)]
     ok.sort(key=lambda j: j.rank)
     return ok[:max(0, int(c.max_count))]
+
+
+def watchlist_jobs(scans, cfg: Config = DEFAULT) -> list[ChartJob]:
+    """저녁 브리핑 관심종목 앨범 대상. scans 는 **한 스캔일**의 행이다.
+
+    WATCHLIST 중 등급이 cfg.chart.watch_grades 에 든 종목만. NONE 과
+    스냅샷에 없는 종목('스캔 제외')은 빠진다. 정렬은 등급 높은 순, 같은
+    등급이면 max(매집, 추세) → min(매집, 추세) → 코드 순. watch_max 개까지.
+    스캔 결과를 읽기만 한다 — 점수·등급을 새로 매기지 않는다.
+    """
+    c = cfg.chart
+    bad = [g for g in c.watch_grades if g not in GRADE_RANK]
+    if bad:
+        raise ValueError(f"WATCHLIST_ALBUM_GRADES 는 {list(GRADE_RANK)} 중에서만"
+                         f" 고를 수 있습니다: {bad}")
+    if scans is None or len(scans) == 0:
+        return []
+    watch = watchlist_codes()
+    cand = []
+    for _, r in scans.iterrows():
+        code = str(r["ticker"]).zfill(6)
+        g = str(r["grade"] or "").strip()
+        if code not in watch or g not in c.watch_grades:
+            continue
+        v = float(r["value_score"] or 0.0)
+        t = float(r["trend_score"] or 0.0)
+        cand.append((GRADE_RANK[g], -max(v, t), -min(v, t), code,
+                     str(r.get("name") or watch[code][0]), g, v, t))
+    cand.sort()
+    return [ChartJob(rank=i, ticker=code, name=name, grade=g,
+                     recorded=(v, t))
+            for i, (_gr, _a, _b, code, name, g, v, t)
+            in enumerate(cand[:max(0, int(c.watch_max))], 1)]
+
+
+def watchlist_header(n: int, scan_date: str) -> str:
+    """관심종목 앨범 첫 장 캡션 맨 위 한 줄. 추천 앨범과 헷갈리지 않게 한다."""
+    return f"📌 <b>관심종목 차트 {n}종목</b> (스캔 {scan_date} · 추천 아님)"
 
 
 # ══════════════════════════ 폰트 ══════════════════════════
@@ -579,14 +617,19 @@ def chart_caption(res: ScreenResult, rank: int | None = None,
 
 
 def album_items(outs: list, cfg: Config = DEFAULT,
-                limit: int = TELEGRAM_CAPTION_MAX) -> list[tuple[Path, str]]:
+                limit: int = TELEGRAM_CAPTION_MAX,
+                header: str | None = None) -> list[tuple[Path, str]]:
     """생성된 차트 -> 앨범 항목 [(경로, 캡션)]. 순위 순.
 
     첫 사진 캡션 맨 끝에 면책 문구를 붙인다. 본문을 (상한 - 문구 길이)로
     먼저 줄이고 붙이므로, 합쳐도 1,024자를 넘지 않고 문구는 잘리지 않는다.
+    header 가 있으면 첫 사진 캡션 맨 위에 한 줄 붙인다(관심종목 앨범).
+    줄이기는 뒷줄부터라 header 는 남는다.
     """
     ready = sorted((o for o in outs if o.path is not None), key=lambda o: o.rank)
     items = [(o.path, o.caption) for o in ready]
+    if items and header:
+        items[0] = (items[0][0], f"{header}\n{items[0][1]}")
     if items and cfg.chart.disclaimer:
         tail = f"\n\n<i>{_e(cfg.chart.disclaimer)}</i>"
         body, _m = fit_caption(items[0][1], limit - caption_units(tail))
@@ -596,10 +639,15 @@ def album_items(outs: list, cfg: Config = DEFAULT,
 
 # ══════════════════════════ 파일 ══════════════════════════
 def chart_path(trade_date, rank: int, ticker: str, cfg: Config = DEFAULT,
-               root=None) -> Path:
-    """data/charts/YYYYMMDD/NN_티커.png — 폴더 날짜는 기준 거래일."""
+               root=None, prefix: str = "") -> Path:
+    """data/charts/YYYYMMDD/[접두사]NN_티커.png — 폴더 날짜는 기준 거래일.
+
+    관심종목 앨범은 접두사 W 를 쓴다(W01_…). 같은 날짜 폴더에 추천 차트
+    (01_…)가 있어도 덮어쓰지 않고, 날짜 폴더 정리는 그대로 같이 된다.
+    """
     ymd = pd.Timestamp(str(trade_date)).strftime("%Y%m%d")
-    return Path(root or cfg.chart.out_dir) / ymd / f"{int(rank):02d}_{ticker}.png"
+    return (Path(root or cfg.chart.out_dir) / ymd
+            / f"{prefix}{int(rank):02d}_{ticker}.png")
 
 
 _YMD = re.compile(r"^\d{8}$")
@@ -638,7 +686,8 @@ def prune_chart_dirs(cfg: Config = DEFAULT, root=None,
 
 
 def build_charts(store, jobs: list[ChartJob], trade_date: str,
-                 cfg: Config = DEFAULT, root=None) -> list[ChartOut]:
+                 cfg: Config = DEFAULT, root=None,
+                 prefix: str = "") -> list[ChartOut]:
     """jobs 마다 PNG + 캡션. 한 종목의 실패는 그 종목의 ChartOut.error 로만 남는다."""
     from .daily import exclusion_of, scan_context, screen_ticker
 
@@ -655,7 +704,8 @@ def build_charts(store, jobs: list[ChartJob], trade_date: str,
             if job.result is not None and not job.result.excluded:
                 res = job.result          # 방금 채점한 그 객체를 그린다
             path = render_chart(res, ohlcv,
-                                chart_path(trade_date, job.rank, job.ticker, cfg, root),
+                                chart_path(trade_date, job.rank, job.ticker, cfg,
+                                           root, prefix),
                                 cfg, trade_date=trade_date)
             cap = chart_caption(res, rank=job.rank,
                                 flags=ctx["flags"].get(job.ticker),

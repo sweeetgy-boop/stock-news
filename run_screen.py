@@ -585,7 +585,8 @@ def _holdings_msg(store: Store, args, asof, trade_date: str, scanned: int,
 
 
 def _send_charts(store: Store, args, trade_date: str, picks=None,
-                 rows=None) -> None:
+                 rows=None, jobs=None, key: str = "charts",
+                 prefix: str = "", header: str | None = None) -> None:
     """추천 발송 **뒤에** 10선 차트를 앨범 1개로 붙인다 (CHART_MAX_COUNT).
 
     어떤 실패도 텍스트 발송으로 번지지 않는다. 텍스트는 이미 나갔고,
@@ -597,22 +598,30 @@ def _send_charts(store: Store, args, trade_date: str, picks=None,
 
     picks : 방금 채점한 [(slot, ScreenResult)] (스캔 경로)
     rows  : recos 행 (일요일 경로 — DB 시세로 재계산해 그린다)
+    jobs  : 이미 고르고 자른 ChartJob 목록 (관심종목 앨범). 주면 picks/rows 와
+            CHART_* 선정을 건너뛴다.
+    key   : SUMMARY 에 남길 이름 (추천 "charts" · 관심종목 "watch_charts")
+    prefix/header : chart_path 파일 접두사 · 첫 장 캡션 머리말
     """
     info: dict = {"eligible": 0, "made": 0, "sent": 0, "files": [],
                   "failed": []}
-    SUMMARY["charts"] = info
+    SUMMARY[key] = info
     try:
         from stocknews import chart as ch
         from stocknews.notify import album_payload, caption_units, fit_caption
-        jobs = (ch.jobs_from_picks(picks) if picks is not None
-                else ch.jobs_from_rows(rows))
-        targets = ch.select_targets(jobs, DEFAULT)
+        if jobs is not None:
+            targets = list(jobs)
+        else:
+            targets = ch.select_targets(
+                ch.jobs_from_picks(picks) if picks is not None
+                else ch.jobs_from_rows(rows), DEFAULT)
         info["eligible"] = len(targets)
         if not targets:
             return
         ch.prune_chart_dirs(DEFAULT)
-        outs = ch.build_charts(store, targets, trade_date, DEFAULT)
-        items = ch.album_items(outs, DEFAULT)
+        outs = ch.build_charts(store, targets, trade_date, DEFAULT,
+                               prefix=prefix)
+        items = ch.album_items(outs, DEFAULT, header=header)
         # 실제 요청과 같은 함수로 구성한다. dry-run 에서 본 것이 나가는 것이다.
         media, _names = album_payload(
             [(p, *fit_caption(c)) for p, c in items])
@@ -635,7 +644,8 @@ def _send_charts(store: Store, args, trade_date: str, picks=None,
         return
     if args.dry_run:
         _say("-" * 62)
-        _say(f"[차트 앨범 {len(media)}장 · 캡션 최대 "
+        label = "관심종목 차트 앨범" if key == "watch_charts" else "차트 앨범"
+        _say(f"[{label} {len(media)}장 · 캡션 최대 "
              f"{info['album']['caption_max']}자]")
         for (p, _c), m in zip(items, media):
             _say(f"  {p}")
@@ -964,7 +974,47 @@ def mode_brief_evening(store: Store, args) -> int:
                                hours=args.news_hours), args.dry_run)
     SUMMARY.update({"news_hours": args.news_hours,
                     "picks": 0 if picks is None else len(picks)})
+    # 텍스트 **뒤에** 관심종목 차트 앨범 1개. 텍스트는 이미 나갔으므로
+    # 여기서 무엇이 실패해도 브리핑에는 영향이 없다(_send_charts 와 같은 격리).
+    _send_watch_charts(store, args)
     return EXIT_OK
+
+
+def _send_watch_charts(store: Store, args) -> None:
+    """관심종목 중 **당일 스캔** 등급이 매겨진 종목의 차트 앨범.
+
+    '당일' = 최신 스캔일이 최신 거래일(last_price_date)과 같을 때만. daily 가
+    오늘 실패해 스냅샷이 어제 것이면 어제 차트를 오늘 것처럼 보내지 않는다.
+    대상 0개면 앨범 없이 끝난다 (SUMMARY.watch_charts.eligible = 0).
+    """
+    info: dict = {"eligible": 0}
+    try:
+        from stocknews import chart as ch
+        sc = store.scan_history(days=1)
+        if sc is None or sc.empty:
+            info["skipped"] = "no_scan"
+        else:
+            scan_d = str(sc["d"].max())
+            last_d = store.last_price_date()
+            info["scan_date"] = scan_d
+            if last_d and scan_d != str(last_d):
+                info["skipped"] = f"stale_scan (최신 거래일 {last_d})"
+            else:
+                jobs = ch.watchlist_jobs(sc[sc["d"] == scan_d], DEFAULT)
+                if jobs:
+                    _send_charts(store, args, scan_d, jobs=jobs,
+                                 key="watch_charts", prefix="W",
+                                 header=ch.watchlist_header(len(jobs), scan_d))
+                    SUMMARY["watch_charts"]["scan_date"] = scan_d
+                    SUMMARY["watch_charts"]["tickers"] = [j.ticker for j in jobs]
+                    return
+    except Exception as exc:  # noqa: BLE001 - 앨범은 부가 정보다
+        info["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        log.warning("관심종목 차트 앨범 준비 실패 — 텍스트 브리핑은 이미 끝났습니다"
+                    " (%s)", info["error"])
+    SUMMARY["watch_charts"] = info
+    log.info("관심종목 차트 앨범 없음 (%s)",
+             info.get("skipped") or info.get("error") or "등급 매겨진 관심종목 0")
 
 
 class _RecoRow:

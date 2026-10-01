@@ -146,6 +146,17 @@ CHART_MIN_GRADE: str | None = None
 CHART_MAX_COUNT = 10
 CHART_DISCLAIMER = "검증 중 · 투자 판단 근거 아님"
 
+# 저녁 브리핑(brief-evening)의 관심종목 차트 앨범. 텍스트 브리핑 **뒤에**
+# 앨범 1개로 붙는다. 대상은 WATCHLIST 중 **당일 스캔** 등급이 아래에 든
+# 종목뿐이다 — NONE 과 '스캔 제외'(스냅샷에 없음)는 뺀다. 등급 높은 순,
+# 같은 등급이면 max(매집, 추세) 높은 순으로 자른다. 대상 0개면 앨범 없음.
+# 차트·캡션은 추천 앨범과 같은 모듈(chart.py)을 쓴다.
+#
+# WATCHLIST_ALBUM_GRADES  chart.GRADE_RANK 의 등급 이름만 쓸 수 있다.
+# WATCHLIST_ALBUM_MAX     앨범 한도(MEDIA_GROUP_MAX = 10)를 넘기지 않는다.
+WATCHLIST_ALBUM_GRADES: tuple[str, ...] = ("S+", "S", "A", "B")
+WATCHLIST_ALBUM_MAX = 10
+
 
 @dataclass(frozen=True)
 class ChartConfig:
@@ -154,6 +165,8 @@ class ChartConfig:
     min_grade: str | None = CHART_MIN_GRADE
     max_count: int = CHART_MAX_COUNT
     disclaimer: str = CHART_DISCLAIMER
+    watch_grades: tuple[str, ...] = WATCHLIST_ALBUM_GRADES
+    watch_max: int = WATCHLIST_ALBUM_MAX
     bars: int = 120                  # 표시 봉 수. 매물대 POC 구간(120)과 같게 둔다
     fib_levels: tuple[float, ...] = (0.382, 0.5, 0.618, 0.786)
     # 매물대는 cost_basis.from_volume_profile 과 **같은 구간·같은 칸 수**로
@@ -593,9 +606,11 @@ RECONCILE_ADJ_SUSPECT_RATIO = 0.10
 # ══════════════════════════ 관심종목 (표시·태깅 전용) ══════════════════════════
 # 외부에서 받은 관심종목. **보유가 아니다** — positions 에 넣지 않는다.
 #
-# 쓰는 곳은 둘뿐이다.
+# 쓰는 곳은 셋뿐이다.
 #   renderer.render_watchlist   저녁 브리핑 '📌 관심종목 현황' 섹션 (팩트만)
 #   news.held_codes             뉴스 중요도의 '내 종목' 자리에 연결 (브리핑 정렬)
+#   chart.watchlist_jobs        저녁 브리핑 관심종목 차트 앨범 대상 (스캔 결과를
+#                               읽기만 한다 — WATCHLIST_ALBUM_* 참조)
 # 점수·스크리닝·추천·채점·청산 어디에서도 참조하지 않는다. smoke 의
 # [watchlist] 검사가 screener/daily/exits 등에서 이 이름이 나오면 실패한다.
 #
