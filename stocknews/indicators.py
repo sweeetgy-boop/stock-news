@@ -15,14 +15,19 @@
 
 그리고 크로스 후 종가가 다시 60선 아래로 떨어진 횟수(휩쏘)를 세어
 가짜 크로스를 감점한다.
+
+OBV (기록·표시 전용)
+--------------------
+맨 아래 `evaluate_obv` 블록은 채점과 무관하다. `evaluate_trend` 는 OBV 를
+보지 않고, 결과는 `scans` 의 두 컬럼과 차트·캡션에만 간다(스모크가 강제).
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from .config import MAConfig
-from .contracts import CrossEvent, TrendSignal
+from .config import MAConfig, ObvConfig
+from .contracts import CrossEvent, ObvSignal, TrendSignal
 
 __all__ = [
     "moving_averages",
@@ -32,6 +37,10 @@ __all__ = [
     "convergence_pct",
     "alignment_of",
     "evaluate_trend",
+    "obv_series",
+    "obv_fit",
+    "split_traces",
+    "evaluate_obv",
 ]
 
 
@@ -264,3 +273,94 @@ def evaluate_trend(ohlcv: pd.DataFrame, cfg: MAConfig) -> TrendSignal | None:
         whipsaw_count=whip,
         breakdown=bd,
     )
+
+
+# ══════════════════ OBV (기록·표시 전용) ══════════════════
+# 누적 절대값은 쓰지 않는다. OBV 의 수준은 시작일을 어디로 잡느냐에 따라
+# 달라지는 임의의 숫자라 종목 간에도, 같은 종목의 날짜 간에도 비교가 안
+# 된다. 의미가 있는 건 최근 구간의 **방향과 기울기**뿐이다.
+def obv_series(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume. 첫 봉은 0. 종가 보합인 날은 증감 0."""
+    sign = np.sign(close.astype("float64").diff()).fillna(0.0)
+    return (sign * volume.astype("float64")).cumsum()
+
+
+def obv_fit(obv: pd.Series) -> tuple[float, float]:
+    """OBV 구간의 최소제곱 직선 (기울기 주/일, 절편). x = 0..n-1."""
+    y = obv.to_numpy(dtype="float64")
+    slope, icpt = np.polyfit(np.arange(len(y), dtype="float64"), y, 1)
+    return float(slope), float(icpt)
+
+
+def split_traces(close: pd.Series, volume: pd.Series,
+                 cfg: ObvConfig) -> list[tuple]:
+    """가격제한폭 밖으로 뛴 날과 그 성격. [(날짜, "split"|"price_gap"), ...]
+
+    분할·병합 날 원시 시세는 가격이 1/k 로, 거래량이 k 배로 뛴다. 그 날이
+    창 안에 있으면 OBV 가 서로 다른 단위의 거래량을 더하게 되고(앞쪽 k배
+    거래량이 기울기를 지배한다), 20일 가격 변화율도 가짜 급등락이 된다.
+
+    "split"     거래량 비율이 가격 비율의 역수 방향으로 움직였고 곱이
+                [1/tol, tol] 안 — 요청된 '분할 흔적' 판정 그대로
+    "price_gap" 가격은 제한폭 밖인데 거래량은 역수가 아님. 2026-10-01 실측
+                75건 중 다수(예: 008040 가격 x11.9 · 거래량 x1.03)가 여기다.
+                가격 시계열이 끊긴 것은 같으므로 이것도 NULL 로 본다.
+
+    수정주가 + 원시 거래량처럼 **가격은 연속인데 거래량만 k 배** 인 혼재는
+    정상적인 거래량 급증과 구분할 수 없어 잡지 않는다.
+    """
+    c = close.astype("float64")
+    v = volume.astype("float64")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lp = np.log(c / c.shift(1))
+        lv = np.log(v / v.shift(1))
+    jump = (lp.abs() >= np.log(cfg.split_price_jump)).fillna(False)
+    out = []
+    tol = np.log(cfg.split_recip_tol)
+    for d in lp.index[jump.to_numpy(dtype=bool)]:
+        a, b = float(lp.loc[d]), float(lv.loc[d])
+        recip = (np.isfinite(b) and np.sign(b) == -np.sign(a)
+                 and abs(a + b) <= tol)
+        out.append((d, "split" if recip else "price_gap"))
+    return out
+
+
+def evaluate_obv(ohlcv: pd.DataFrame | None, cfg: ObvConfig) -> ObvSignal:
+    """최근 window 거래일 OBV 기울기(정규화) + 가격-OBV 다이버전스.
+
+    봉 window+1 개(t-window .. t)를 본다. 증감은 window 개다.
+      slope = OLS 기울기(주/일) / 그 window 개 증감일의 평균 거래량
+              매일 상승 · 거래량 일정이면 +1.0, 매일 하락이면 -1.0.
+      price_ret_pct = 종가(t) / 종가(t-window) - 1
+      divergence  +1 강세: 가격 -div_price_pct% 이하인데 slope +div_slope 이상
+                  -1 약세: 가격 +div_price_pct% 이상인데 slope -div_slope 이하
+                   0 없음
+    창 안에 분할 흔적이 있으면 전부 None (null_reason 참조).
+    """
+    w = int(cfg.window)
+    if ohlcv is None or len(ohlcv) < w + 1:
+        return ObvSignal(None, None, None, "short")
+    tail = ohlcv.iloc[-(w + 1):]
+    close = tail["종가"].astype("float64")
+    vol = tail["거래량"].astype("float64")
+
+    traces = split_traces(close, vol, cfg)
+    if traces:
+        kinds = {k for _d, k in traces}
+        return ObvSignal(None, None, None,
+                         "split" if "split" in kinds else "price_gap",
+                         tuple(pd.Timestamp(d).strftime("%Y-%m-%d")
+                               for d, _k in traces))
+
+    mean_vol = float(vol.iloc[1:].mean())
+    if not np.isfinite(mean_vol) or mean_vol <= 0:
+        return ObvSignal(None, None, None, "no_volume")
+
+    slope = obv_fit(obv_series(close, vol))[0] / mean_vol
+    ret = (float(close.iloc[-1]) / float(close.iloc[0]) - 1.0) * 100.0
+    div = 0
+    if ret <= -cfg.div_price_pct and slope >= cfg.div_slope:
+        div = 1
+    elif ret >= cfg.div_price_pct and slope <= -cfg.div_slope:
+        div = -1
+    return ObvSignal(slope=slope, divergence=div, price_ret_pct=ret)
