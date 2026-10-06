@@ -243,12 +243,68 @@ SLOT_LABEL = {
 }
 
 
+# ══════════════════ 추천 10선 규모 구분 (표시 전용) ══════════════════
+def is_large(mcap, amt, cfg: Config = DEFAULT) -> bool:
+    """시총·일거래대금 둘 다 기준 이상이면 True. 하나라도 모르면 False."""
+    g = cfg.reco_group
+    try:
+        return (mcap is not None and amt is not None
+                and float(mcap) >= g.mcap_min and float(amt) >= g.amt_min)
+    except (TypeError, ValueError):
+        return False
+
+
+def _won(v) -> str:
+    """원 -> '1조' / '2.7조' / '3,450억' / '-'."""
+    if v is None or v != v:
+        return "-"
+    v = float(v)
+    if v >= 1e12:
+        return f"{v / 1e12:.1f}".rstrip("0").rstrip(".") + "조"
+    return f"{v / 1e8:,.0f}억"
+
+
+def _size_bits(size: dict | None, ticker: str) -> str:
+    if size is None:
+        return ""
+    mcap, amt = size.get(ticker, (None, None))
+    return f" · 시총 {_won(mcap)} · 대금 {_won(amt)}"
+
+
+def _grouped_body(blocks: list, size: dict | None, cfg: Config) -> str:
+    """[(ticker, 블록)] -> 본문. size 가 있으면 대형 / 그 외 두 묶음.
+
+    순위 번호와 묶음 안의 순서는 그대로 둔다 — 같은 10선을 나눠 보일 뿐이다.
+    """
+    if size is None:
+        return "\n\n".join(b for _t, b in blocks)
+    g = cfg.reco_group
+    big = [b for t, b in blocks if is_large(*size.get(t, (None, None)), cfg)]
+    rest = [b for t, b in blocks if not is_large(*size.get(t, (None, None)), cfg)]
+    out = ["",
+           f"━━ 🏢 대형 · 시총 {_won(g.mcap_min)}↑ · 거래대금 "
+           f"{_won(g.amt_min)}↑ ({len(big)}) ━━",
+           "\n\n".join(big) if big else "• 해당 없음",
+           "",
+           f"━━ 🌱 그 외 ({len(rest)}) ━━",
+           "\n\n".join(rest) if rest else "• 해당 없음"]
+    return "\n".join(out)
+
+
+def _size_note(size: dict | None, cfg: Config) -> list[str]:
+    if size is None:
+        return []
+    return [f"※ 거래대금 = 기준일까지 {cfg.reco_group.amt_days}거래일 평균 · "
+            "시총 = 종목 마스터 최신값 · 구분은 표시용 (선정과 무관)"]
+
+
 def render_top10(picks: list, asof, trade_date: str, scanned: int,
-                 cfg: Config = DEFAULT) -> str:
+                 cfg: Config = DEFAULT, size: dict | None = None) -> str:
     """매일 저녁 추천 10선.
 
     한 종목당 3줄로 제한한다. 10종목이면 30줄 남짓, 스마트폰 한두 화면이다.
     이 분량 제약을 지키지 않으면 결국 안 읽는다.
+    size : {티커: (시총, 일거래대금)} 이면 대형 / 그 외로 나눠 보인다.
     """
     if not picks:
         return (f"🌙 <b>[저녁 전종목 스캔]</b> {trade_date}\n\n"
@@ -265,7 +321,8 @@ def render_top10(picks: list, asof, trade_date: str, scanned: int,
         f, q, t = r.fib, r.liq, r.trend
         l1 = (f"{i}. <b>{_e(r.name)}</b> ({r.ticker}) {r.mark} "
               f"[{r.grade}·{SLOT_LABEL.get(slot, slot)}]")
-        l2 = f"   {r.price:,.0f}원 · 매집 {r.value_score:.1f} / 추세 {r.trend_score:.1f}"
+        l2 = (f"   {r.price:,.0f}원 · 매집 {r.value_score:.1f} / 추세 "
+              f"{r.trend_score:.1f}{_size_bits(size, r.ticker)}")
         bits = []
         if f is not None:
             bits.append(f"피보 {f.ratio:.3f}{'✅' if f.below_target else ''}")
@@ -277,18 +334,22 @@ def render_top10(picks: list, asof, trade_date: str, scanned: int,
         if q is not None:
             bits.append(f"청산중심 {q.band_mid:,.0f}({(r.price / q.band_mid - 1) * 100:+.0f}%)")
         l3 = "   " + " · ".join(bits) if bits else ""
-        body.append("\n".join(x for x in (l1, l2, l3) if x))
+        body.append((r.ticker, "\n".join(x for x in (l1, l2, l3) if x)))
 
     tail = [
         "",
         "※ 매집=역추세 바닥 그물 / 추세=골든크로스 확증",
         "※ 시퀀스 = 청산밴드 진입 후 골든크로스 (최상위 등급)",
+        *_size_note(size, cfg),
         f"⏰ {asof:%Y-%m-%d %H:%M:%S}",
     ]
-    return "\n".join(head) + "\n\n".join(body) + "\n" + "\n".join(tail)
+    return ("\n".join(head) + _grouped_body(body, size, cfg) + "\n"
+            + "\n".join(tail))
 
 
-def render_reco_stored(rows, asof, send_dow_label: str = "일요일") -> str:
+def render_reco_stored(rows, asof, send_dow_label: str = "일요일",
+                       size: dict | None = None,
+                       cfg: Config = DEFAULT) -> str:
     """DB 에 쌓인 추천으로 만드는 주간 10선.
 
     발송 요일(기본 일요일)은 휴장일이라 그날 스캔이 돌지 않는다. 그래서
@@ -298,6 +359,7 @@ def render_reco_stored(rows, asof, send_dow_label: str = "일요일") -> str:
     채점되는 숫자가 달라지므로, 저장된 열만 쓰는 별도 렌더러로 분리했다.
 
     rows : store.reco_history(days=1) 결과 (DataFrame)
+    size : {티커: (시총, 일거래대금)} 이면 대형 / 그 외로 나눠 보인다.
     """
     if rows is None or len(rows) == 0:
         return ("🌙 <b>[주간 추천]</b>\n\n"
@@ -315,20 +377,23 @@ def render_reco_stored(rows, asof, send_dow_label: str = "일요일") -> str:
         l1 = (f"{int(r['rank'])}. <b>{_e(str(r['name']))}</b> ({r['ticker']}) "
               f"[{r['grade']}·{SLOT_LABEL.get(slot, slot)}]")
         l2 = (f"   {float(r['price']):,.0f}원 · 매집 {float(r['value_score']):.1f}"
-              f" / 추세 {float(r['trend_score']):.1f}")
+              f" / 추세 {float(r['trend_score']):.1f}"
+              f"{_size_bits(size, str(r['ticker']))}")
         reason = str(r["reason"] or "").strip()
         if len(reason) > 90:
             reason = reason[:89] + "…"
         l3 = f"   {_e(reason)}" if reason else ""
-        body.append("\n".join(x for x in (l1, l2, l3) if x))
+        body.append((str(r["ticker"]), "\n".join(x for x in (l1, l2, l3) if x)))
 
     tail = [
         "",
         "※ 매집=역추세 바닥 그물 / 추세=골든크로스 확증",
         "※ 기준일 종가 기준입니다. 발송 시점 가격과 다릅니다.",
+        *_size_note(size, cfg),
         f"⏰ {asof:%Y-%m-%d %H:%M:%S}",
     ]
-    return "\n".join(head) + "\n\n".join(body) + "\n" + "\n".join(tail)
+    return ("\n".join(head) + _grouped_body(body, size, cfg) + "\n"
+            + "\n".join(tail))
 
 
 def render_reco_missing(asof, expected: str | None, got: str | None) -> str:

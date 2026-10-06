@@ -574,6 +574,27 @@ def liquidity_filter(store, tickers: dict, min_amt_20d: float = 5e8,
     return keep
 
 
+def avg_trading_value(store, ticker: str, until=None,
+                      days: int = 20) -> float | None:
+    """기준일(until, 포함)까지 days 거래일 평균 거래대금(원). 모르면 None.
+
+    거래대금이 비어 있는 날은 종가 x 거래량으로 채운다(liquidity_filter 와
+    같은 근사). 표시용이다 — 스캔 대상 선정은 liquidity_filter 가 한다.
+    """
+    df = store.load_ohlcv(ticker, days=int(days) + 10)
+    if df is None or df.empty:
+        return None
+    if until is not None:
+        df = df[df.index <= pd.Timestamp(str(until))]
+    tail = df.tail(int(days))
+    if tail.empty:
+        return None
+    approx = tail["종가"] * tail["거래량"]
+    amt = tail["거래대금"].fillna(approx) if "거래대금" in tail.columns else approx
+    v = float(amt.mean())
+    return v if pd.notna(v) else None
+
+
 # 업종 컬럼이 있는 FDR 상장목록. 순서가 우선순위다.
 #
 # 2026-08 실측: `StockListing("KRX")` 에는 업종 컬럼이 **없다**.

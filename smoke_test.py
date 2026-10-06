@@ -9985,6 +9985,186 @@ def test_watch_album(tmp: Path):
     check("watch-album", "차트 모듈 실패 격리", t_evening_chart_module_down)
 
 
+# ══════════════════════════ 추천 10선 규모 구분 (표시 전용) ══════════════════════════
+def test_reco_groups(tmp: Path):
+    """추천 메시지를 대형(시총 1조↑·거래대금 100억↑) / 그 외로 나눠 보인다."""
+    import argparse
+    import contextlib
+    import importlib
+    import inspect
+    import io
+    import os
+    import sqlite3
+
+    from stocknews import config as C
+    from stocknews import notify as nt
+    from stocknews import renderer as R
+    from stocknews.config import DEFAULT
+    from stocknews.screener import screen_one
+    from stocknews.store import Store
+    from stocknews.universe import avg_trading_value
+
+    def t_config():
+        assert C.RECO_LARGE_MCAP_MIN == 1e12 and C.RECO_LARGE_AMT_MIN == 100e8
+        assert C.RECO_LARGE_AMT_DAYS == 20
+        g = DEFAULT.reco_group
+        assert (g.mcap_min, g.amt_min, g.amt_days) == (1e12, 100e8, 20), "미배선"
+
+    def t_is_large_boundary():
+        assert R.is_large(1e12, 100e8), "경계값(이상)이 대형이 아님"
+        assert not R.is_large(1e12 - 1, 500e8)
+        assert not R.is_large(5e12, 100e8 - 1)
+        assert not R.is_large(None, 500e8) and not R.is_large(5e12, None)
+        assert R._won(1.23e12) == "1.2조" and R._won(152e8) == "152억"
+        assert R._won(1e12) == "1조" and R._won(3e12) == "3조"
+        assert R._won(None) == "-"
+
+    def t_avg_trading_value():
+        st = Store(tmp / "rg_amt.db")
+        df = fixture_flat().copy()
+        df["거래대금"] = 50e8
+        df.iloc[-1, df.columns.get_loc("거래대금")] = np.nan   # 비면 종가x거래량
+        st.upsert_prices("000001", df, allow_today=True)
+        got = avg_trading_value(st, "000001", days=20)
+        approx = float(df["종가"].iloc[-1] * df["거래량"].iloc[-1])
+        near(got, (19 * 50e8 + approx) / 20, tol=1.0, label="20일 평균")
+        cut = df.index[-6].strftime("%Y-%m-%d")
+        near(avg_trading_value(st, "000001", until=cut, days=20), 50e8,
+             tol=1.0, label="기준일 절단")
+        assert avg_trading_value(st, "999999") is None
+
+    def _rows():
+        return pd.DataFrame([
+            dict(d="2026-10-02", rank=1, ticker="000001", name="소형A", price=1000.0,
+                 slot="SEQ", grade="A", value_score=3.0, trend_score=9.0, reason=""),
+            dict(d="2026-10-02", rank=2, ticker="000002", name="대형B", price=50000.0,
+                 slot="VALUE", grade="B", value_score=7.0, trend_score=1.0, reason=""),
+            dict(d="2026-10-02", rank=3, ticker="000003", name="대형C", price=9000.0,
+                 slot="TREND", grade="A", value_score=2.0, trend_score=9.5, reason=""),
+            dict(d="2026-10-02", rank=4, ticker="000004", name="미상D", price=500.0,
+                 slot="TREND", grade="B", value_score=1.0, trend_score=7.0, reason=""),
+        ])
+
+    SIZE = {"000001": (3000e8, 500e8), "000002": (2.5e12, 120e8),
+            "000003": (1e12, 100e8), "000004": (None, None)}
+
+    def t_render_stored_grouped():
+        msg = R.render_reco_stored(_rows(), datetime(2026, 10, 4, 21, 30),
+                                   "일요일", size=SIZE)
+        i_big = msg.index("\n\n━━ 🏢 대형 · 시총 1조↑ · 거래대금 100억↑ (2) ━━")
+        i_rest = msg.index("━━ 🌱 그 외 (2) ━━")
+        assert i_big < i_rest
+        big, rest = msg[i_big:i_rest], msg[i_rest:]
+        assert "2. <b>대형B</b>" in big and "3. <b>대형C</b>" in big
+        assert big.index("2. <b>") < big.index("3. <b>"), "묶음 안 순위 순 아님"
+        assert "1. <b>소형A</b>" in rest and "4. <b>미상D</b>" in rest
+        assert "시총 2.5조 · 대금 120억" in big
+        assert "시총 3,000억 · 대금 500억" in rest and "시총 - · 대금 -" in rest
+        assert "구분은 표시용 (선정과 무관)" in msg
+        # size 없으면 예전 출력 그대로
+        plain = R.render_reco_stored(_rows(), datetime(2026, 10, 4, 21, 30), "일요일")
+        assert "━━ 🏢" not in plain and "시총" not in plain
+
+    def t_render_empty_group():
+        only_small = {t: (1e8, 1e8) for t in SIZE}
+        msg = R.render_reco_stored(_rows(), datetime(2026, 10, 4), size=only_small)
+        assert "(0) ━━\n• 해당 없음" in msg, msg[:400]
+        assert "━━ 🌱 그 외 (4) ━━" in msg
+
+    def t_render_top10_grouped():
+        r1 = screen_one("000002", "대형", fixture_crash())
+        r2 = screen_one("000001", "소형", fixture_golden_cross())
+        msg = R.render_top10([("VALUE", r1), ("TREND", r2)], datetime(2026, 10, 2),
+                             "2026-10-02", 1000, DEFAULT,
+                             size={"000002": (2e12, 300e8), "000001": (1e11, 5e8)})
+        assert msg.index("━━ 🏢") < msg.index("1. <b>대형</b>") \
+            < msg.index("━━ 🌱") < msg.index("2. <b>소형</b>"), msg
+
+    def t_display_only_guard():
+        """선정·채점·게이트·청산 경로에 규모 구분이 없다."""
+        from stocknews import daily, exits, notify, screener, store
+        toks = ("reco_group", "RECO_LARGE", "is_large", "avg_trading_value",
+                "RecoGroupConfig")
+        for mod in (screener, daily, exits, notify):
+            src = inspect.getsource(mod)
+            for tk in toks:
+                assert tk not in src, f"{mod.__name__} 가 {tk} 를 참조한다"
+        assert "is_large" not in inspect.getsource(store.Store.save_recos)
+
+    def _sunday_send(st):
+        mod = importlib.import_module("run_screen")
+        args = argparse.Namespace(force=False, dry_run=False, with_fib=False,
+                                  top=10, limit=None, min_amount=0.0)
+        saved = (dict(mod.SUMMARY), mod.reco_send_allowed, mod.send_telegram,
+                 mod.send_album, os.getcwd())
+        texts: list = []
+        try:
+            mod.SUMMARY.clear()
+            mod.reco_send_allowed = lambda *a, **k: (True, "send_dow")
+            mod.send_telegram = lambda t, *a, **k: (texts.append(t),
+                                                    nt.SendReport(sent=2))[1]
+            mod.send_album = lambda items, *a, **k: nt.SendReport(sent=2)
+            os.chdir(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = mod.mode_daily(st, args)
+            sm = dict(mod.SUMMARY)
+        finally:
+            os.chdir(saved[4])
+            mod.SUMMARY.clear()
+            mod.SUMMARY.update(saved[0])
+            (mod.reco_send_allowed, mod.send_telegram, mod.send_album) = saved[1:4]
+        return mod, rc, sm, texts
+
+    def t_sunday_path_grouped():
+        st = Store(tmp / "rg_sun.db")
+        big, small = fixture_crash().copy(), fixture_golden_cross().copy()
+        big["거래대금"] = 200e8
+        small["거래대금"] = 3e8
+        st.upsert_prices("000001", big, allow_today=True)
+        st.upsert_prices("000002", small, allow_today=True)
+        st.upsert_tickers([{"ticker": "000001", "name": "대형", "market_cap": 3e12},
+                           {"ticker": "000002", "name": "소형", "market_cap": 2e11}])
+        d = big.index[-1].strftime("%Y-%m-%d")
+        with sqlite3.connect(st.path) as con:
+            con.executemany(
+                "INSERT INTO recos(d,rank,ticker,name,price,slot,grade,"
+                "value_score,trend_score,reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                [(d, 1, "000002", "소형", 1.0, "TREND", "A", 1.0, 9.0, ""),
+                 (d, 2, "000001", "대형", 1.0, "VALUE", "B", 7.0, 1.0, "")])
+            con.execute("INSERT INTO scans(d,ticker) VALUES(?,?)", (d, "000001"))
+            con.commit()
+        mod, rc, sm, texts = _sunday_send(st)
+        assert rc == mod.EXIT_OK and len(texts) == 1, (rc, len(texts))
+        assert sm["reco_groups"]["large"] == ["000001"], sm["reco_groups"]
+        assert sm["reco_groups"]["other"] == ["000002"], sm["reco_groups"]
+        t = texts[0]
+        assert t.index("━━ 🏢") < t.index("2. <b>대형</b>") < t.index("━━ 🌱") \
+            < t.index("1. <b>소형</b>"), t
+        assert "시총 3조 · 대금 200억" in t
+
+    def t_size_failure_falls_back():
+        """규모 조회가 죽어도 추천은 예전처럼 한 묶음으로 나간다."""
+        st = Store(tmp / "rg_sun.db")
+        saved = st.ticker_meta
+        st.ticker_meta = lambda: (_ for _ in ()).throw(RuntimeError("db"))
+        try:
+            mod, rc, sm, texts = _sunday_send(st)
+        finally:
+            st.ticker_meta = saved
+        assert rc == mod.EXIT_OK and len(texts) == 1
+        assert "━━ 🏢" not in texts[0] and "error" in sm["reco_groups"]
+
+    check("reco-group", "config 상수 배선", t_config)
+    check("reco-group", "경계값(이상) · 값 모름 = 그 외", t_is_large_boundary)
+    check("reco-group", "20일 평균 거래대금 (빈칸 근사 · 기준일 절단)", t_avg_trading_value)
+    check("reco-group", "주간 추천: 대형 / 그 외 · 순위 유지", t_render_stored_grouped)
+    check("reco-group", "빈 묶음 = 해당 없음", t_render_empty_group)
+    check("reco-group", "스캔 경로(render_top10)도 구분", t_render_top10_grouped)
+    check("reco-group", "표시 전용 (선정·게이트·청산 미참조)", t_display_only_guard)
+    check("reco-group", "일요일 발송 경로 연동", t_sunday_path_grouped)
+    check("reco-group", "조회 실패 -> 한 묶음 발송", t_size_failure_falls_back)
+
+
 # ═══════════════════ 발송 요일(일요일) 예외 — nightly · daily --send-only ═══════════════════
 def test_send_day(tmp: Path):
     """일요일은 휴장이어도 daily --send-only 한 단계만 돈다. 토요일은 전체 스킵.
@@ -10309,6 +10489,7 @@ def main() -> int:
         test_chart(tmp)
         test_obv(tmp)
         test_watch_album(tmp)
+        test_reco_groups(tmp)
         test_send_day(tmp)
         test_trading_day(tmp)
         test_backtest(tmp)

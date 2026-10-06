@@ -102,8 +102,8 @@ from stocknews.renderer import (render_daily_holdings, render_detail,
                                 render_weekly)
 from stocknews.screener import screen_one
 from stocknews.store import Store
-from stocknews.universe import (backfill_one, fetch_day, fill_sectors,
-                                liquidity_filter, refresh_master)
+from stocknews.universe import (avg_trading_value, backfill_one, fetch_day,
+                                fill_sectors, liquidity_filter, refresh_master)
 from stocknews.weekly import weekly_report
 
 # 로그는 stderr 와 파일에 동시에 쓴다. stdout 은 --json 결과 전용이어야
@@ -702,6 +702,37 @@ def _prev_trading_day(store: Store, day) -> str | None:
     return None
 
 
+def _reco_size_map(store: Store, tickers: list[str],
+                   trade_date: str) -> dict | None:
+    """추천 종목별 (시가총액, 일거래대금 평균). 표시용 — 선정과 무관하다.
+
+    실패하면 None 을 돌려 메시지가 예전처럼 한 묶음으로 나간다. 규모 구분
+    때문에 추천 발송이 막히면 주객이 바뀐다.
+    """
+    from stocknews.renderer import is_large
+    try:
+        meta = store.ticker_meta()
+        days = DEFAULT.reco_group.amt_days
+        out: dict = {}
+        for t in tickers:
+            mc = None
+            if t in meta.index:
+                v = meta.at[t, "market_cap"]
+                mc = float(v) if v is not None and v == v else None
+            out[t] = (mc, avg_trading_value(store, t, until=trade_date, days=days))
+    except Exception as exc:  # noqa: BLE001 - 표시 부가 정보
+        log.warning("추천 규모 구분 실패 — 한 묶음으로 보냅니다 (%s: %s)",
+                    type(exc).__name__, exc)
+        SUMMARY["reco_groups"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+        return None
+    SUMMARY["reco_groups"] = {
+        "large": [t for t in tickers if is_large(*out[t], DEFAULT)],
+        "other": [t for t in tickers if not is_large(*out[t], DEFAULT)],
+        "unknown": [t for t in tickers if None in out[t]],
+    }
+    return out
+
+
 def _daily_send_only(store: Store, args, asof, send_ok: bool,
                      dow_label: str) -> int:
     """nightly 의 발송 요일(일요일) 단계. **스캔하지 않는다.**
@@ -731,7 +762,8 @@ def _daily_send_only(store: Store, args, asof, send_ok: bool,
     n = int(len(rows))
     SUMMARY.update({"picks": n, "from_db": True})
     log.info("주간 추천 발송: 기준일 %s 기록 %d건 (스캔 없음)", got, n)
-    _emit(render_reco_stored(rows, asof, dow_label), args.dry_run)
+    size = _reco_size_map(store, [str(t) for t in rows["ticker"]], got)
+    _emit(render_reco_stored(rows, asof, dow_label, size=size), args.dry_run)
     SUMMARY["reco_sent"] = True
     _send_charts(store, args, got, rows=rows)
     return EXIT_OK
@@ -783,7 +815,9 @@ def mode_daily(store: Store, args) -> int:
             log.warning("발송 요일이지만 기록된 추천이 없습니다 — 발송 생략")
             return EXIT_OK
         log.info("주간 추천 발송: 기록된 %d건 (스캔 생략)", n)
-        _emit(render_reco_stored(rows, asof, dow_label), args.dry_run)
+        size = _reco_size_map(store, [str(t) for t in rows["ticker"]],
+                              str(rows.iloc[0]["d"]))
+        _emit(render_reco_stored(rows, asof, dow_label, size=size), args.dry_run)
         SUMMARY["reco_sent"] = True
         _send_charts(store, args, str(rows.iloc[0]["d"]), rows=rows)
         return EXIT_OK
@@ -796,8 +830,10 @@ def mode_daily(store: Store, args) -> int:
     res = run_daily(store, cfg=DEFAULT, top_n=args.top, tickers=tickers)
 
     if send_ok:
+        size = _reco_size_map(store, [r.ticker for _s, r in res["picks"]],
+                              res["trade_date"])
         _emit(render_top10(res["picks"], asof, res["trade_date"],
-                           scanned=len(res["results"]), cfg=DEFAULT),
+                           scanned=len(res["results"]), cfg=DEFAULT, size=size),
               args.dry_run)
         SUMMARY["reco_sent"] = True
         _send_charts(store, args, res["trade_date"], picks=res["picks"])

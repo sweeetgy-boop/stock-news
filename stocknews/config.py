@@ -723,6 +723,29 @@ class NewsDedupConfig:
     seed_hours: int = 48              # 배치 경계를 넘기 위한 씨앗 조회 구간
 
 
+# 추천 10선 메시지의 규모 구분. **표시 전용** — 선정·등급·슬롯·게이트와
+# 무관하고, 같은 10종목을 두 묶음으로 나눠 보여줄 뿐이다(순위 번호 유지).
+#
+#   대형   시가총액 >= RECO_LARGE_MCAP_MIN  그리고  일거래대금 >= RECO_LARGE_AMT_MIN
+#   그 외  둘 중 하나라도 미달이거나 값을 모르는 종목
+#
+# 일거래대금은 기준일까지 RECO_LARGE_AMT_DAYS 거래일 평균이다. 하루치만 보면
+# 급등락 하루에 묶음이 바뀐다(유동성 필터의 20일 평균과 같은 방식).
+# 시가총액은 종목 마스터(tickers.market_cap)의 최신값이다.
+RECO_LARGE_MCAP_MIN = 1e12        # 1조원
+RECO_LARGE_AMT_MIN = 100e8        # 100억원
+RECO_LARGE_AMT_DAYS = 20
+
+
+@dataclass(frozen=True)
+class RecoGroupConfig:
+    """추천 10선 규모 구분 (표시 전용). 모듈 상수를 그대로 배선한다."""
+
+    mcap_min: float = RECO_LARGE_MCAP_MIN
+    amt_min: float = RECO_LARGE_AMT_MIN
+    amt_days: int = RECO_LARGE_AMT_DAYS
+
+
 @dataclass(frozen=True)
 class ObvConfig:
     """OBV 파라미터. **기록·표시 전용이다.**
@@ -771,6 +794,7 @@ class Config:
     dividend: DividendConfig = DividendConfig()
     chart: ChartConfig = ChartConfig()
     obv: ObvConfig = ObvConfig()
+    reco_group: RecoGroupConfig = RecoGroupConfig()
 
 
 DEFAULT = Config()
