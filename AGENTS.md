@@ -399,6 +399,7 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
 `rebalance` 는 `data/holdings.csv`(커밋 금지 · 템플릿
 `data/holdings.csv.example`)의 비중 한도 위반과 줄일 금액만 콘솔에
 냅니다. 발송하지 않습니다.
+
 `weekly` 는 `WEEKLY_ANALYSIS_V2`(기본 OFF)가 켜졌을 때만 허스트 기록
 INSERT 순간에 락을 **기다리지 않고** 시도합니다. 점유 중이면 기록만
 건너뛰고 리포트는 그대로 냅니다(다른 잡을 막지 않습니다).

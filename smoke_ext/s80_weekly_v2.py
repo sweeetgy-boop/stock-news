@@ -263,6 +263,10 @@ def run(check, near, tmp):
                              ("VALUE", "TREND")[k % 2], "A", 8.0, 1.0, ""))
             if with_h:
                 con.executescript(_H_DDL)
+            else:
+                # H 병합 후 Store 가 indicator_log 를 만든다. '테이블 없음'
+                # 경로를 검사하려고 지운다.
+                con.execute("DROP TABLE IF EXISTS indicator_log")
             con.commit()
         return st, days
 
@@ -327,7 +331,8 @@ def run(check, near, tmp):
         # 테이블은 H·E 스키마 그대로 임시 DB 에만 만든다(병합 시 그쪽 DDL).
         samp = W.weekly_sample_dates(days)
         with closing(sqlite3.connect(st.path)) as con:
-            con.execute("CREATE TABLE risk_metrics(d TEXT, ticker TEXT, sigma_ewma REAL,"
+            # E 병합 후 Store 가 같은 스키마로 이미 만든다 → IF NOT EXISTS.
+            con.execute("CREATE TABLE IF NOT EXISTS risk_metrics(d TEXT, ticker TEXT, sigma_ewma REAL,"
                         " lam REAL, calc_version INTEGER, kind TEXT, created TEXT,"
                         " PRIMARY KEY(d, ticker, calc_version))")
             rows_h, rows_e = [], []
