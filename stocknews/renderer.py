@@ -901,6 +901,10 @@ def _tick_map(store, rows) -> dict:
 def render_morning_brief(store, asof, hours: int = 16,
                          per_section: int = 5) -> str:
     """아침 브리핑 (개장 전). 밤사이 해외 + 매크로 + 내 종목 순."""
+    from . import news_v2
+    if news_v2.enabled():           # [G] NEWS_V2 — OFF 면 아래 기존 경로 그대로
+        return news_v2.render_morning_v2(store, asof, hours=hours,
+                                         per_section=per_section)
     df = store.news_since(hours=hours)
     if df is None or df.empty:
         return (f"☀️ <b>[아침 브리핑]</b> {asof:%m/%d}\n\n"
@@ -940,6 +944,10 @@ def render_morning_brief(store, asof, hours: int = 16,
 def render_evening_brief(store, asof, picks: list | None = None,
                          hours: int = 12, per_section: int = 6) -> str:
     """저녁 브리핑 (장마감 후). 국내 뉴스 정리 + 추천 10선 교차."""
+    from . import news_v2
+    if news_v2.enabled():           # [G] NEWS_V2 — OFF 면 아래 기존 경로 그대로
+        return news_v2.render_evening_v2(store, asof, picks=picks, hours=hours,
+                                         per_section=per_section)
     df = store.news_since(hours=hours, region="KR")
     out = [f"🌙 <b>[저녁 뉴스 정리]</b> {asof:%Y-%m-%d %H:%M}"]
     if df is None or df.empty:

@@ -988,7 +988,15 @@ def mode_brief_morning(store: Store, args) -> int:
                      args.news_hours, hours, store.last_price_date())
     SUMMARY["news_hours"] = hours
     _emit(render_morning_brief(store, now_kst(), hours=hours), args.dry_run)
+    _news_v2_summary()
     return EXIT_OK
+
+
+def _news_v2_summary() -> None:
+    """[G] NEWS_V2 ON 일 때만 --json 에 렌더 요약을 싣는다. OFF 면 아무것도 안 한다."""
+    from stocknews import news_v2
+    if news_v2.enabled():
+        SUMMARY["news_v2"] = dict(news_v2.LAST_INFO)
 
 
 def mode_brief_evening(store: Store, args) -> int:
@@ -1010,6 +1018,7 @@ def mode_brief_evening(store: Store, args) -> int:
                                hours=args.news_hours), args.dry_run)
     SUMMARY.update({"news_hours": args.news_hours,
                     "picks": 0 if picks is None else len(picks)})
+    _news_v2_summary()
     # 텍스트 **뒤에** 관심종목 차트 앨범 1개. 텍스트는 이미 나갔으므로
     # 여기서 무엇이 실패해도 브리핑에는 영향이 없다(_send_charts 와 같은 격리).
     _send_watch_charts(store, args)
