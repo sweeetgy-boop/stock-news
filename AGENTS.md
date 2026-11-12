@@ -385,6 +385,7 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
 쓰기 모드: master backfill update flags credit credit-kiwoom daily exits
            news brief-morning brief-evening flash pos-open fill pos-close
            holidays (분기 1회 수동 · nightly 밖)
+           paper (추천 추적 갱신 · --backfill 소급 편입 · nightly 밖 1회성)
 읽기 모드: weekly fib export pos-list brief-weekly runs
            backtest credit-probe kiwoom-plan          (락 없음)
 ```

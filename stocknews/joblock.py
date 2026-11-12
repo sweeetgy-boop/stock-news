@@ -67,6 +67,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "pos-open": 120,
     "fill": 120,
     "pos-close": 120,
+    # [v2 D] 추천 추적 갱신 / 소급 편입(--backfill). nightly 밖 1회성.
+    "paper": 1800,
 }
 DEFAULT_TIMEOUT = 900
 

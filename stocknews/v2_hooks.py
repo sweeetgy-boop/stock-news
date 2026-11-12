@@ -68,5 +68,13 @@ def stop_hit_prob(store, d, ticker: str, price: float, stop: float,
 
 # ════════════════ [D] 추천 추적 — 주인: D·F ════════════════
 def tracked_tickers(store, d) -> set[str]:
-    """그 거래일 추적 중(paper_positions 활성)인 종목코드. 없으면 빈 집합."""
-    return set()
+    """그 거래일 추적 중(paper_positions 활성)인 종목코드. 없으면 빈 집합.
+
+    활성 = 편입됨 · 진입일 ≤ d · 진입일을 1일째로 센 d 가 20일째 미만.
+    PAPER_TRACKING 이 꺼져 있으면 빈 집합(= 지금과 같은 동작).
+    """
+    try:
+        from .paper import tracked_tickers as _tt
+        return _tt(store, d)
+    except Exception:  # noqa: BLE001 - 훅은 호출부를 막지 않는다
+        return set()
