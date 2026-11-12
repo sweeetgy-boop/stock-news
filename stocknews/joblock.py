@@ -67,6 +67,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "pos-open": 120,
     "fill": 120,
     "pos-close": 120,
+    # [H] 지표 소급 1회성. 전 종목 × 전 기간 약 1천만 행 쓰기.
+    "indicators-backfill": 3600,
 }
 DEFAULT_TIMEOUT = 900
 

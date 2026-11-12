@@ -362,10 +362,15 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     # 섹터 지표는 market_context 뒤에 둔다. 코스피 수익률을 그 기록에서
     # 가져다 쓰므로, 순서가 바뀌면 같은 날 지수를 두 번 조회한다.
     sec = collect_sector_metrics(store, trade_date, cfg=cfg)
+    # [H] 지표 기록 (INDICATOR_LOG ON 일 때만 · 기록 전용 · 예외를 삼킨다).
+    # 추천 저장 뒤라 점수·추천에 닿지 않는다. OFF 면 None 이고 아무것도 안 한다.
+    from .indicator_log import maybe_record_daily
+    ind = maybe_record_daily(store, trade_date)
 
     store.log_run("daily", started, len(results), len(errors),
                   note=f"snapshot={saved}, picks={len(picks)}")
 
     return {"trade_date": trade_date, "results": results, "errors": errors,
             "picks": picks, "snapshot_rows": saved,
-            "market_context": mkt, "sector_metrics": sec}
+            "market_context": mkt, "sector_metrics": sec,
+            "indicator_log": ind}
