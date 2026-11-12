@@ -203,7 +203,7 @@ _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "credit-kiwoom", "collect-dividends", "dividend-report",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
                 "flash", "pos-open", "fill", "pos-close", "holidays",
-                "reconcile"}
+                "reconcile", "hurst-backfill"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -885,6 +885,46 @@ def mode_weekly(store: Store, args) -> int:
             "compliance_pct": c.get("compliance_pct"),
         }
     _emit(render_weekly(rep, now_kst(), DEFAULT), args.dry_run)
+    _weekly_v2(store, args)
+    return EXIT_OK
+
+
+def _weekly_v2(store: Store, args) -> None:
+    """[I] 주간 분석. 플래그 OFF 이고 --weekly-v2 도 없으면 아무것도 안 한다.
+
+    기존 weekly 리포트가 먼저 나간 뒤에 돈다. 실패해도 weekly 의 종료
+    코드를 바꾸지 않는다(기록 전용 분석이 주간 리포트를 막으면 안 된다).
+    """
+    from stocknews import config as _C
+    if not (getattr(_C, "WEEKLY_ANALYSIS_V2", False)
+            or getattr(args, "weekly_v2", False)):
+        return
+    try:
+        from stocknews.weekly_v2 import run_weekly_v2
+        text, summ = run_weekly_v2(store, no_lock=args.no_lock)
+        SUMMARY["weekly_v2"] = summ
+        if args.dry_run or getattr(_C, "WEEKLY_V2_SEND", False):
+            _emit(text, args.dry_run)
+        log.info("주간 분석 v2 %.1f초 · 리포트 %s",
+                 summ.get("elapsed_sec", 0.0), summ.get("report_file"))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("주간 분석 v2 실패: %s", exc)
+        SUMMARY["weekly_v2"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def mode_hurst_backfill(store: Store, args) -> int:
+    """[I] 허스트(DFA) 소급 기록 — 1회성. 주별 표본일마다 kind='소급'.
+
+    indicator_log 가 없으면(H 미병합) 전제조건 미충족 exit 4.
+    """
+    from stocknews.weekly_v2 import hurst_backfill
+    res = hurst_backfill(store)
+    SUMMARY["hurst_backfill"] = res
+    if res.get("reason"):
+        log.error("허스트 소급 불가: %s", res["reason"])
+        return EXIT_PRECOND
+    log.info("허스트 소급 %d일 · %d행 기록 · %.1f초", res["dates"],
+             res["written"], res["elapsed_sec"])
     return EXIT_OK
 
 
@@ -2034,6 +2074,7 @@ MODES = {
     "reconcile": mode_reconcile,
     "daily": mode_daily,
     "weekly": mode_weekly,
+    "hurst-backfill": mode_hurst_backfill,
     "fib": mode_fib,
     "flash": mode_flash,
     "news": mode_news,
@@ -2087,6 +2128,9 @@ def main(argv=None) -> int:
     ap.add_argument("--monthly", action="store_true",
                     help="weekly 에 전월 회고를 강제로 붙인다 "
                          "(기본: 매월 첫 금요일에만 자동)")
+    ap.add_argument("--weekly-v2", action="store_true",
+                    help="weekly: 주간 분석 v2 를 플래그와 무관하게 1회 실행 "
+                         "(WEEKLY_ANALYSIS_V2)")
     ap.add_argument("--horizon", type=int, default=5,
                     help="자기검증 보유 가정 거래일수")
     ap.add_argument("--ignore-window", action="store_true",

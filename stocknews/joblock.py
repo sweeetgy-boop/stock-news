@@ -63,6 +63,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "brief-morning": 900,
     "brief-evening": 900,
     "credit": 300,
+    # [I] 허스트 소급 1회성. 주별 표본일 x 전 종목 DFA (실측 수십 초).
+    "hurst-backfill": 900,
     # 사람이 직접 치는 명령. 즉시 끝난다.
     "pos-open": 120,
     "fill": 120,
