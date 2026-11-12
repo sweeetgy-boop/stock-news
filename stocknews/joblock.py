@@ -67,6 +67,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "pos-open": 120,
     "fill": 120,
     "pos-close": 120,
+    # [E] σ 소급 (1회성). 전 거래일 × 전종목, 실측 수 분.
+    "risk-backfill": 1800,
 }
 DEFAULT_TIMEOUT = 900
 

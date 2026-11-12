@@ -385,9 +385,14 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
 쓰기 모드: master backfill update flags credit credit-kiwoom daily exits
            news brief-morning brief-evening flash pos-open fill pos-close
            holidays (분기 1회 수동 · nightly 밖)
+           risk-backfill (σ 소급 1회성 · nightly 밖 · 지시가 있을 때만)
 읽기 모드: weekly fib export pos-list brief-weekly runs
-           backtest credit-probe kiwoom-plan          (락 없음)
+           backtest credit-probe kiwoom-plan rebalance (락 없음)
 ```
+
+`rebalance` 는 `data/holdings.csv`(커밋 금지 · 템플릿
+`data/holdings.csv.example`)의 비중 한도 위반과 줄일 금액만 콘솔에
+냅니다. 발송하지 않습니다.
 
 이 두 목록과 `stocknews/joblock.py` 의 `MODE_TIMEOUTS` 키 집합이 정확히
 일치해야 합니다. 스모크 테스트가 강제합니다. 예전에는 락을 잡지 않는

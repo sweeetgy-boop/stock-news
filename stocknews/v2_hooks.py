@@ -56,14 +56,48 @@ def exclusion_line(store, d) -> str | None:
 
 # ════════════════ [E] 위험 정보 — 주인: E ════════════════
 def sigma_on(store, d, ticker: str) -> float | None:
-    """그 거래일 종목의 EWMA 일간 변동성 σ (소수, 예: 0.023). 없으면 None."""
-    return None
+    """그 거래일 종목의 EWMA 일간 변동성 σ (소수, 예: 0.023). 없으면 None.
+
+    · config.RISK_INFO 가 꺼져 있으면 항상 None (= 지금과 같은 동작).
+      호출부가 플래그를 따로 볼 필요가 없다.
+    · risk_metrics 기록(현재 calc_version)이 있으면 그 값, 없으면 같은
+      정의로 그날까지의 시세에서 즉석 계산한다(쓰지 않는다).
+    · d 가 거래일이 아니면 그 이전 마지막 거래일. 그날 종목 행이 없거나
+      (정지) 표본 부족·수정주가 불연속 직후면 None.
+    · 정의: σ²_t = 0.94·σ²_{t-1} + 0.06·r_t², r = 종가 로그수익률(평균 0),
+      최근 120거래일 창, 60개 미만·불연속 뒤 60거래일은 None
+      (stocknews/risk.py 모듈 docstring).
+
+    "평소 출렁임의 n배" (D·F ③ 요약)
+      n = ln(1 + R) / (σ · √h)    R = 보유 수익률(소수), h = 보유 거래일
+      σ 는 **기준일(추천 이벤트일)** 의 값으로 묻는다 — 움직인 뒤의 σ 는
+      그 움직임으로 부풀어 n 이 작게 나온다. 계산은
+      `stocknews.risk.move_multiple(R, σ, h)` (부호 유지, 표시는 |n|배).
+    """
+    from . import risk
+    if not risk.enabled():
+        return None
+    try:
+        return risk.sigma_on(store, d, ticker)
+    except Exception:  # noqa: BLE001 - 표시 전용. 실패 = 데이터 없음
+        return None
 
 
 def stop_hit_prob(store, d, ticker: str, price: float, stop: float,
                   days: int = 20) -> float | None:
-    """price 에서 days 거래일 안에 stop 에 닿을 확률(0~1). 없으면 None."""
-    return None
+    """price 에서 days 거래일 안에 stop 에 닿을 확률(0~1). 없으면 None.
+
+    모형: 로그 드리프트 0 기하 브라운 운동 + 반사원리,
+          P = 2·Φ( ln(B'/P) / (σ√T) ),  B' = stop·exp(-0.5826·σ)
+          (종가 판정에 맞춘 Broadie–Glasserman–Kou 이산 관측 보정).
+    σ = sigma_on(store, d, ticker). 플래그 OFF·σ 없음이면 None.
+    경계: price ≤ stop → 1.0 · days ≤ 0 → 0.0 · stop ≤ 0 → 0.0.
+    """
+    sigma = sigma_on(store, d, ticker)
+    if sigma is None:
+        return None
+    from . import risk
+    return risk.stop_hit_probability(price, stop, sigma, days)
 
 
 # ════════════════ [D] 추천 추적 — 주인: D·F ════════════════

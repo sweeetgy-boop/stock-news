@@ -816,6 +816,56 @@ PRICE_JUMP_BREAK_PCT = 30.0
 
 # ── [E] 위험 정보 ──
 # (E 구역 시작)
+# 기록·표시 전용. 점수·등급·추천 선정에 들어가지 않는다 (stocknews/risk.py).
+# OFF = 지금과 같다: risk_metrics 기록 안 함 · 차트에 원뿔 없음 · 캡션에
+# 도달 확률 없음 · weekly 에 원뿔 적중률 없음 · 훅(sigma_on/stop_hit_prob)
+# 이 None 을 준다. 리밸런싱 리포트(--mode rebalance)는 사람이 직접 치는
+# 읽기 전용 명령이라 이 플래그와 무관하다.
+RISK_INFO = False
+
+# EWMA 일간 변동성 σ.
+#   σ²_t = λ·σ²_{t-1} + (1-λ)·r_t²     r_t = ln(C_t / C_{t-1}), 평균 0 가정
+# λ = 0.94 는 J.P. Morgan RiskMetrics(1996) 기술문서의 일간 권고값이다.
+# 반감기 ln(0.5)/ln(0.94) ≈ 11.2거래일 — 최근 두 주의 출렁임이 절반을
+# 차지한다. 20일 원뿔을 그리는 용도에 맞는 기억 길이다. 값을 바꾸면
+# RISK_CALC_VERSION 도 올린다 (같은 날짜에 다른 정의의 σ 가 섞이지 않게).
+RISK_EWMA_LAMBDA = 0.94
+# 그날까지 최근 이 수의 수익률만 쓴다(그날 이후 데이터는 쓰지 않는다).
+# 0.94^100 ≈ 0.2% — 창 밖 데이터의 가중치는 무시할 만하다.
+RISK_SIGMA_WINDOW = 120
+# 처음 이 수의 수익률은 r² 평균으로 시작값을 만든다(시드).
+RISK_SIGMA_SEED = 20
+# (재)시작 후 유효 수익률이 이만큼 쌓이기 전에는 σ = NULL.
+# 시드 가중치가 0.94^(60-20) ≈ 8% 아래로 떨어지는 지점이다.
+RISK_SIGMA_MIN_OBS = 60
+# 계산 정의 버전. risk_metrics PK 의 일부. 정의가 바뀌면 올린다.
+RISK_CALC_VERSION = 1
+# 예상 범위(원뿔)·손절선 도달 확률의 기간(거래일).
+RISK_HORIZON_DAYS = 20
+# 원뿔 적중률은 이 미만 표본이면 '표본 부족'.
+RISK_CONE_MIN_N = 20
+
+# ── 리밸런싱 리포트 (--mode rebalance, data/holdings.csv) ──
+# 한도는 '평가액 비중' 기준. 위반 판정 = 비중 > 한도 + 밴드.
+# 위반이면 '한도까지' 줄일 금액을 보인다(밴드 안쪽 경계가 아니라 한도).
+# 밴드는 매일 조금씩 넘나드는 것을 위반으로 세지 않기 위한 여유다.
+REBAL_MAX_STOCK_PCT = 10.0       # 개별 종목(ETF/ETN 포함 단일 코드)
+REBAL_MAX_SECTOR_PCT = 30.0      # 섹터
+REBAL_MAX_LEVERAGE_PCT = 10.0    # 레버리지·인버스 ETF/ETN 합계
+REBAL_BAND_PCT = 5.0             # 허용 밴드 ±%p
+REBAL_HOLDINGS_FILE = "data/holdings.csv"
+# ETF/ETN 섹터 수동 표. 코드 → 섹터 이름. 없는 ETF/ETN 은 "ETF(미분류)" /
+# "ETN(미분류)" 섹터로 묶인다. 주식 섹터(tickers.sector)와 같은 이름을
+# 쓰면 같은 섹터로 합산된다.
+ETF_SECTOR_OVERRIDE: dict = {
+    # "069500": "시장 대표(KOSPI200)",
+    # "091160": "반도체 제조업",
+}
+# 레버리지·인버스 판정. 이름에 이 단어가 있으면 레버리지로 센다.
+# 판정이 틀리면 아래 수동 표로 덮는다(코드 → True/False).
+REBAL_LEVERAGE_KEYWORDS = ("레버리지", "인버스", "2X", "3X", "곱버스",
+                           "-1X", "-2X", "-3X", "2배", "3배")
+REBAL_LEVERAGE_OVERRIDE: dict = {}
 # (E 구역 끝)
 
 # ── [G] 뉴스 ──

@@ -42,6 +42,29 @@ __all__ = ["apply"]
 
 # ── [E] 위험 정보 ──
 # (E 구역 시작)
+# 종목별 EWMA 일간 변동성 σ (stocknews/risk.py). 기록 전용.
+#   sigma_ewma    일간 σ, 소수(0.023 = 2.3%). NULL 행은 쓰지 않는다.
+#   lam           그 행을 계산한 λ
+#   calc_version  config.RISK_CALC_VERSION. 정의가 바뀌면 새 버전으로 쌓인다
+#   kind          '실시간' = daily 스캔 단계가 그날 기록 (그날까지 데이터만)
+#                 '소급'   = --mode risk-backfill 이 과거 날짜를 채움
+#                 같은 정의·같은 입력이라 값은 같다. 실시간 행이 이긴다
+#                 (소급은 INSERT OR IGNORE, 실시간은 INSERT OR REPLACE).
+# 스키마는 I 묶음(상관 행렬·GARCH 비교)과의 계약이다. 바꾸지 않는다.
+DDL_E = """
+CREATE TABLE IF NOT EXISTS risk_metrics (
+    d            TEXT NOT NULL,
+    ticker       TEXT NOT NULL,
+    sigma_ewma   REAL,
+    lam          REAL,
+    calc_version INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    created      TEXT,
+    PRIMARY KEY (d, ticker, calc_version)
+);
+CREATE INDEX IF NOT EXISTS idx_risk_metrics_ticker
+    ON risk_metrics(ticker, d);
+"""
 # (E 구역 끝)
 
 

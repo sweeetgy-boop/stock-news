@@ -581,7 +581,7 @@ def weekly_report(store, cfg: Config = DEFAULT, week_days: int = 5,
     week_scan_days = sorted(scans["d"].unique())[-week_days:] if not scans.empty else []
     week_scans = scans[scans["d"].isin(week_scan_days)] if week_scan_days else scans
 
-    return {
+    rep = {
         "trade_date": store.last_price_date(),
         "days_covered": len(week_scan_days),
         "universe_size": int(week_scans["ticker"].nunique()) if not week_scans.empty else 0,
@@ -597,3 +597,11 @@ def weekly_report(store, cfg: Config = DEFAULT, week_days: int = 5,
         # 네 번 보게 되고, 그러면 읽지 않는다.
         "monthly": monthly_review(store, cfg=cfg) if want_monthly else None,
     }
+    # [E] 원뿔 적중률. RISK_INFO ON 일 때만 키가 생긴다(OFF = 지금과 같다).
+    from . import risk
+    if risk.enabled():
+        try:
+            rep["cone"] = risk.cone_hit_rate(store)
+        except Exception as exc:  # noqa: BLE001 - 기록·표시 전용
+            log.warning("원뿔 적중률 집계 실패: %s", exc)
+    return rep
