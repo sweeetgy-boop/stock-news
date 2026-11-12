@@ -334,8 +334,8 @@ def bt_section(db: str, bt_dir: Path, stamp: str | None,
         "stop_fixed_net": _m(stop, "net"),
     }
 
-    n_s = int((E["grade"] == "S+").sum())
-    n_a = int((E["grade"] == "A").sum())
+    n_s = int(E.loc[E["grade"] == "S+", "alpha_10"].notna().sum())
+    n_a = int(E.loc[E["grade"] == "A", "alpha_10"].notna().sum())
     new.update({"events": len(E), "cands": len(C), "tickers": E["ticker"].nunique(),
                 "period": f"{E['date'].min()[:7]} ~ {E['date'].max()[:7]}",
                 "n_stop": len(stop), "n_both": len(both), "n_s": n_s, "n_a": n_a,
