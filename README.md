@@ -24,7 +24,7 @@ stocknews/
   universe.py    전종목 목록 · 배제 필터 · 시세 적재
   daily.py       저녁 전종목 스캔 → 추천 10선 (슬롯 배정 + 섹터 분산)
   weekly.py      금요일 누적 분석 (자기검증 · 모멘텀 · 연속등재 · ETA)
-  news_sources.py 뉴스 수집 (네이버금융 · Google News RSS · Yahoo · DART)
+  news_sources.py 뉴스 수집 (네이버 증권 API · Google News RSS · Yahoo · DART)
   news.py        뉴스 정리 (중복제거 · 사건 클러스터 · 종목태깅 · 중요도)
   exits.py       청산 규칙 엔진 (8계층 우선순위)
   flags.py       배제 플래그 공급원 (FDR 관리종목 · DART · 로컬 · 수동)
@@ -694,9 +694,11 @@ data/export/tickers_20260824.csv        종목 마스터
 - `backfill`은 KRX 스크래핑이므로 `--throttle` 을 너무 낮추면 차단될 수 있다.
   기본 0.35초를 권한다.
 - 자기검증(①)의 표본이 최소 4주 이상 쌓이기 전에는 승률 수치를 신뢰하지 말 것.
-- 네이버 금융은 마크업을 자주 바꾼다. 셀렉터 5개를 순차 시도하고 전부
-  실패하면 경고만 남기고 다른 소스로 넘어간다. 로그에 `셀렉터 미매칭`이
-  보이면 셀렉터를 갱신해야 한다.
+- 네이버 뉴스는 `stock.naver.com` 의 JSON API(list · focus)로 받는다
+  (2026-11-12 HTML 셀렉터에서 교체). 실패하면 경고에 원인(리다이렉트·HTTP
+  코드·JSON 아님·구조 변경)을 남기고 다른 소스로 넘어간다. 소스별 건수는
+  runs.note 의 `news_sources=` 에 남고, 평일 3회 연속 0건이면 관리자 채팅에
+  알린다(AGENTS.md 9장).
 - 뉴스 브리핑 시각 판단은 KST 고정이다(`store._now_kst`). 다만 `notify.py`와
   일부 렌더러는 아직 `datetime.now()` 로컬 시간을 쓴다. UTC 서버에서
   `flash` 시간창이 열리지 않으므로 배포 전에 서버 타임존을 KST로 맞추거나

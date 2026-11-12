@@ -966,6 +966,17 @@ NEWS_V2_FX: tuple[str, str] = ("원/달러", "USD/KRW")
 NEWS_V2_US_CLOSE_BUFFER_MIN = 15
 # 마감 봉이 이 달력일보다 오래됐으면 그 줄을 뺀다(소스가 멈춘 경우).
 NEWS_V2_MARKET_MAX_AGE_DAYS = 5
+# 네이버 증권 JSON API (news_sources.collect_naver). 2026-11-12 실측: pageSize=20
+# 에 20건, focus 는 date·enableFallback 없으면 빈 결과라 maxDays 와 함께 보낸다.
+NAVER_API_PAGE_SIZE = 20
+NAVER_FOCUS_MAX_DAYS = 7
+# 뉴스 소스 건강(stocknews/news_health.py). 평일 수집 회차(news 잡·nightly news
+# 단계·수집하는 브리핑)에서 한 소스가 이 횟수 연속 0건이면 관리자 채팅에 한 번
+# 알린다. 휴장일 회차와 그 소스를 끈 회차는 세지 않는다(연속도 끊지 않는다).
+# 평일 수집은 하루 3회(06:00 · 21:30 · 23:00)라 3 = 대략 하루.
+NEWS_SOURCE_ZERO_STREAK = 3
+# 연속 판정에 읽는 runs 이력 범위(일). 연휴(최장 5일)를 넘겨 이어 세려면 여유가 필요.
+NEWS_SOURCE_HISTORY_DAYS = 14
 # (G 구역 끝)
 
 # ── [H] 지표 기록 ──

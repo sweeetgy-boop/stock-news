@@ -308,8 +308,11 @@ def run(check, near, tmp):
             C.REGIME_BANNER = False
             RS.mode_brief_morning(s, A())
             RS.mode_brief_evening(s, A())
-            assert sent[0] == render_morning_brief(s, fixed, hours=16)
-            assert sent[1] == render_evening_brief(s, fixed, picks=None, hours=16)
+            # [G] 맨 아래 '뉴스 소스 n개 중 m개 수집' 한 줄(사용자 지시 추가)만 뺀다
+            from stocknews.news_health import remove_line
+            assert all("뉴스 소스 " in t for t in sent[:2]), sent[:2]
+            assert remove_line(sent[0]) == render_morning_brief(s, fixed, hours=16)
+            assert remove_line(sent[1]) == render_evening_brief(s, fixed, picks=None, hours=16)
             C.REGIME_BANNER = True
             RS.mode_brief_morning(s, A())
             RS.mode_brief_evening(s, A())

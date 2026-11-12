@@ -9,7 +9,7 @@ RSS 2.0 과 Atom 태그 이름 차이만 흡수하면 되고, 그러면 requirem
 
 수집 경로
 --------
-  NAVER  : 네이버 금융 주요뉴스/실시간 속보 (HTML)
+  NAVER  : 네이버 증권 주요뉴스·시황·종목분석 (JSON API)
   GOOGLE : Google News RSS 검색 (한국어. 국내외 모두 커버, 가장 안정적)
   YAHOO  : Yahoo Finance 종목별 RSS (미국 개별주 원문)
   DART   : Open DART 공시 목록 API (DART_API_KEY 필요, 없으면 건너뜀)
@@ -19,13 +19,15 @@ RSS 2.0 과 Atom 태그 이름 차이만 흡수하면 되고, 그러면 requirem
 """
 from __future__ import annotations
 
+import html
+import json
 import logging
 import os
 import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,7 +42,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 TIMEOUT = 8.0
 
 __all__ = ["NewsItem", "GOOGLE_QUERIES", "YAHOO_SYMBOLS", "collect_all",
-           "collect_naver", "collect_google", "collect_yahoo", "collect_dart"]
+           "collect_naver", "collect_google", "collect_yahoo", "collect_dart",
+           "enabled_sources", "SOURCE_LABELS", "LAST_WARN"]
 
 
 class NewsItem(dict):
@@ -92,8 +95,13 @@ def _get(url: str, **kw) -> requests.Response | None:
             if res.status_code == 200:
                 return res
             if res.status_code in (429, 503):
+                if attempt == 2:
+                    log.warning("요청 실패 %s: HTTP %d (재시도 소진)",
+                                url[:70], res.status_code)
                 time.sleep(2 ** attempt + random.random())
                 continue
+            # 예전에는 조용히 None 이었다 — 원인이 '0건' 뒤로 숨었다.
+            log.warning("요청 실패 %s: HTTP %d", url[:70], res.status_code)
             return None
         except requests.RequestException as exc:
             if attempt == 2:
@@ -161,56 +169,165 @@ def _parse_feed(xml_text: str) -> list[dict]:
     return out
 
 
-# ══════════════════════════ 네이버 금융 ══════════════════════════
-_NAVER_PAGES = (
-    ("https://finance.naver.com/news/mainnews.naver", "주요뉴스"),
-    ("https://finance.naver.com/news/news_list.naver"
-     "?mode=LSS2D&section_id=101&section_id2=258", "시황·전망"),
-    ("https://finance.naver.com/news/news_list.naver"
-     "?mode=LSS2D&section_id=101&section_id2=402", "종목분석"),
+# ══════════════════════════ 네이버 증권 (JSON API) ══════════════════════════
+# 2026-09-09~10 사이 finance.naver.com/news/* 가 302 → stock.naver.com(Next.js
+# SPA)로 넘어갔다. 그 HTML 에는 기사가 없어 예전 셀렉터 5개가 전부 0건이었고,
+# 경고는 '셀렉터 미매칭' 뿐이라 원인(리다이렉트)이 가려졌다 — news 단계는 63일
+# 동안 rc 0 이었다. 이제 SPA 가 부르는 JSON API 를 직접 부른다.
+#
+#   list  : /api/domestic/news/list?category=mainnews&page=1&pageSize=N
+#           {"articles":[{officeId, officeHname, articleId, title,
+#                         "datetime":"2026-11-12 15:14:14", ...}]}
+#   focus : /api/domestic/news/focus?sid=S&page=1&pageSize=N&date=YYYYMMDD
+#           &enableFallback=true&maxDays=7   (date·enableFallback 없으면 빈 결과)
+#           {"articles":[{officeID, officeHName, articleID, title,
+#                         "date":"20261112154213", "url":"https://n.news..."}]}
+#
+# 두 엔드포인트의 키 대소문자가 다르다(officeId vs officeID). 파서가 둘 다 받는다.
+# focus 의 sid 는 새 체계다: 401 시황·전망 · 402 종목분석 (예전 '시황·전망'은 258).
+# source 라벨은 예전 그대로 "네이버금융" — make_id·클러스터·애그리게이터 처리를
+# 바꾸지 않기 위해서다(매체명으로 바꾸면 다른 출처와의 중복 판정이 달라진다).
+_NAVER_API = "https://stock.naver.com/api/domestic/news"
+_NAVER_FEEDS: tuple[tuple[str, dict, str], ...] = (
+    ("list", {"category": "mainnews"}, "주요뉴스"),
+    ("focus", {"sid": "401"}, "시황·전망"),
+    ("focus", {"sid": "402"}, "종목분석"),
 )
+_NAVER_HEADERS = {"Accept": "application/json",
+                  "Referer": "https://stock.naver.com/news/mainnews"}
+_NAVER_ARTICLE = "https://n.news.naver.com/mnews/article/{office}/{article}"
+_NAVER_TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y%m%d%H%M%S", "%Y%m%d%H%M",
+                       "%Y-%m-%dT%H:%M:%S")
+
+# 소스 라벨 → 이번 수집의 경고(원인). collect_all 이 매번 비운다.
+# 관리자 알림(news_health)이 '왜 0건인가' 를 이 값으로 적는다.
+LAST_WARN: dict[str, str] = {}
+
+
+def naver_feed_url(kind: str, params: dict, page_size: int,
+                   day: str | None = None, max_days: int = 7) -> str:
+    """엔드포인트 URL. focus 는 date·enableFallback 이 없으면 빈 결과다."""
+    q = dict(params)
+    q.update({"page": 1, "pageSize": int(page_size)})
+    if kind == "focus":
+        q.update({"date": day or datetime.now(KST).strftime("%Y%m%d"),
+                  "enableFallback": "true", "maxDays": int(max_days)})
+    return f"{_NAVER_API}/{kind}?" + "&".join(f"{k}={v}" for k, v in q.items())
+
+
+def naver_fetch_json(url: str) -> tuple[object | None, str | None]:
+    """JSON 을 받는다. 반환 (data, 실패 원인). 성공이면 원인 None.
+
+    리다이렉트를 따라가지 않는다 — 따라가면 SPA HTML 이 200 으로 와서
+    '기사 없음' 으로 보이고 원인이 사라진다. 2026-09 에 그렇게 63일을 놓쳤다.
+    """
+    why = None
+    for attempt in range(3):
+        try:
+            res = requests.get(url, headers={"User-Agent": UA,
+                                             "Accept-Language": "ko,en;q=0.8",
+                                             **_NAVER_HEADERS},
+                               timeout=TIMEOUT, allow_redirects=False)
+        except requests.RequestException as exc:
+            why = f"{type(exc).__name__}: {str(exc)[:120]}"
+            time.sleep(1.0 + attempt)
+            continue
+        code = res.status_code
+        if code in (429, 503):
+            why = f"HTTP {code}"
+            time.sleep(2 ** attempt + random.random())
+            continue
+        return naver_decode(code, res.headers or {}, res.content)
+    return None, why
+
+
+def naver_decode(status: int, headers, body
+                 ) -> tuple[object | None, str | None]:
+    """응답 → (data, 원인). 네트워크 없이 검사할 수 있게 분리했다."""
+    if 300 <= int(status) < 400:
+        loc = headers.get("Location") or headers.get("location") or "?"
+        return None, f"리다이렉트 {status} → {str(loc)[:100]}"
+    if int(status) != 200:
+        return None, f"HTTP {status}"
+    try:
+        text = body.decode("utf-8") if isinstance(body, bytes) else str(body)
+        return json.loads(text), None
+    except (ValueError, UnicodeDecodeError):
+        ctype = headers.get("Content-Type") or headers.get("content-type") or "?"
+        return None, f"JSON 아님 (content-type={str(ctype)[:60]})"
+
+
+def _parse_naver_time(text) -> datetime | None:
+    """'2026-11-12 15:14:14'(list) · '20261112154213'(focus) → KST aware."""
+    if not text:
+        return None
+    t = str(text).strip()
+    for fmt in _NAVER_TIME_FORMATS:
+        try:
+            return datetime.strptime(t, fmt).replace(tzinfo=KST)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_naver_articles(data, cat: str, limit: int | None = None
+                         ) -> tuple[list[dict], str | None]:
+    """API 응답 → NewsItem 목록. 반환 (items, 원인). 0건이면 원인을 적는다."""
+    if not isinstance(data, dict) or not isinstance(data.get("articles"), list):
+        keys = list(data)[:6] if isinstance(data, dict) else type(data).__name__
+        return [], f"응답 구조 변경 (articles 없음 · {keys})"
+    out: list[dict] = []
+    for a in data["articles"]:
+        if not isinstance(a, dict):
+            continue
+        title = html.unescape(str(a.get("title") or "")).strip()
+        office = a.get("officeId") or a.get("officeID")
+        article = a.get("articleId") or a.get("articleID")
+        url = a.get("url") or (_NAVER_ARTICLE.format(office=office,
+                                                     article=article)
+                               if office and article else "")
+        if not title or not url:
+            continue
+        out.append({
+            "title": title,
+            "url": url,
+            "source": "네이버금융",
+            "origin": "NAVER",
+            "region": "KR",
+            "category_hint": cat,
+            "published": _parse_naver_time(a.get("datetime") or a.get("date")),
+            "lang": "ko",
+        })
+        if limit is not None and len(out) >= limit:
+            break
+    return out, (None if out else "기사 0건")
 
 
 def collect_naver(limit_per_page: int = 40) -> list[dict]:
-    """네이버 금융 뉴스 목록 (HTML 파싱).
+    """네이버 증권 뉴스 (JSON API). 엔드포인트별로 실패를 격리한다.
 
-    네이버는 마크업을 자주 바꾼다. 셀렉터를 여러 개 시도하고
-    전부 실패하면 빈 리스트를 돌려 다른 소스로 넘긴다.
+    실패·0건이면 원인(리다이렉트 302 → …, HTTP 404, JSON 아님, 구조 변경)을
+    경고로 남기고 LAST_WARN["naver"] 에 모은다.
     """
+    from .config import NAVER_API_PAGE_SIZE, NAVER_FOCUS_MAX_DAYS
     out: list[dict] = []
-    selectors = (".newsList .articleSubject a", "dl.newsList dd.articleSubject a",
-                 ".block1 .articleSubject a", "ul.newsList li a", "td.title a")
-    for url, cat in _NAVER_PAGES:
-        res = _get(url)
-        if res is None:
-            continue
-        res.encoding = res.apparent_encoding or "euc-kr"
-        soup = BeautifulSoup(res.text, "lxml")
-        links = []
-        for sel in selectors:
-            links = soup.select(sel)
-            if links:
-                break
-        if not links:
-            log.warning("네이버 뉴스 셀렉터 미매칭: %s", url[:60])
-            continue
-        for a in links[:limit_per_page]:
-            title = a.get_text(strip=True)
-            href = a.get("href", "")
-            if not title or not href:
-                continue
-            out.append({
-                "title": title,
-                "url": urljoin("https://finance.naver.com", href),
-                "source": "네이버금융",
-                "origin": "NAVER",
-                "region": "KR",
-                "category_hint": cat,
-                "published": None,
-                "lang": "ko",
-            })
-        time.sleep(0.4)
-    log.info("네이버 금융 %d건", len(out))
+    warns: list[str] = []
+    size = max(1, min(int(limit_per_page), int(NAVER_API_PAGE_SIZE)))
+    for i, (kind, params, cat) in enumerate(_NAVER_FEEDS):
+        if i:
+            time.sleep(0.4)
+        url = naver_feed_url(kind, params, size, max_days=NAVER_FOCUS_MAX_DAYS)
+        data, why = naver_fetch_json(url)
+        items: list[dict] = []
+        if why is None:
+            items, why = parse_naver_articles(data, cat, limit=limit_per_page)
+        if why:
+            log.warning("네이버 뉴스 %s 0건 — %s (%s)", cat, why, url[:90])
+            warns.append(f"{cat}: {why}")
+        out.extend(items)
+    if warns:
+        LAST_WARN["naver"] = " · ".join(warns)[:300]
+    log.info("네이버 증권 %d건", len(out))
     return out
 
 
@@ -374,10 +491,31 @@ def _collect_dart_market(key: str, market: str, start, end,
 
 
 # ══════════════════════════ 통합 ══════════════════════════
+# 소스 라벨(수집 순서). runs.note 의 news_sources= 와 관리자 알림이 이 이름을 쓴다.
+SOURCE_LABELS: tuple[str, ...] = ("naver", "google", "yahoo", "dart")
+
+
+def enabled_sources(use_naver: bool = True, use_google: bool = True,
+                    use_yahoo: bool = True, use_dart: bool = True
+                    ) -> tuple[str, ...]:
+    """켜진 소스. DART 는 키(DART_API_KEY)가 없으면 꺼진 것으로 본다 —
+    collect_dart 가 조회 없이 건너뛰므로 '0건' 으로 세면 매일 오탐이 된다."""
+    flags = {"naver": use_naver, "google": use_google, "yahoo": use_yahoo,
+             "dart": use_dart and bool(os.getenv("DART_API_KEY"))}
+    return tuple(k for k in SOURCE_LABELS if flags[k])
+
+
 def collect_all(use_naver: bool = True, use_google: bool = True,
-                use_yahoo: bool = True, use_dart: bool = True) -> list[dict]:
-    """전 소스 수집. 소스별 실패를 개별 격리한다."""
+                use_yahoo: bool = True, use_dart: bool = True,
+                counts: dict | None = None) -> list[dict]:
+    """전 소스 수집. 소스별 실패를 개별 격리한다.
+
+    counts 를 주면 **켜진 소스**의 수집 건수(중복 제거 전 원본)를 채운다.
+    예외로 죽은 소스는 0 이다. 끈 소스(--no-naver, DART 키 없음)는 넣지 않는다.
+    """
     items: list[dict] = []
+    LAST_WARN.clear()
+    active = enabled_sources(use_naver, use_google, use_yahoo, use_dart)
     jobs = (
         ("naver", use_naver, collect_naver),
         ("google", use_google, collect_google),
@@ -387,9 +525,14 @@ def collect_all(use_naver: bool = True, use_google: bool = True,
     for label, enabled, fn in jobs:
         if not enabled:
             continue
+        got: list = []
         try:
-            items.extend(fn())
+            got = fn() or []
         except Exception as exc:  # noqa: BLE001 - 소스 격리
             log.warning("수집기 %s 실패: %s", label, exc)
+            LAST_WARN[label] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        items.extend(got)
+        if counts is not None and label in active:
+            counts[label] = len(got)
     log.info("뉴스 수집 합계 %d건", len(items))
     return items

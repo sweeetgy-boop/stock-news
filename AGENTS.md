@@ -757,8 +757,20 @@ requirements.txt  그 버전용 휠로 재고정
 - 이 시스템은 투자 조언이 아닙니다. `DISCLAIMER.md` 를 참조하십시오.
 - PC 가 절전/최대 절전으로 들어가면 cron 이 돌지 않습니다. 전원 옵션에서
   절전을 끄거나, 깨우기 타이머를 허용해야 스케줄이 유지됩니다.
-- 네이버 금융은 마크업을 자주 바꿉니다. 로그에 `셀렉터 미매칭` 이 보이면
-  `stocknews/news_sources.py` 의 셀렉터를 갱신해야 합니다.
+- **네이버 뉴스는 JSON API 로 받습니다** (2026-11-12 교체). 2026-09-09~10 에
+  `finance.naver.com/news` 가 302 로 `stock.naver.com`(SPA)에 넘어가 HTML
+  셀렉터가 63일 동안 0건이었는데 news 단계는 rc 0 이었습니다. 지금은
+  `stock.naver.com/api/domestic/news/{list,focus}` 를 리다이렉트를 따라가지
+  않고 부르고, 실패하면 경고에 원인(`리다이렉트 302 → …` / `HTTP 404` /
+  `JSON 아님` / `응답 구조 변경`)을 남깁니다. 응답 표본과 오프라인 검사는
+  `smoke_ext/fixtures/naver_*.json` · `smoke_ext/s61_naver_api.py`.
+- **뉴스 소스별 수집 건수가 runs.note 에 남습니다** (`news_sources=naver:60,
+  google:197,…` · 끈 소스는 키 없음 · DART 키 없으면 끈 것). 평일 수집 회차
+  (06:00 news · nightly news 단계 · 수집하는 브리핑)에서 한 소스가
+  `NEWS_SOURCE_ZERO_STREAK`(3)회 연속 0건이면 **관리자 채팅에만** 한 번
+  알리고, 복구되면 한 번 더 알립니다(상태가 바뀔 때만 · 휴장일 회차는 세지
+  않음). 아침·저녁 브리핑 맨 아래에 `뉴스 소스 n개 중 m개 수집` 한 줄이
+  붙습니다(n = 켜진 소스, m = 브리핑 창 안 수집 회차에서 1건 이상 받은 소스).
 
 ---
 
