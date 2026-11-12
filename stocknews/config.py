@@ -992,6 +992,9 @@ IND_KALMAN_OBS_VAR = 2.5e-4      # 관측 잡음 R  (일 1.58%)
 IND_KALMAN_LEVEL_VAR = 1.0e-4    # 수준 잡음 Qμ (일 1.0%)
 IND_KALMAN_SLOPE_VAR = 4.0e-7    # 기울기 잡음 Qβ (일 0.063%p)
 IND_KALMAN_P0_SLOPE = 1.0e-4     # 초기 기울기 분산 (일 1%) · 초기 수준 분산 = R
+# 지표 소급 명령의 기본 범위(거래일). 전 기간은 --ind-all. 2026-11-12:
+# 전 기간 470일 = DB +약 560MB, 최근 250일 = +약 260MB (사본 실측).
+INDICATOR_BACKFILL_DAYS = 250
 # (H 구역 끝)
 
 # ── [I] 주간 분석 ──

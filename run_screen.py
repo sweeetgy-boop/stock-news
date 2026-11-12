@@ -2480,7 +2480,15 @@ def mode_indicators_backfill(store: Store, args) -> int:
     from stocknews import indicator_log as ind
     db = Path(args.db)
     size0 = db.stat().st_size if db.exists() else 0
-    rep = ind.backfill(store, date_from=args.ind_from, date_to=args.ind_to,
+    date_from = args.ind_from
+    if not date_from and not getattr(args, "ind_all", False):
+        # 기본 = 최근 INDICATOR_BACKFILL_DAYS 거래일 (전 기간은 --ind-all)
+        from stocknews.events import trading_calendar
+        cal = trading_calendar(store)
+        n = int(getattr(_cfg, "INDICATOR_BACKFILL_DAYS", 250))
+        date_from = cal[-n] if len(cal) >= n else (cal[0] if cal else None)
+    SUMMARY["indicators_from"] = date_from
+    rep = ind.backfill(store, date_from=date_from, date_to=args.ind_to,
                        cache_dir=args.index_cache)
     size1 = db.stat().st_size if db.exists() else 0
     rep["db_bytes_before"], rep["db_bytes_after"] = size0, size1
@@ -2710,7 +2718,10 @@ def main(argv=None) -> int:
                     help="reco-events-backfill: 재추천 제한 창(거래일). "
                          "0 이면 RECO_COOLDOWN_DAYS, 그것도 0 이면 20")
     # ── [H] 지표 소급 ──
-    ap.add_argument("--ind-from", help="indicators-backfill: 시작일 (기본 전 기간)")
+    ap.add_argument("--ind-from", help="indicators-backfill: 시작일 "
+                    "(기본 최근 INDICATOR_BACKFILL_DAYS=250 거래일)")
+    ap.add_argument("--ind-all", action="store_true",
+                    help="indicators-backfill: 전 기간 (기본은 최근 250거래일)")
     ap.add_argument("--ind-to", help="indicators-backfill: 종료일 (기본 전 기간)")
     ap.add_argument("--index-cache", default="data/index_cache",
                     help="indicators-backfill: 지수 히스토리 CSV 캐시 폴더")

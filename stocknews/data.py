@@ -108,7 +108,8 @@ def load_ohlcv(ticker: str, days: int = 400) -> pd.DataFrame:
     end = now_kst()
     start = end - timedelta(days=int(days * 1.6))
     try:
-        from pykrx import stock
+        from .quiet_import import pykrx_stock
+        stock = pykrx_stock()
         df = stock.get_market_ohlcv(start.strftime("%Y%m%d"),
                                     end.strftime("%Y%m%d"), ticker)
         return normalize_ohlcv(df).tail(days)
@@ -123,7 +124,8 @@ def load_investor(ticker: str, days: int = 180) -> pd.DataFrame | None:
     end = now_kst()
     start = end - timedelta(days=int(days * 1.6))
     try:
-        from pykrx import stock
+        from .quiet_import import pykrx_stock
+        stock = pykrx_stock()
         df = stock.get_market_trading_value_by_date(
             start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), ticker, detail=True
         )
@@ -140,7 +142,8 @@ def load_shorting(ticker: str, days: int = 120) -> pd.DataFrame | None:
     end = now_kst()
     start = end - timedelta(days=int(days * 1.6))
     try:
-        from pykrx import stock
+        from .quiet_import import pykrx_stock
+        stock = pykrx_stock()
         df = stock.get_shorting_balance_by_date(
             start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), ticker
         )
@@ -284,7 +287,8 @@ def close_on_status(ticker: str, trade_date: str,
     from_exc: Exception | None = None
     for attempt in range(max(0, int(retries)) + 1):
         try:
-            from pykrx import stock
+            from .quiet_import import pykrx_stock
+            stock = pykrx_stock()
             df = stock.get_market_ohlcv(trade_date, trade_date, ticker)
         except Exception as exc:  # noqa: BLE001
             from_exc = exc

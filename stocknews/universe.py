@@ -258,7 +258,8 @@ def refresh_master(store, on_date: str | None = None,
 def _refresh_master_pykrx(ds: str, include_preferred: bool
                           ) -> tuple[list[dict], set[str]]:
     """구 경로 폴백. KRX 가 전종목 조회를 다시 열면 이쪽이 살아난다."""
-    from pykrx import stock
+    from .quiet_import import pykrx_stock
+    stock = pykrx_stock()
 
     log.warning("스냅샷 실패 → pykrx 전종목 경로로 폴백 "
                 "(현재 KRX 가 막아둔 상태일 수 있음)")
@@ -498,7 +499,8 @@ def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
 
 def _upsert_one_day(store, ticker: str, trade_date: str, iso: str) -> int:
     """종목 1개의 특정 거래일 1행을 적재."""
-    from pykrx import stock
+    from .quiet_import import pykrx_stock
+    stock = pykrx_stock()
     try:
         df = stock.get_market_ohlcv(trade_date, trade_date, ticker)
     except Exception:  # noqa: BLE001
@@ -523,7 +525,8 @@ def backfill_one(store, ticker: str, days: int = 420,
     2,800종목 × 0.35초 ≈ 17분. 중간에 끊겨도 backfill_state 체크포인트로
     다음 실행에서 이어서 진행된다.
     """
-    from pykrx import stock
+    from .quiet_import import pykrx_stock
+    stock = pykrx_stock()
 
     # KST 기준. UTC 호스트에서 datetime.now() 를 쓰면 조회 종료일이 하루
     # 뒤처져 최신 봉이 조용히 빠진다.

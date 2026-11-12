@@ -356,7 +356,6 @@ def collect_market_context(store, trade_date: str, bars: int = 300,
 def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
               tickers: dict | None = None) -> dict:
     """저녁 배치 본체. 스캔 → 스냅샷 저장 → 10선 선정 → 저장."""
-    started = datetime.now()
     tickers = tickers or store.active_tickers()
     trade_date = store.last_price_date()
     if not trade_date:
@@ -394,8 +393,9 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     from .indicator_log import maybe_record_daily
     ind = maybe_record_daily(store, trade_date)
 
-    store.log_run("daily", started, len(results), len(errors),
-                  note=f"snapshot={saved}, picks={len(picks)}")
+    # 배치 이력은 run_screen.main() 이 한 곳에서 기록한다(AGENTS 10장).
+    # 여기서도 log_run 을 부르면 runs 에 daily 가 두 줄씩 남았다 — 하나는
+    # TZ=UTC 자식에서 datetime.now() 라 9시간 어긋난 started 로.
 
     out = {"trade_date": trade_date, "results": results, "errors": errors,
            "picks": picks, "snapshot_rows": saved,
