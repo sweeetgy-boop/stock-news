@@ -105,12 +105,15 @@ def run(check, near, tmp):
         # ① 이 ④ 보다 먼저: S1 은 재추천이지만 사유는 SEQ
         assert r["S1"]["filter_reason"] == "SEQ" and r["S2"]["filter_reason"] == "SEQ"
         assert r["F1"]["filter_reason"] == "보충" and r["F2"]["filter_reason"] == "보충"
-        # ③ TREND 3개 → 내림 1개, 추세 점수 높은 T2 를 남긴다 → ④ 에서 유지
+        # ③ TREND 3개 → 내림 1개, 추세 점수 높은 T2 를 남긴다.
+        # [2026-11-12 발송용 계열] T2 는 이틀 전 ③(TREND 1개 → 0개)으로 빠져
+        # 한 번도 발송되지 않았다 → 오늘 통과하면 '추천 유지' 가 아니라 새 추천.
         assert r["T1"]["filter_reason"] == "국면" and r["T3"]["filter_reason"] == "국면"
-        assert r["T2"]["status"] == "hold" and r["T2"]["filter_reason"] == "재추천 제한"
+        assert r["T2"]["status"] == "new" and r["T2"]["filter_reason"] is None, r["T2"]
+        # V2 는 이틀 전 실제로 발송됐다 → 유지 3일째
         assert r["V2"]["status"] == "hold" and int(r["V2"]["day_in_window"]) == 3
-        assert [x["ticker"] for x in res.new] == ["V1", "V3"], res.new
-        assert res.counts == {"SEQ": 2, "보충": 2, "국면": 2, "재추천 제한": 2}
+        assert [x["ticker"] for x in res.new] == ["V1", "V3", "T2"], res.new
+        assert res.counts == {"SEQ": 2, "보충": 2, "국면": 2, "재추천 제한": 1}
         assert sf.regime_keep(3) == 1 and sf.regime_keep(2) == 1 and sf.regime_keep(1) == 0
         # 빠진 자리를 메우지 않는다 — 행 수는 그대로 10, 새 추천은 2
         assert len(res.rows) == 10 and len(res.targets) == 4
@@ -167,10 +170,12 @@ def run(check, near, tmp):
         keys = [(r[0], r[1]) for r in e1]
         assert len(keys) == len(set(keys)), "reco_events 중복 행"
         ev = {(r[0], r[1]): r for r in e1}
+        # [발송용 계열] SEQ 제외로 한 번도 발송되지 않은 S1 은 이벤트가 없다.
+        assert not any(k[0] in ("S1", "S2", "F1", "F2") for k in ev), sorted(ev)
         # 제한 종료일 = 20일째. 달력(12일) 밖이라 주말을 뺀 예상 거래일.
-        assert ev[("S1", dm2)][2] == "2026-10-07", ev[("S1", dm2)]
-        assert ev[("S1", dm2)][3] == 20
-        assert ev[("S1", dm2)][11] == 2, ev[("S1", dm2)]            # days_listed
+        assert ev[("V2", dm2)][2] == "2026-10-07", ev[("V2", dm2)]
+        assert ev[("V2", dm2)][3] == 20
+        assert ev[("V2", dm2)][11] == 2, ev[("V2", dm2)]            # days_listed
         assert ev[("V2", dm2)][12] and "등급 B→A" in ev[("V2", dm2)][12]
         reasons = {r[1]: r[6] for r in l1}
         assert reasons["S1"] == "SEQ" and reasons["V2"] == "재추천 제한"
@@ -289,3 +294,24 @@ def run(check, near, tmp):
             out = sf.backfill_events(st)
         assert out["window"] == 20 and out["events"] > 0, out
     check(S, "소급 모드 등록 · 락 타임아웃 · 기본 창 20", mode_registered)
+
+
+    def two_tracks():
+        # [2026-11-12] 측정용(recos 전체)과 발송용(①②③ 통과 행) 이벤트가 갈린다.
+        from stocknews import events as E
+        recos = sf._load_recos(st, d0)
+        meas = E.events_only(E.assign_events(recos, E.trading_calendar(st), window=20))
+        assert ("S1", dm2) in {(r["ticker"], r["event_date"]) for r in meas.to_dict("records")}
+        with _flags(cd=20, seq=True):
+            res = sf.evaluate(st, d0)
+            tg = hk.send_targets(st, d0)
+        r = by_t(res)
+        # 발송용: S1 은 SEQ 로 계속 빠져 이벤트가 없고 targets 에도 없다.
+        assert r["S1"]["status"] == "excluded"
+        assert "S1" not in {t["ticker"] for t in tg}
+        # 발송된 V2 만 '유지', 처음 통과한 V1·V3 는 새 추천.
+        assert r["V2"]["status"] == "hold" and r["V1"]["status"] == "new"
+        lines = sf.hold_lines(res)
+        assert any("V2" in x or "종목V2" in x for x in lines) and not any("S1" in x for x in lines)
+    check(S, "이벤트 두 계열: 측정용(recos 전체) vs 발송용(필터 통과) · 유지는 발송된 종목만",
+          two_tracks)

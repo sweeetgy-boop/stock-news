@@ -379,3 +379,10 @@ def run(check, near, tmp):
         assert "락 점유" in rep["hurst"]["record"]["reason"]
     check(S, "끝에서 끝: 합성 Store → 7개 절 · 허스트 실시간 기록 · 락 점유 시 기록만 생략",
           end_to_end)
+
+
+    def quint_note():
+        rep = {"horizon": 20, "quintile": {"table": None, "dates": []}}
+        txt = "\n".join(W._quint_lines(rep))
+        assert "표본이 서로 독립이 아님" in txt, txt
+    check(S, "5분위 표에 '표본이 서로 독립이 아님' 문구", quint_note)

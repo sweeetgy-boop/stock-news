@@ -1234,7 +1234,9 @@ def _quint_lines(rep: dict) -> list[str]:
     out = [f"■ 4. 지표별 5분위 — {h}일 시장(전종목 중위) 대비 초과수익 %p",
            f"  표본일 {len(ds)}개(주별 마지막 거래일, {h}일 경과분) · 가상 이벤트 "
            f"{q.get('virtual_events', 0):,} · 채점 {q.get('scored', 0):,}",
-           "  Q1=지표 낮음 … Q5=높음 · 칸 = 평균 / 중앙 (n)"]
+           "  Q1=지표 낮음 … Q5=높음 · 칸 = 평균 / 중앙 (n)",
+           "  ※ 표본이 서로 독립이 아님 — 주별 표본일의 20일 구간이 겹치고 같은 날"
+           " 종목끼리 상관된다. n 은 독립 표본 수가 아니다."]
     if t is None or t.empty:
         out.append("  데이터 없음")
         return out

@@ -257,7 +257,8 @@ def run(check, near, tmp):
                "kospi_close": 2450.123, "ma200_gap_pct": -3.44,
                "kospi_ret_20d": -5.21}
         b = R.banner_line(row)
-        assert "\n" not in b and "하락" in b and "추천 성과 저조 구간" in b
+        # 하락은 수치만 (해석 문구 금지 · 2026-11-12)
+        assert "\n" not in b and "하락" in b and "추천 성과 저조" not in b and " — " not in b
         assert "2,450.12" in b and "-3.4%" in b and "-5.2%" in b
         b = R.banner_line(dict(row, label=R.UP))
         assert "상승 구간 — 절대수익보다 시장 대비 초과수익으로 볼 것" in b

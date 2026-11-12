@@ -17,9 +17,14 @@
                   이벤트의 시작 행이 아니면(= 기간 중 재추천) 새 추천이 아니라
                   '추천 유지 n일째' 한 줄로만 보인다.
 
-이벤트 판정의 입력은 **recos 전체**다([0] 정의 그대로, 필터 결과가 아니다).
-그래서 이벤트 시작 행이 ①~③ 으로 빠졌어도 기간 중 재등장은 ④ 의
-'재추천 제한' 이다. 이 선택은 시뮬레이션 보고에 건수로 따로 적는다.
+이벤트 판정은 두 계열이다 (2026-11-12 분리).
+
+  측정용  recos **전체** → [0] assign_events. A 의 채점, 이 모듈의
+          `score_table`(발송 vs 제외 성적)이 쓴다. 필터와 무관한 표본 정의.
+  발송용  ①②③ 을 **통과한 행만** → [0] assign_events(window=재추천 제한).
+          ④ 와 reco_events 가 쓴다. 그래서 '추천 유지' 는 실제로 새 추천으로
+          나간 적 있는 종목에만 붙고, 한 번도 발송되지 않은 종목(이벤트 시작
+          행이 ①~③ 으로 빠졌던 종목)이 필터를 통과하면 **새 추천**이다.
 
 행 상태
 -------
@@ -284,8 +289,8 @@ def _row_dict(r: dict, cooldown: int) -> dict:
     return out
 
 
-def _apply_day(rows: list[dict], flags: dict, regime: str | None) -> list[dict]:
-    """한 거래일 행에 ①②③④ 를 순서대로 건다. rows 는 순위 순."""
+def _filter_123(rows: list[dict], flags: dict, regime: str | None) -> list[dict]:
+    """한 거래일 행에 ①②③ 만 건다(④ 는 발송용 이벤트 판정 뒤). rows 는 순위 순."""
     def alive():
         return [r for r in rows if r["status"] is None]
 
@@ -306,14 +311,52 @@ def _apply_day(rows: list[dict], flags: dict, regime: str | None) -> list[dict]:
                                  else float("-inf")), r["rank"]))
         for r in tr[regime_keep(len(tr)):]:
             excl(r, REASON_REGIME)
-    for r in alive():                                              # ④
+    for r in rows:
+        r["regime"] = regime
+    return rows
+
+
+def _apply_cooldown(rows: list[dict], flags: dict) -> list[dict]:
+    """④ — ①②③ 을 통과한 행. 발송용 이벤트의 시작 행이 아니면 '추천 유지'."""
+    for r in rows:
+        if r["status"] is not None:
+            continue
         if flags["cooldown_days"] > 0 and not r["is_new_event"]:
             r["status"], r["filter_reason"] = HOLD, REASON_COOLDOWN
         else:
             r["status"] = NEW
-    for r in rows:
-        r["regime"] = regime
     return rows
+
+
+def _apply_day(rows: list[dict], flags: dict, regime: str | None) -> list[dict]:
+    """한 거래일 행에 ①②③④ 를 순서대로 건다(이벤트 필드는 이미 채워진 행)."""
+    return _apply_cooldown(_filter_123(rows, flags, regime), flags)
+
+
+_EVENT_FIELDS = ("is_event", "day_in_window", "event_date", "window_end",
+                 "event_slot", "event_grade", "slot_changed", "grade_changed",
+                 "event_id")
+
+
+def _send_track(store, recos: pd.DataFrame, fl: dict, cal: list[str]
+                ) -> tuple[dict[str, list[dict]], pd.DataFrame]:
+    """발송용 계열. (날짜별 ①②③ 판정 행, 통과 행의 이벤트 판정).
+
+    ①②③ 은 그날 행만 보고 정해지므로 날짜별로 먼저 건다. 통과한 행만
+    [0] assign_events 에 넣는다 — 이벤트 = 실제로 새 추천으로 나간 날.
+    """
+    pre: dict[str, list[dict]] = {}
+    for d, g in recos.sort_values(["d", "rank"], kind="mergesort").groupby(
+            "d", sort=True):
+        rows = [_row_dict(r, 0) for r in g.to_dict("records")]
+        pre[str(d)[:10]] = _filter_123(rows, fl, _regime(store, d))
+    passed = [r for rows in pre.values() for r in rows if r["status"] is None]
+    if not passed:
+        return pre, pd.DataFrame()
+    pdf = pd.DataFrame([{k: r[k] for k in _RECO_COLS} for r in passed])
+    a = _assign(pdf, cal, fl["cooldown_days"], _holidays(store)
+                if fl["cooldown_days"] > 0 else frozenset())
+    return pre, a
 
 
 def evaluate_days(store, days=None, flags: dict | None = None,
@@ -332,17 +375,21 @@ def evaluate_days(store, days=None, flags: dict | None = None,
     if recos is None or recos.empty:
         return {d: DayResult(d, fl, _regime(store, d), []) for d in (want or [])}
     cal = calendar if calendar is not None else _calendar(store, recos)
-    a = _assign(recos, cal, fl["cooldown_days"], _holidays(store)
-                if fl["cooldown_days"] > 0 else frozenset())
-    a = a.sort_values(["d", "rank"], kind="mergesort")
-    by_d = {d: g for d, g in a.groupby("d", sort=True)}
+    pre, a = _send_track(store, recos, fl, cal)
+    amap = ({} if a is None or a.empty else
+            {(str(r["d"])[:10], str(r["ticker"])): r for r in a.to_dict("records")})
     out: dict[str, DayResult] = {}
-    for d in (want if want is not None else sorted(by_d)):
-        g = by_d.get(d)
-        rows = ([] if g is None else
-                [_row_dict(r, fl["cooldown_days"]) for r in g.to_dict("records")])
-        regime = _regime(store, d)
-        out[d] = DayResult(d, fl, regime, _apply_day(rows, fl, regime))
+    for d in (want if want is not None else sorted(pre)):
+        rows = pre.get(d, [])
+        for r in rows:
+            if r["status"] is None:                    # ①②③ 통과 → 발송용 이벤트
+                ev_r = _row_dict(amap[(d, r["ticker"])], fl["cooldown_days"])
+                for k in ("is_new_event", "day_in_window", "event_date",
+                          "window_end", "event_slot", "event_grade",
+                          "slot_changed", "grade_changed"):
+                    r[k] = ev_r[k]
+        regime = rows[0]["regime"] if rows else _regime(store, d)
+        out[d] = DayResult(d, fl, regime, _apply_cooldown(rows, fl))
     return out
 
 
@@ -385,14 +432,19 @@ def _event_rows(assigned: pd.DataFrame, window: int) -> list[tuple]:
 
 
 def _write_events(store, until: str, window: int,
-                  recos: pd.DataFrame | None = None) -> int:
-    """until 까지의 recos 로 이벤트를 다시 계산해 reco_events 를 갈아 끼운다."""
+                  recos: pd.DataFrame | None = None,
+                  flags: dict | None = None) -> int:
+    """until 까지의 recos 로 **발송용** 이벤트를 다시 계산해 reco_events 를 갈아 끼운다.
+
+    ①②③ 을 통과한 행만 이벤트가 된다(플래그는 flags, 없으면 현재 설정).
+    """
     recos = _load_recos(store, until) if recos is None else recos
     if recos.empty:
         return 0
-    a = ev.assign_events(recos, _calendar(store, recos), window=window,
-                         holidays=_holidays(store))
-    rows = _event_rows(a, window)
+    fl = dict(current_flags() if flags is None else flags)
+    fl["cooldown_days"] = int(window)
+    _pre, a = _send_track(store, recos, fl, _calendar(store, recos))
+    rows = _event_rows(a, window) if a is not None and not a.empty else []
     with closing(sqlite3.connect(store.path, timeout=30.0)) as con:
         con.execute("DELETE FROM reco_events WHERE event_date<=?", (until,))
         con.executemany(
@@ -431,7 +483,8 @@ def record(store, d, flags: dict | None = None) -> dict | None:
     res = evaluate_days(store, [ds], fl, recos=recos)[ds]
     n_ev = 0
     if fl["cooldown_days"] > 0:
-        n_ev = _write_events(store, ds, fl["cooldown_days"], recos=recos)
+        n_ev = _write_events(store, ds, fl["cooldown_days"], recos=recos,
+                             flags=fl)
     n_log = _write_log(store, res)
     out = res.summary()
     out.update({"events_rows": n_ev, "log_rows": n_log})

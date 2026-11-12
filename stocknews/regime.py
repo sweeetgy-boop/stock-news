@@ -582,7 +582,8 @@ def banner_line(row: dict | None, d: str | None = None) -> str:
             f"20일 {_f(row.get('kospi_ret_20d'), '+.1f')}%")
     lb = row.get("label")
     if lb == DOWN:
-        return f"📊 국면 하락{when} · {nums} — 추천 성과 저조 구간"
+        # 2026-11-12 사용자 지시: 하락 국면은 해석 문구 없이 수치만.
+        return f"📊 국면 하락{when} · {nums}"
     if lb == UP:
         return (f"📊 국면 상승{when} · {nums} — 상승 구간 — 절대수익보다 "
                 "시장 대비 초과수익으로 볼 것")
