@@ -27,6 +27,46 @@ __all__ = ["apply"]
 
 # ── [B] 추천 필터 ──
 # (B 구역 시작)
+# reco_events     : 재추천 제한용 이벤트([0] assign_events 결과의 이벤트 행).
+#                   (ticker, event_date) 가 키라 재실행·--force 재스캔에도
+#                   행이 늘지 않는다. send_filter.record() 가 그 날짜까지의
+#                   이벤트를 지우고 다시 쓴다(결정적 재계산 = 멱등).
+# reco_filter_log : 그날 발송·추적 대상에서 빠진 recos 행과 사유.
+#                   (d, ticker) 키. 그날 행을 지우고 다시 쓴다.
+DDL_B = """
+CREATE TABLE IF NOT EXISTS reco_events (
+  ticker TEXT NOT NULL,
+  event_date TEXT NOT NULL,       -- 이벤트 날짜(첫 추천일 = 1일째)
+  window_end TEXT,                -- 제한 종료일(N일째). 달력 밖이면 예상 거래일
+  window_days INTEGER NOT NULL,   -- N (RECO_COOLDOWN_DAYS)
+  name TEXT,
+  slot TEXT,                      -- 이벤트 시작 행의 슬롯·등급·점수
+  grade TEXT,
+  score REAL,                     -- VALUE=매집, TREND=추세, 그 외=max(매집,추세)
+  last_d TEXT,                    -- 기간 중 마지막 추천일
+  last_slot TEXT,
+  last_grade TEXT,
+  days_listed INTEGER,            -- 기간 중 추천 목록에 오른 거래일 수
+  changes TEXT,                   -- 기간 중 슬롯·등급 변화 기록 (없으면 NULL)
+  PRIMARY KEY (ticker, event_date)
+);
+CREATE INDEX IF NOT EXISTS ix_reco_events_end ON reco_events(window_end);
+
+CREATE TABLE IF NOT EXISTS reco_filter_log (
+  d TEXT NOT NULL,
+  ticker TEXT NOT NULL,
+  name TEXT,
+  rank INTEGER,
+  slot TEXT,
+  grade TEXT,
+  reason TEXT NOT NULL,           -- SEQ / 보충 / 국면 / 재추천 제한
+  regime TEXT,                    -- 그날 국면 라벨 (없으면 NULL)
+  event_date TEXT,                -- 재추천 제한일 때 소속 이벤트 날짜
+  day_in_window INTEGER,
+  PRIMARY KEY (d, ticker)
+);
+CREATE INDEX IF NOT EXISTS ix_reco_filter_log_reason ON reco_filter_log(reason);
+"""
 # (B 구역 끝)
 
 

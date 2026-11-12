@@ -203,7 +203,7 @@ _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "credit-kiwoom", "collect-dividends", "dividend-report",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
                 "flash", "pos-open", "fill", "pos-close", "holidays",
-                "reconcile"}
+                "reconcile", "reco-events-backfill"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -762,11 +762,41 @@ def _daily_send_only(store: Store, args, asof, send_ok: bool,
     n = int(len(rows))
     SUMMARY.update({"picks": n, "from_db": True})
     log.info("주간 추천 발송: 기준일 %s 기록 %d건 (스캔 없음)", got, n)
-    size = _reco_size_map(store, [str(t) for t in rows["ticker"]], got)
-    _emit(render_reco_stored(rows, asof, dow_label, size=size), args.dry_run)
-    SUMMARY["reco_sent"] = True
-    _send_charts(store, args, got, rows=rows)
+    _send_stored(store, args, asof, dow_label, rows)
     return EXIT_OK
+
+
+def _send_stored(store: Store, args, asof, dow_label: str, rows) -> None:
+    """기록된 recos 로 주간 추천을 보낸다 (일요일 경로 둘이 같이 쓴다).
+
+    [B] 추천 필터 플래그가 전부 OFF 면 예전과 똑같이 보낸다. 하나라도
+    켜져 있으면 발송 대상 판정(①SEQ ②보충 ③국면 ④재추천 제한)을 거친
+    새 추천만 보내고, 재추천 제한 종목은 '추천 유지 n일째' 한 줄,
+    맨 아래에 '오늘 제외 — ...' 한 줄을 붙인다. 새 추천이 0개면
+    "오늘 새 추천 없음" 을 보낸다. recos 는 읽기만 한다.
+    """
+    from stocknews import send_filter as sf
+    d = str(rows.iloc[0]["d"])
+    if not sf.any_on():
+        size = _reco_size_map(store, [str(t) for t in rows["ticker"]], d)
+        _emit(render_reco_stored(rows, asof, dow_label, size=size), args.dry_run)
+        SUMMARY["reco_sent"] = True
+        _send_charts(store, args, d, rows=rows)
+        return
+    try:
+        sf.record(store, d)
+    except Exception as exc:  # noqa: BLE001 - 기록 실패가 발송을 막지 않는다
+        log.warning("추천 필터 기록 실패 (%s: %s)", type(exc).__name__, exc)
+    res = sf.evaluate(store, d)
+    SUMMARY["send_filter"] = res.summary()
+    new = res.new
+    size = (_reco_size_map(store, [r["ticker"] for r in new], d)
+            if new else None)
+    _emit(sf.render_send(res, asof, dow_label, size=size), args.dry_run)
+    SUMMARY["reco_sent"] = bool(new)
+    SUMMARY["picks_sent"] = len(new)
+    if new:
+        _send_charts(store, args, d, rows=pd.DataFrame(new))
 
 
 def _asof(args) -> datetime:
@@ -815,11 +845,7 @@ def mode_daily(store: Store, args) -> int:
             log.warning("발송 요일이지만 기록된 추천이 없습니다 — 발송 생략")
             return EXIT_OK
         log.info("주간 추천 발송: 기록된 %d건 (스캔 생략)", n)
-        size = _reco_size_map(store, [str(t) for t in rows["ticker"]],
-                              str(rows.iloc[0]["d"]))
-        _emit(render_reco_stored(rows, asof, dow_label, size=size), args.dry_run)
-        SUMMARY["reco_sent"] = True
-        _send_charts(store, args, str(rows.iloc[0]["d"]), rows=rows)
+        _send_stored(store, args, asof, dow_label, rows)
         return EXIT_OK
 
     tickers = _scan_pool(store, args)
@@ -829,7 +855,23 @@ def mode_daily(store: Store, args) -> int:
 
     res = run_daily(store, cfg=DEFAULT, top_n=args.top, tickers=tickers)
 
-    if send_ok:
+    # [B] 추천 필터 판정 기록 (플래그가 전부 OFF 면 아무것도 쓰지 않는다).
+    # recos 를 읽기만 하고, 같은 날 재실행·--force 재스캔에도 결과가 같다.
+    from stocknews import send_filter as sf
+    filter_on = sf.any_on()
+    if filter_on:
+        try:
+            SUMMARY["send_filter"] = sf.record(store, res["trade_date"])
+        except Exception as exc:  # noqa: BLE001 - 스캔·추천 기록은 이미 끝났다
+            log.warning("추천 필터 기록 실패 (%s: %s)", type(exc).__name__, exc)
+            SUMMARY["send_filter"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+    rows = (store.recos_between(res["trade_date"], res["trade_date"])
+            if send_ok and filter_on and res["picks"] else None)
+    if rows is not None and len(rows):
+        # 필터가 켜져 있으면 방금 기록된 recos 로 일요일과 같은 발송 경로를 탄다.
+        _send_stored(store, args, asof, dow_label, rows)
+    elif send_ok:
         size = _reco_size_map(store, [r.ticker for _s, r in res["picks"]],
                               res["trade_date"])
         _emit(render_top10(res["picks"], asof, res["trade_date"],
@@ -884,7 +926,23 @@ def mode_weekly(store: Store, args) -> int:
             "reentry_violations": c.get("reentry_violations", 0),
             "compliance_pct": c.get("compliance_pct"),
         }
-    _emit(render_weekly(rep, now_kst(), DEFAULT), args.dry_run)
+    text = render_weekly(rep, now_kst(), DEFAULT)
+    # [B] 발송된 추천 vs 사유별 제외 종목 20일 초과수익. 플래그 ON 일 때만.
+    from stocknews import send_filter as sf
+    if sf.any_on():
+        try:
+            tab = sf.score_table(store, horizon=20,
+                                 cache_dir=Path("data") / "index_cache")
+            SUMMARY["send_filter_table"] = {"units": tab.get("units", 0),
+                                            "rows": len(tab.get("rows") or [])}
+            lines = text.split("\n")
+            # 마지막 '⏰' 줄 앞에 넣는다.
+            text = "\n".join(lines[:-1] + sf.render_score_table(tab)
+                             + ["", lines[-1]])
+        except Exception as exc:  # noqa: BLE001 - 주간 리포트 본문은 지킨다
+            log.warning("추천 필터 검증 표 실패 (%s: %s)",
+                        type(exc).__name__, exc)
+    _emit(text, args.dry_run)
     return EXIT_OK
 
 
@@ -1001,13 +1059,27 @@ def mode_brief_evening(store: Store, args) -> int:
         process_and_store(store, raw)
 
     picks = None
+    foot = None
     rec = store.reco_history(days=1)
     if rec is not None and not rec.empty:
         # 오늘 추천 목록을 렌더러가 쓰는 최소 형태로 재구성한다.
         picks = [(r["slot"], _RecoRow(r)) for _, r in rec.iterrows()]
+        # [B] 추천 필터가 켜져 있으면 발송 대상(새 추천 + 추천 유지)만 남기고
+        # 종목 부분 맨 아래에 '오늘 제외 — ...' 한 줄. 전부 OFF 면 그대로.
+        from stocknews import send_filter as sf
+        if sf.any_on():
+            from stocknews import v2_hooks as hk
+            d0 = str(rec.iloc[0]["d"])
+            keep = {t["ticker"] for t in hk.send_targets(store, d0)}
+            picks = [(s_, r_) for s_, r_ in picks if r_.ticker in keep]
+            line = hk.exclusion_line(store, d0)
+            foot = [line] if line else None
+            SUMMARY["send_filter"] = {"d": d0, "targets": len(picks),
+                                      "line": line}
 
     _emit(render_evening_brief(store, now_kst(), picks=picks,
-                               hours=args.news_hours), args.dry_run)
+                               hours=args.news_hours, foot_lines=foot),
+          args.dry_run)
     SUMMARY.update({"news_hours": args.news_hours,
                     "picks": 0 if picks is None else len(picks)})
     # 텍스트 **뒤에** 관심종목 차트 앨범 1개. 텍스트는 이미 나갔으므로
@@ -2027,6 +2099,23 @@ def mode_pos_close(store: Store, args) -> int:
     return EXIT_OK
 
 
+def mode_reco_events_backfill(store: Store, args) -> int:
+    """[B] 과거 recos 전체로 reco_events 를 소급 구성한다 (1회성 · nightly 밖).
+
+    RECO_COOLDOWN_DAYS 를 켜기 **전에** 한 번 돌린다. recos 는 읽기만
+    한다. 다시 돌려도 같은 결과다(이벤트를 지우고 결정적으로 다시 쓴다).
+    """
+    from stocknews import send_filter as sf
+    out = sf.backfill_events(store, window=args.cooldown_days or None)
+    SUMMARY.update({"reco_events": out})
+    log.info("reco_events 소급: 창 %d거래일 · recos %d행/%d일 → 이벤트 %d건 (%.2f초)",
+             out["window"], out["recos"], out["days"], out["events"],
+             out["elapsed_sec"])
+    _say(f"reco_events 소급 완료: 창 {out['window']}거래일 · recos "
+         f"{out['recos']}행 · 이벤트 {out['events']}건 · {out['elapsed_sec']}초")
+    return EXIT_OK
+
+
 MODES = {
     "master": mode_master,
     "backfill": mode_backfill,
@@ -2056,6 +2145,7 @@ MODES = {
     "pos-list": mode_pos_list,
     "fill": mode_fill,
     "pos-close": mode_pos_close,
+    "reco-events-backfill": mode_reco_events_backfill,
 }
 
 
@@ -2212,6 +2302,10 @@ def main(argv=None) -> int:
                     help="backtest: 대조군 생략 (빠른 확인용)")
     ap.add_argument("--bt-no-exits", action="store_true",
                     help="backtest: 청산 규칙 시뮬 생략")
+    # ── [B] 추천 필터 ──
+    ap.add_argument("--cooldown-days", type=int, default=0,
+                    help="reco-events-backfill: 재추천 제한 창(거래일). "
+                         "0 이면 RECO_COOLDOWN_DAYS, 그것도 0 이면 20")
     args = ap.parse_args(argv)
 
     SUMMARY.clear()

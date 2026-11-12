@@ -349,7 +349,8 @@ def render_top10(picks: list, asof, trade_date: str, scanned: int,
 
 def render_reco_stored(rows, asof, send_dow_label: str = "일요일",
                        size: dict | None = None,
-                       cfg: Config = DEFAULT) -> str:
+                       cfg: Config = DEFAULT, marks: dict | None = None,
+                       extra_lines: list | None = None) -> str:
     """DB 에 쌓인 추천으로 만드는 주간 10선.
 
     발송 요일(기본 일요일)은 휴장일이라 그날 스캔이 돌지 않는다. 그래서
@@ -360,6 +361,9 @@ def render_reco_stored(rows, asof, send_dow_label: str = "일요일",
 
     rows : store.reco_history(days=1) 결과 (DataFrame)
     size : {티커: (시총, 일거래대금)} 이면 대형 / 그 외로 나눠 보인다.
+    marks : {티커: 표기} — 종목 첫 줄 끝에 붙인다 ([B] "하한 완화 적용").
+    extra_lines : 본문 뒤·주석 앞에 넣을 줄 ([B] 추천 유지 · 오늘 제외).
+    둘 다 None 이면 예전과 같은 출력이다.
     """
     if rows is None or len(rows) == 0:
         return ("🌙 <b>[주간 추천]</b>\n\n"
@@ -376,6 +380,8 @@ def render_reco_stored(rows, asof, send_dow_label: str = "일요일",
         slot = str(r["slot"])
         l1 = (f"{int(r['rank'])}. <b>{_e(str(r['name']))}</b> ({r['ticker']}) "
               f"[{r['grade']}·{SLOT_LABEL.get(slot, slot)}]")
+        if marks and marks.get(str(r["ticker"])):
+            l1 += f" · {_e(marks[str(r['ticker'])])}"
         l2 = (f"   {float(r['price']):,.0f}원 · 매집 {float(r['value_score']):.1f}"
               f" / 추세 {float(r['trend_score']):.1f}"
               f"{_size_bits(size, str(r['ticker']))}")
@@ -386,6 +392,7 @@ def render_reco_stored(rows, asof, send_dow_label: str = "일요일",
         body.append((str(r["ticker"]), "\n".join(x for x in (l1, l2, l3) if x)))
 
     tail = [
+        *(["", *extra_lines] if extra_lines else []),
         "",
         "※ 매집=역추세 바닥 그물 / 추세=골든크로스 확증",
         "※ 기준일 종가 기준입니다. 발송 시점 가격과 다릅니다.",
@@ -938,8 +945,12 @@ def render_morning_brief(store, asof, hours: int = 16,
 
 
 def render_evening_brief(store, asof, picks: list | None = None,
-                         hours: int = 12, per_section: int = 6) -> str:
-    """저녁 브리핑 (장마감 후). 국내 뉴스 정리 + 추천 10선 교차."""
+                         hours: int = 12, per_section: int = 6,
+                         foot_lines: list | None = None) -> str:
+    """저녁 브리핑 (장마감 후). 국내 뉴스 정리 + 추천 10선 교차.
+
+    foot_lines : 종목 부분 맨 아래 줄 ([B] "오늘 제외 — ..."). None 이면 예전과 같다.
+    """
     df = store.news_since(hours=hours, region="KR")
     out = [f"🌙 <b>[저녁 뉴스 정리]</b> {asof:%Y-%m-%d %H:%M}"]
     if df is None or df.empty:
@@ -985,6 +996,13 @@ def render_evening_brief(store, asof, picks: list | None = None,
                                f"· 매집 {r.value_score:.1f}/추세 {r.trend_score:.1f}")
         else:
             out.append("• 추천 종목 관련 뉴스 없음 (조용한 바닥일 수 있음)")
+        if foot_lines:
+            out += list(foot_lines)
+        out.append("")
+    elif foot_lines:
+        # 필터로 종목이 전부 빠진 날에도 제외 사유 한 줄은 남긴다.
+        out.append("━━ 🔗 추천 10선 뉴스 연동 ━━")
+        out += list(foot_lines)
         out.append("")
 
     out.append(render_watchlist(store))

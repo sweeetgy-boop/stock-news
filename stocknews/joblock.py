@@ -67,6 +67,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "pos-open": 120,
     "fill": 120,
     "pos-close": 120,
+    # [B] reco_events 소급 구성 (1회성). recos 수백 행 — 수 초.
+    "reco-events-backfill": 300,
 }
 DEFAULT_TIMEOUT = 900
 

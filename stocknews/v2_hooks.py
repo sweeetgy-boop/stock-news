@@ -45,13 +45,31 @@ def send_targets(store, d) -> list[dict] | None:
     각 dict 는 recos 행(d, rank, ticker, name, slot, grade, value_score,
     trend_score) + is_new_event(bool) + day_in_window(int).
     None = 필터 미구현/미기록 → 호출부는 그날 recos 전체를 대상으로 본다.
+
+    [B 구현] **항상 list 를 돌린다**(그날 recos 가 없으면 빈 list).
+      · 플래그 전부 OFF 면 그날 recos 전체, 전부 is_new_event=True.
+      · ①SEQ ②보충 ③국면 으로 빠진 행은 들어 있지 않다.
+      · RECO_COOLDOWN_DAYS > 0 이면 기간 중 재추천 행도 들어 있다
+        (is_new_event=False, status="hold" — '추천 유지 n일째' 표시용).
+        추적 신규 편입은 is_new_event=True 행만 한다.
+      · 그 밖의 키: status("new"/"hold"), event_date, window_end,
+        event_slot, event_grade, slot_changed, grade_changed, regime.
+    판정은 recos 를 읽기만 한다(stocknews/send_filter.py).
     """
-    return None
+    from .send_filter import evaluate
+    return evaluate(store, d).targets
 
 
 def exclusion_line(store, d) -> str | None:
-    """"오늘 제외 — SEQ n, 보충 n, 재추천 제한 n" 한 줄. 없으면 None."""
-    return None
+    """"오늘 제외 — SEQ n, 보충 n, 재추천 제한 n" 한 줄. 없으면 None.
+
+    [B 구현] 플래그가 전부 OFF 면 None. REGIME_TREND_CUT 이 켜져 있으면
+    끝에 ", 국면 n" 이 붙는다.
+    """
+    from .send_filter import any_on, evaluate, exclusion_line_of
+    if not any_on():
+        return None
+    return exclusion_line_of(evaluate(store, d))
 
 
 # ════════════════ [E] 위험 정보 — 주인: E ════════════════

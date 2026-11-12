@@ -202,7 +202,8 @@ def run(check, near, tmp):
         from stocknews import v2_hooks as hk
         st = Store(tmp / "v2_0.db")
         assert hk.regime_on(st, "2026-09-01") is None
-        assert hk.send_targets(st, "2026-09-01") is None
+        # [B] 병합 후 규약: 항상 list (recos 없으면 빈 list)
+        assert hk.send_targets(st, "2026-09-01") == []
         assert hk.tracked_tickers(st, "2026-09-01") == set()
         Store(tmp / "v2_0.db")          # 재초기화 멱등
     check(S, "schema_v2 적용 멱등 · 훅 기본값 = 지금과 같은 동작", schema_hook)
