@@ -37,7 +37,8 @@ log = logging.getLogger(__name__)
 
 __all__ = ["NOTE_KEY", "SOURCE_NAMES", "format_counts", "parse_counts",
            "load_rounds", "zero_streak", "evaluate", "alert_text",
-           "check_and_alert", "source_line", "append_line", "remove_line"]
+           "check_and_alert", "source_line", "last_news_round_line",
+           "append_line", "remove_line"]
 
 NOTE_KEY = "news_sources"
 SOURCE_NAMES = {"naver": "네이버", "google": "Google News",
@@ -67,11 +68,15 @@ def parse_counts(note) -> dict | None:
     return out
 
 
-def load_rounds(store, days: int | None = None) -> list[tuple[datetime, dict]]:
-    """runs 에서 수집 회차를 오래된 순으로. [(started naive KST, counts)]."""
+def load_rounds(store, days: int | None = None,
+                mode: str | None = None) -> list[tuple[datetime, dict]]:
+    """runs 에서 수집 회차를 오래된 순으로. [(started naive KST, counts)].
+
+    mode 를 주면 그 모드의 회차만(예: "news" = 06:00 잡 + nightly news 단계).
+    """
     from .config import NEWS_SOURCE_HISTORY_DAYS
     days = NEWS_SOURCE_HISTORY_DAYS if days is None else days
-    df = store.run_history(days=days, limit=5000)
+    df = store.run_history(days=days, mode=mode, limit=5000)
     rows: list[tuple[datetime, dict]] = []
     if df is None or df.empty:
         return rows
@@ -217,6 +222,34 @@ def source_line(store, enabled, hours: float, current: dict | None = None,
                   "rounds": len(window)}
 
 
+def last_news_round_line(store) -> tuple[str | None, dict]:
+    """수집하지 않는 브리핑(아침 --no-collect)용 — 직전 news 회차의 결과.
+
+    '뉴스 소스 n개 중 m개 수집 (MM-DD HH:MM 회차)'
+      n = 그 회차에 켜져 있던 소스 수(끈 소스는 note 에 키가 없다)
+      m = 그중 1건 이상 수집된 소스 수
+    news 회차 기록이 없거나(조회 실패 포함) 켜진 소스가 0개면 None — 줄을 생략한다.
+    아침 브리핑은 수집을 하지 않으므로, 브리핑 창 안의 회차를 세면 기록
+    유무에 따라 '4개 중 0개' 처럼 실제와 다른 숫자가 나온다(2026-11-12 실측).
+    """
+    try:
+        rounds = load_rounds(store, mode="news")
+    except Exception as exc:  # noqa: BLE001 - 한 줄 때문에 브리핑을 막지 않는다
+        log.warning("뉴스 소스 이력 조회 실패: %s", exc)
+        return None, {"rounds": 0}
+    if not rounds:
+        return None, {"rounds": 0}
+    t, counts = rounds[-1]
+    if not counts:
+        return None, {"rounds": len(rounds), "at": t.isoformat(sep=" ")}
+    got = [s for s, v in counts.items() if int(v) > 0]
+    line = (f"뉴스 소스 {len(counts)}개 중 {len(got)}개 수집 "
+            f"({t:%m-%d %H:%M} 회차)")
+    return line, {"n": len(counts), "m": len(got),
+                  "missing": [s for s in counts if s not in got],
+                  "at": t.isoformat(sep=" "), "rounds": len(rounds)}
+
+
 def append_line(text: str, line: str) -> str:
     """브리핑 맨 아래에 한 줄. 마지막 줄이 '⏰ 시각' 이면 그 바로 위."""
     lines = str(text).rstrip("\n").split("\n")
@@ -226,7 +259,8 @@ def append_line(text: str, line: str) -> str:
     return "\n".join(lines) + "\n\n" + line
 
 
-_LINE_RE = re.compile(r"^뉴스 소스 \d+개 중 \d+개 수집$")
+_LINE_RE = re.compile(r"^뉴스 소스 \d+개 중 \d+개 수집"
+                      r"(?: \(\d\d-\d\d \d\d:\d\d 회차\))?$")
 
 
 def remove_line(text: str) -> str:

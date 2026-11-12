@@ -397,11 +397,12 @@ def weekday_block(store, d: str, *, paper_on: bool | None = None,
         return text + "\n" + FOOTER_LITE, info
     sec2 = _matured_section(pd_, d)
     topn = int(C.PAPER_SUMMARY_TOPN)
+    floor = max(0, min(topn, int(getattr(C, "PAPER_SUMMARY_MIN_TOPN", 0))))
     while True:
         sec3, tinfo = _tracking_section(pd_, d, topn)
         text = "\n\n".join("\n".join(p) for p in (sec1, sec2, sec3, sec4) if p) \
             + "\n" + FOOTER
-        if len(text) <= limit_room or topn <= 0:
+        if len(text) <= limit_room or topn <= floor:
             break
         topn -= 1                       # ③을 먼저 줄인다 (상위·하위 줄 수)
     info["tracking"] = tinfo

@@ -232,14 +232,27 @@ def run(check, near, tmp):
         full_t, i1 = R.weekday_block(st, d, paper_on=True, pdata=pdx)
         assert i1["topn"] == C.PAPER_SUMMARY_TOPN and "▲ 상위" in full_t
         assert "③ 추적 중" in full_t and "검증 중 · 투자 판단 근거 아님" in full_t
+        # 2026-11-13: 넘어도 ③ 상위·하위는 PAPER_SUMMARY_MIN_TOPN(3) 밑으로 안 준다
         short, i2 = R.weekday_block(st, d, paper_on=True, pdata=pdx,
                                     limit_room=len(full_t) - 1)
-        assert i2["topn"] < i1["topn"], "③ 이 줄지 않았다"
-        sec1 = full_t.split("━━ ②")[0]
-        assert short.startswith(sec1), "①이 먼저 줄었다"
+        assert i2["topn"] == min(C.PAPER_SUMMARY_TOPN, C.PAPER_SUMMARY_MIN_TOPN)
+        assert short == full_t and "▲ 상위" in short, "③ 상위·하위가 깎였다"
+        zero, i3 = R.weekday_block(st, d, paper_on=True, pdata=pdx, limit_room=0)
+        assert i3["topn"] == i2["topn"] and "▲ 상위" in zero
+        o_top, o_min = C.PAPER_SUMMARY_TOPN, C.PAPER_SUMMARY_MIN_TOPN
+        try:                              # 하한 위로는 여전히 줄인다
+            C.PAPER_SUMMARY_TOPN, C.PAPER_SUMMARY_MIN_TOPN = 5, 1
+            big, j1 = R.weekday_block(st, d, paper_on=True, pdata=pdx)
+            sm, j2 = R.weekday_block(st, d, paper_on=True, pdata=pdx,
+                                     limit_room=len(big) - 1)
+            assert 1 <= j2["topn"] < j1["topn"], (j1["topn"], j2["topn"])
+            sec1 = big.split("━━ ②")[0]
+            assert sm.startswith(sec1), "①이 먼저 줄었다"
+        finally:
+            C.PAPER_SUMMARY_TOPN, C.PAPER_SUMMARY_MIN_TOPN = o_top, o_min
         for w in ("매수", "매도"):
             assert w not in full_t, f"발송 문구에 '{w}'"
-    check(S, "4,096 자 초과 → ③(상위·하위)부터 줄인다 · ① 유지", limit_shrink)
+    check(S, "4,096 자 초과 → ③ 은 하한(3)까지만 줄인다 · ① 유지", limit_shrink)
 
     def flags_off():
         assert C.PAPER_TRACKING is False and C.DAILY_LIST_V2 is False, "기본 OFF"

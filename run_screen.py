@@ -1216,8 +1216,17 @@ def mode_brief_morning(store: Store, args) -> int:
                      args.news_hours, hours, store.last_price_date())
     SUMMARY["news_hours"] = hours
     from stocknews.news_health import append_line
-    text = append_line(render_morning_brief(store, now_kst(), hours=hours),
-                       _news_source_line(store, args, hours))
+    text = render_morning_brief(store, now_kst(), hours=hours)
+    if args.no_collect:
+        # 아침은 수집하지 않는다(06:00 news 가 한다). 직전 news 회차의 결과를
+        # 적고, 그 기록이 없으면 줄을 생략한다.
+        from stocknews.news_health import last_news_round_line
+        line, info = last_news_round_line(store)
+        SUMMARY["news_source_line"] = {**info, "line": line}
+        if line:
+            text = append_line(text, line)
+    else:
+        text = append_line(text, _news_source_line(store, args, hours))
     _emit(with_regime_banner(store, text), args.dry_run)
     _news_v2_summary()
     return EXIT_OK

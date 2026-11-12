@@ -82,6 +82,23 @@ def normalize_title(title: str, strip_media_tail: bool = True) -> str:
     return t
 
 
+# 사건 비교 전용 매체 꼬리. 저장용 _MEDIA_TAIL 은 가운뎃점(·)과 공백 없는
+# 하이픈도 꼬리 구분자로 봐서 본문을 잘라낸다 — '민·관·군 방산수출 협력
+# 강조' 의 '· 군 방산수출 협력 강조' 를 매체명으로 오인했다(2026-11-12 실측,
+# 잘린 제목이 묶음 대표가 되면 같은 사건 기사가 따로 떨어진다). 비교용은
+# 공백으로 둘러싼 '-'·'|'·'–'·'—' 뒤만 꼬리로 본다. 저장 title_norm 과
+# 기사 id(make_id) 는 그대로다 — 바꾸면 이미 쌓인 행과 id 가 갈린다.
+_EVENT_MEDIA_TAIL = re.compile(r"\s+[-|–—]\s+[가-힣A-Za-z0-9. ]{2,20}$")
+
+
+def event_title_norm(title: str | None) -> str:
+    """같은 사건 비교용 정규화 제목. 원문이 없으면 빈 문자열."""
+    if not title:
+        return ""
+    t = _EVENT_MEDIA_TAIL.sub("", str(title).strip())
+    return normalize_title(t, strip_media_tail=False)
+
+
 def make_id(title_norm: str, source: str) -> str:
     """같은 매체의 같은 기사는 하나. 매체가 다르면 별건으로 남긴다.
 
@@ -429,6 +446,36 @@ def build_alias_index(tickers: dict) -> AliasIndex:
     return AliasIndex(idx)
 
 
+# 이름 매칭 경계 (2026-11-12 실측 오탐: '[위클리오늘]' -> 클리오,
+# 'JP모건, 머큐리 시스템즈' -> 머큐리).
+#   ① 이름이 다른 단어의 일부: 이름 첫 글자가 한글인데 바로 앞 글자도 한글,
+#      또는 첫 글자가 영숫자인데 바로 앞도 영숫자면 붙이지 않는다.
+#      뒤쪽은 보지 않는다 — '삼성전자가' 처럼 조사가 바로 붙는다.
+#   ② 해외 회사명의 일부: 이름 바로 뒤(공백 0~1개)에 외국 법인명 꼬리가
+#      오면 붙이지 않는다. 그 꼬리까지 포함한 이름이 상장사라면 긴 이름
+#      우선 매칭이 먼저 잡으므로 여기까지 오지 않는다.
+_HANGUL_CH = re.compile(r"[가-힣]")
+_ALNUM_CH = re.compile(r"[A-Za-z0-9]")
+_FOREIGN_SUFFIX = ("시스템즈", "테크놀로지스", "테크놀로지", "테크놀러지",
+                   "인터내셔널", "코퍼레이션", "인코퍼레이티드", "홀딩스",
+                   "인더스트리즈", "커뮤니케이션즈", "파마슈티컬스",
+                   "파마슈티컬", "랩스", "Inc", "Corp", "Systems",
+                   "Holdings", "Technologies")
+
+
+def _name_hit_ok(hay: str, start: int, name: str) -> bool:
+    prev = hay[start - 1] if start > 0 else ""
+    first = name[0]
+    if prev and _HANGUL_CH.match(first) and _HANGUL_CH.match(prev):
+        return False
+    if prev and _ALNUM_CH.match(first) and _ALNUM_CH.match(prev):
+        return False
+    rest = hay[start + len(name):]
+    if rest.startswith(" "):
+        rest = rest[1:]
+    return not rest.startswith(_FOREIGN_SUFFIX)
+
+
 def map_tickers(title: str, alias_idx: AliasIndex,
                 extra_names: list | None = None,
                 stock_code: str | None = None) -> list[tuple[str, str]]:
@@ -444,10 +491,18 @@ def map_tickers(title: str, alias_idx: AliasIndex,
     # setdefault 는 같은 종목의 중복만 막고, 다른 종목의 부분 겹침은 못 막는다.
     hay = title or ""
     for name in alias_idx.names_by_len:
-        if name in hay:
+        if name not in hay:
+            continue
+        hit = False
+        pos = hay.find(name)
+        while pos >= 0:
+            if _name_hit_ok(hay, pos, name):
+                hit = True
+                hay = hay[:pos] + "\x00" * len(name) + hay[pos + len(name):]
+            pos = hay.find(name, pos + len(name))
+        if hit:
             code, official = alias_idx.map[name]
             found.setdefault(code, official)
-            hay = hay.replace(name, "\x00" * len(name))
 
     for extra in (extra_names or []):
         e = (extra or "").strip()

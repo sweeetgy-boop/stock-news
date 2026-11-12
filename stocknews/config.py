@@ -898,6 +898,10 @@ PAPER_RANDOM_BUNDLES = 100
 PAPER_RANDOM_SEED = 20261112
 # ③ 추적 요약의 상위·하위 표시 수.
 PAPER_SUMMARY_TOPN = 3
+# 브리핑이 4,096자를 넘어도 ③ 상위·하위는 이 수 밑으로 줄이지 않는다
+# (넘는 분량은 send_telegram 이 나눠 보낸다). 2026-11-12 저녁 dry-run 에서
+# 뉴스 링크 길이 때문에 상위·하위가 0줄까지 깎여 요약 한 줄만 남았다.
+PAPER_SUMMARY_MIN_TOPN = 3
 # 지수 히스토리 CSV 캐시 (네트워크 실패 시 사용). cwd 기준.
 PAPER_INDEX_CACHE = "data/index_cache"
 # 그림자 청산 — 대안 세트 1개. **2026-11-12 고정. 이후 변경 금지.**
@@ -981,10 +985,15 @@ NEWS_V2 = False
 # 같아('[공시] X 주요사항보고서(...)') 다른 회사끼리 0.6~0.86 이 나오므로
 # 이 단계에서 뺀다.
 NEWS_V2_TITLE_SIM = 0.5
+# 같은 종목 사건 병합(news_v2.refine_groups c단계). 1 = 켬, 0 = 끔.
+NEWS_V2_SAME_TICKER_MERGE = 1
 # '⭐ 추천·추적 종목' 섹션 상한(사건 수).
 NEWS_V2_FOCUS_MAX = 8
 # 공시 블록 상한(줄). 넘치면 "외 n건" 한 줄.
 NEWS_V2_DART_MAX_LINES = 12
+# 공시 블록에서 정기보고서는 종목별로 나열하지 않고 맨 아래 한 줄로 줄인다.
+# 보고서명 앞의 [기재정정]·[첨부추가] 같은 꼬리표는 무시하고 판정한다.
+NEWS_V2_DART_PERIODIC_RE = r"^(?:\[[^\]]*\]\s*)*(?:분기|반기|사업)보고서"
 # 공시 블록 조회: Open DART list.json 시장별 페이지 상한(100건/페이지).
 NEWS_V2_DART_MAX_PAGES = 30
 # 밤사이 시장 — (표시명, FinanceDataReader 심볼). 2026-11-12 실측 확인.

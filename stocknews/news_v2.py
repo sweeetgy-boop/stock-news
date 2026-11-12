@@ -184,7 +184,8 @@ def refine_groups(groups: list[list], codes_of: dict,
     codes_of {news_id: set(종목코드)}
     반환     (새 묶음 목록, {"dart_split": n, "merged": n})
     """
-    from .news import event_serials, normalize_title, representative_rank
+    from .news import (event_serials, event_title_norm, normalize_title,
+                       representative_rank)
     th = float(C.NEWS_V2_TITLE_SIM if sim is None else sim)
     stats = {"dart_split": 0, "merged": 0}
 
@@ -234,6 +235,33 @@ def refine_groups(groups: list[list], codes_of: dict,
                 if a != b:
                     parent[max(a, b)] = min(a, b)
                     stats["merged"] += 1
+
+    # c) 같은 종목 사건 병합 — 대표끼리만 보던 b) 가 놓치는 쌍.
+    #    두 묶음의 대표 종목이 같은 한 종목이고 DART 가
+    #    아니면, 구성 기사 아무 쌍이라도 사건 토큰(가운뎃점 뒤를 자르지 않은
+    #    정규화)이 news.same_event 기준을 넘으면 합친다. 2026-11-12 실측:
+    #    일동제약 '파도프라잔' 5건·한화에어로스페이스 '육군 원팀' 6건이
+    #    2~4묶음으로 갈려 있었다. 종목 없는 시황 기사에는 걸지 않는다 —
+    #    전체 재묶음으로 시험했을 때 개장·마감 시황이 서로 붙었다. 두 종목
+    #    (삼성전자+SK하이닉스) 시황도 날짜가 다른 반등·급락 마감이 붙어서 한 종목만.
+    if int(getattr(C, "NEWS_V2_SAME_TICKER_MERGE", 0)):
+        from .news import event_tokens, same_event
+        toks = [[event_tokens(event_title_norm(x.get("title"))
+                              or str(x.get("title_norm") or "")) for x in g]
+                for g in split]
+        for i in range(n):
+            if _is_dart(reps[i]) or len(cod[i]) != 1:
+                continue
+            for j in range(i + 1, n):
+                if _is_dart(reps[j]) or cod[j] != cod[i]:
+                    continue
+                if ser[i] and ser[j] and not (ser[i] & ser[j]):
+                    continue
+                if find(i) == find(j):
+                    continue
+                if any(same_event(a, b) > 0 for a in toks[i] for b in toks[j]):
+                    parent[max(find(i), find(j))] = min(find(i), find(j))
+                    stats["merged_ticker"] = stats.get("merged_ticker", 0) + 1
 
     merged: dict[int, list] = {}
     for i in range(n):            # 순서 = 가장 앞선 구성 묶음의 위치
@@ -432,6 +460,12 @@ def dart_block(store, focus: Focus, asof, fetch=None) -> tuple[list[str], dict]:
         else:
             out.append(f"• 해당 공시 없음 (대상 {len(codes)}종목)")
         return out + [""], info
+    # 정기보고서(분기·반기·사업보고서, 기재정정 포함)는 맨 아래 한 줄로.
+    import re as _re
+    per_re = _re.compile(C.NEWS_V2_DART_PERIODIC_RE)
+    periodic = [r for r in rows if per_re.search(str(r.get("report_nm") or ""))]
+    rows = [r for r in rows if not per_re.search(str(r.get("report_nm") or ""))]
+    info["periodic"] = sum(int(r.get("_n", 1)) for r in periodic)
     cap = int(C.NEWS_V2_DART_MAX_LINES)
     for r in rows[:cap]:
         name = r.get("corp_name") or focus.names.get(r["stock_code"], r["stock_code"])
@@ -442,6 +476,14 @@ def dart_block(store, focus: Focus, asof, fetch=None) -> tuple[list[str], dict]:
         out.append(f"• <a href=\"{_e(url)}\">{_e(title[:100])}</a>{more}")
     if len(rows) > cap:
         out.append(f"• 외 {len(rows) - cap}건")
+    if periodic:
+        names: list[str] = []
+        for r in periodic:
+            nm = r.get("corp_name") or focus.names.get(r["stock_code"],
+                                                       r["stock_code"])
+            if nm not in names:
+                names.append(nm)
+        out.append(f"• 정기보고서 {info['periodic']}건({_e('·'.join(names))})")
     if res is None:
         out.append("(DART 직접 조회 불가(키 없음·실패) — 수집 배치가 넣은 공시만 표시)")
     elif res.get("truncated"):

@@ -314,8 +314,9 @@ def run(check, near, tmp):
             RS.mode_brief_evening(s, A())
             # [G] 맨 아래 '뉴스 소스 n개 중 m개 수집' 한 줄(사용자 지시 추가)만 뺀다
             from stocknews.news_health import remove_line
-            assert all("뉴스 소스 " in t for t in sent[:2]), sent[:2]
-            assert remove_line(sent[0]) == render_morning_brief(s, fixed, hours=16)
+            # 아침(--no-collect)은 직전 news 회차 기록이 없으면 줄을 생략한다
+            assert "뉴스 소스 " not in sent[0] and "뉴스 소스 " in sent[1], sent[:2]
+            assert sent[0] == render_morning_brief(s, fixed, hours=16)
             assert remove_line(sent[1]) == render_evening_brief(s, fixed, picks=None, hours=16)
             C.REGIME_BANNER = True
             RS.mode_brief_morning(s, A())
