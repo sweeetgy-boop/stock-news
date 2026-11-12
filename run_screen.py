@@ -925,6 +925,8 @@ def mode_daily(store: Store, args) -> int:
     reg = res.get("regime") or {}
     SUMMARY["regime"] = {k: reg.get(k) for k in
                          ("label", "raw_label", "fresh", "above_ma60_pct")}
+    if res.get("index_confirm") is not None:     # [C] 지수 확정 (R3-3)
+        SUMMARY["index_confirm"] = res["index_confirm"]
     SUMMARY.update({"trade_date": res["trade_date"], "scanned": ok,
                     "failed": failed, "picks": len(res["picks"]),
                     "top": [{"rank": i, "ticker": r.ticker, "name": r.name,
@@ -2438,9 +2440,10 @@ def mode_reco_events_backfill(store: Store, args) -> int:
 def mode_regime_backfill(store: Store, args) -> int:
     """[C] 국면 소급 — 달력 전 기간. 1회성, nightly 밖.
 
-    '실시간' 행(daily 단계가 그날 밤 기록한 것)은 관측값을 유지하고 확정
-    국면(label·pending)만 전 기간 기준으로 다시 쓴다. 다시 돌려도 같은
-    결과다(멱등).
+    지수는 FDR 히스토리 현재 값에 KRX 확정 종가(market_context)를 덮어쓴
+    공식 값이다. '실시간' 행도 그 값으로 관측값을 다시 계산한다(R3-3 —
+    지수 히스토리에 그날이 없을 때만 그날 밤 관측값 유지). 다시 돌려도
+    같은 결과다(멱등).
     """
     from stocknews.regime import backfill, periods, regime_rows, transitions
     res = backfill(store, start=args.regime_index_start,
@@ -2454,7 +2457,9 @@ def mode_regime_backfill(store: Store, args) -> int:
     SUMMARY.update({k: v for k, v in res.items()})
     SUMMARY["transitions"] = tr
     SUMMARY["periods"] = periods(df)
-    _say(f"국면 소급 {res['rows']}행 · 실시간 유지 {res['kept_live']}행 · "
+    _say(f"국면 소급 {res['rows']}행 · 실시간 공식 값 재계산 "
+         f"{res.get('live_recomputed', 0)}행(관측값 변경 "
+         f"{res.get('live_changed', 0)}) · 실시간 유지 {res['kept_live']}행 · "
          f"추천 스냅샷 {res['reco_rows']}행 · {res['elapsed_sec']}초")
     _say(f"국면별 거래일 {res['counts']}")
     for t in tr:

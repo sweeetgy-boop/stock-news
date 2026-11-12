@@ -334,6 +334,16 @@ master -> update -> flags -> credit-kiwoom -> stock-flow(미구현, 스킵)
 조회가 실패한 경우(예: 8050 지정단말기 인증 실패)는 **실패**로 세고, 완료
 알림에 `credit-kiwoom 실패: 8050 × N건` 줄이 붙습니다.
 
+`daily` 안에는 **지수 확정** 하위 단계가 있습니다(새 단계 아님, STEPS 불변).
+국면 기록 전에 직전 5거래일 KOSPI·KOSDAQ 종가를 KRX 오픈API 지수 서비스
+(`idx/kospi_dd_trd`·`kosdaq_dd_trd`, `KRX_API_KEY`, 10회/일)로 다시 받아
+`market_context`·`market_regime` 을 공식 값으로 갱신하고 `is_final=1`
+· `index_source='KRX'` 로 표시합니다. 당일 행은 `FDR잠정`(KRX 는 D일분을
+익영업일 08:00 이후 준다). 잠정 판정과 국면이 달라진 날은 WARNING 한 줄
+(`국면 잠정→확정 변경 …`)과 `--json` 의 `index_confirm.regime_changed` 에
+남습니다. 키 없음·호출 실패·빈 응답이면 갱신만 생략하고 경고합니다 —
+daily 종료 코드는 바뀌지 않습니다. 코드: `stocknews/index_confirm.py`.
+
 완주 마커의 `reason` 은 셋입니다. `완주` · `부분 완료`(실패 단계는 없지만
 `update` 적재 0건) · `부분 실패`(실패 단계 있음). 완료 알림 첫 줄도
 `부분 완료` 로 나갑니다.
@@ -405,7 +415,8 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
            holidays (분기 1회 수동 · nightly 밖)
            reco-events-backfill (1회성 · nightly 밖 · RECO_COOLDOWN_DAYS 켜기 전,
                                  지시가 있을 때만. recos 는 읽기만 한다)
-           regime-backfill (국면 소급 · 1회성 수동 · nightly 밖)
+           regime-backfill (국면 소급 · 1회성 수동 · nightly 밖 · 실시간 행도
+                            공식 값으로 다시 계산)
            paper (추천 추적 갱신 · --backfill 소급 편입 · nightly 밖 1회성)
            risk-backfill (σ 소급 1회성 · nightly 밖 · 지시가 있을 때만)
            indicators-backfill (지표 소급 1회성 · nightly 밖 · docs/지표등록.md)

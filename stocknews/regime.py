@@ -47,10 +47,17 @@
     날도 같이 채운다. 실패해도 daily 를 죽이지 않는다(경고만).
     상태 기계는 테이블에 쌓인 raw 열 전체 위에서 돈다.
   · 소급: `--mode regime-backfill` (1회성, nightly 밖). 달력 전 기간을
-    계산한다. 소급 행은 kind='소급'. 이미 있는 '실시간' 행은 그날 밤
-    관측값(fresh·지수 칸·비율·raw)을 유지하고 label·pending 만 전 기간
-    상태 기계 결과로 다시 쓴다(실시간 기록은 기록 시작일부터 상태 기계를
-    돌려 '확정 전' 이 남을 수 있으므로). reco_regime 스냅샷은 바꾸지 않는다.
+    계산한다. 소급 행은 kind='소급'. 지수는 FDR 히스토리의 **현재 값**에
+    market_context 의 KRX 확정 종가를 덮어쓴 공식 값 시계열이다.
+    이미 있는 '실시간' 행도 그 공식 값으로 관측값(fresh·지수 칸·비율·raw)을
+    다시 계산한다(R3-3 — 예전에는 그날 밤 잠정 관측값을 보존했다). 지수
+    히스토리에 그날 행이 없을 때만 그날 밤 관측값을 유지한다. kind·created
+    는 기록 경로라 유지한다. 관측값이 바뀌어 조건·국면이 달라진 실시간 행은
+    WARNING 한 줄씩 남긴다. reco_regime 스냅샷은 바꾸지 않는다.
+  · 지수 확정(R3-3): daily 단계가 국면 기록 전에 `index_confirm` 으로 직전
+    5거래일 KRX 공식 종가를 받아 `apply_confirmed()` 로 그 날짜 행의 지수
+    칸·raw 를 다시 계산하고 확정 표시(is_final=1, index_source='KRX')한다.
+    잠정 판정과 달라지면 WARNING. 당일 행은 index_source='FDR잠정'.
   · 추천 시점 국면: `reco_regime(d, rank, ticker, regime)`. recos 테이블은
     건드리지 않는다.
 """
@@ -72,7 +79,8 @@ __all__ = ["UP", "NEUTRAL", "DOWN", "classify", "confirm",
            "index_close_series", "index_metrics", "breadth_by_date",
            "raw_row", "record_daily", "backfill", "get_row", "get_label",
            "labels_map", "regime_rows", "periods", "transitions",
-           "banner_line", "with_banner", "reco_regimes"]
+           "banner_line", "with_banner", "reco_regimes", "apply_confirmed",
+           "overlay_series", "SRC_KRX", "SRC_PROV", "SRC_FDR"]
 
 UP, NEUTRAL, DOWN = "상승", "중립", "하락"
 
@@ -84,10 +92,17 @@ R_UNCONFIRMED = "확정 전"
 KIND_BACKFILL = "소급"
 KIND_LIVE = "실시간"
 
+# 지수 칸의 출처 (index_source). is_final=1 은 SRC_KRX 뿐이다.
+SRC_KRX = "KRX"          # KRX 오픈API 지수 서비스 공식 값 (확정)
+SRC_PROV = "FDR잠정"     # 그날 밤 FinanceDataReader 값 (잠정)
+SRC_FDR = "FDR"          # regime-backfill 이 쓴 FDR 히스토리 현재 값
+
 _COLS = ("d", "label", "raw_label", "pending_label", "pending_days",
          "kospi_close", "kospi_ma200", "ma200_gap_pct", "kospi_ret_20d",
          "above_ma60_pct", "n_ma60_universe", "fresh", "null_reason", "kind",
-         "calc_version", "created")
+         "calc_version", "created", "is_final", "index_source", "confirmed_at")
+_OBS = ("fresh", "kospi_close", "kospi_ma200", "ma200_gap_pct",
+        "kospi_ret_20d", "raw_label")
 
 
 def _ds(x) -> str:
@@ -198,6 +213,21 @@ def index_metrics(s: pd.Series | None, d: str,
     return out
 
 
+def overlay_series(s: pd.Series | None, official: dict | None
+                   ) -> pd.Series | None:
+    """지수 종가 시계열에 공식 값({d: 종가})을 덮어쓴다(없는 날짜는 추가).
+
+    s 가 None 이면 None — 공식 값 몇 개만으로는 MA200 을 만들 수 없다.
+    """
+    if s is None or not official:
+        return s
+    out = s.copy()
+    for d, v in official.items():
+        if _ok(v) and float(v) > 0:
+            out.loc[_ds(d)] = float(v)
+    return out.sort_index()
+
+
 # ══════════════════════════ MA60 위 비율 ══════════════════════════
 def breadth_by_date(store, dates, since: str | None = None,
                     window: int | None = None,
@@ -286,7 +316,9 @@ def _apply_states(seq: list[str], raws: dict[str, str | None]) -> dict[str, dict
     return dict(zip(seq, st))
 
 
-def _finish(row: dict, state: dict, kind: str, created: str) -> dict:
+def _finish(row: dict, state: dict, kind: str, created: str,
+            source: str | None = None, confirmed_at: str | None = None) -> dict:
+    """source: 지수 칸 출처(SRC_*). 기본은 kind 로 정한다(실시간=잠정)."""
     r = dict(row)
     r["label"] = state["label"]
     r["pending_label"] = state["pending_label"]
@@ -296,6 +328,12 @@ def _finish(row: dict, state: dict, kind: str, created: str) -> dict:
     r["kind"] = kind
     r["calc_version"] = int(C.REGIME_CALC_VERSION)
     r["created"] = created
+    if source is None:
+        source = SRC_PROV if kind == KIND_LIVE else SRC_FDR
+    fresh = bool(r.get("fresh"))
+    r["index_source"] = source if fresh else None
+    r["is_final"] = int(fresh and source == SRC_KRX)
+    r["confirmed_at"] = (confirmed_at or created) if r["is_final"] else None
     return r
 
 
@@ -415,6 +453,10 @@ def record_daily(store, trade_date, fetch=None, min_n: int | None = None
         else:
             raw_idx = fetch(C.REGIME_INDEX, bars)
         kospi = index_close_series(raw_idx)
+        # 지수 확정(index_confirm.IndexConfirm.fetch)이 공식 값을 덮어쓴 날짜.
+        # 그 날짜를 보충하면 확정(KRX)으로 표시한다. 일반 FDR 프레임엔 없다.
+        final = set((getattr(raw_idx, "attrs", None) or {})
+                    .get("krx_confirmed") or ())
         # 달력 창으로 자르면 장기 거래정지 종목의 '자기 60봉' 이 창 밖으로
         # 밀려 소급값과 어긋난다(실측 2411 vs 2412). 종목별 마지막 N봉만
         # 읽는 tail_only 는 소급과 정확히 같다. 실시간과 소급이 같은 날 같은
@@ -429,7 +471,9 @@ def record_daily(store, trade_date, fetch=None, min_n: int | None = None
         seq = [x for x in seq if x <= td]
         states = _apply_states(seq, raws)
         created = _now()
-        rows = [_finish(new[x], states[x], KIND_LIVE, created) for x in targets]
+        rows = [_finish(new[x], states[x], KIND_LIVE, created,
+                        source=SRC_KRX if x in final else SRC_PROV)
+                for x in targets]
         with closing(sqlite3.connect(store.path, timeout=30.0)) as con:
             _upsert(con, rows)
             n_reco = _fill_reco_regime(con, td, rows[-1]["label"], KIND_LIVE,
@@ -453,13 +497,53 @@ def record_daily(store, trade_date, fetch=None, min_n: int | None = None
 
 
 # ══════════════════════════ 소급 (1회성) ══════════════════════════
+def _obs_changed(old: dict, new: dict, tol: float | None = None) -> bool:
+    """지수 관측값(fresh·종가·MA200·raw)이 달라졌는가."""
+    t = float(C.INDEX_CONFIRM_TOL if tol is None else tol)
+    if bool(old.get("fresh")) != bool(new.get("fresh")):
+        return True
+    if old.get("raw_label") != new.get("raw_label"):
+        return True
+    for c in ("kospi_close", "kospi_ma200"):
+        a, b = old.get(c), new.get(c)
+        if _ok(a) != _ok(b):
+            return True
+        if _ok(a) and abs(float(a) - float(b)) > t:
+            return True
+    return False
+
+
+def _fmt(x, fmt: str = ",.2f") -> str:
+    return "NULL" if not _ok(x) else format(float(x), fmt)
+
+
+def _change(d: str, old: dict, new: dict) -> dict:
+    return {"d": d,
+            "raw": [old.get("raw_label"), new.get("raw_label")],
+            "label": [old.get("label"), new.get("label")],
+            "kospi_close": [old.get("kospi_close"), new.get("kospi_close")],
+            "kospi_ma200": [old.get("kospi_ma200"), new.get("kospi_ma200")],
+            "above_ma60_pct": new.get("above_ma60_pct")}
+
+
+def _log_change(prefix: str, ch: dict) -> None:
+    log.warning("%s %s · 조건 %s→%s · 국면 %s→%s (KOSPI %s→%s · MA200 %s→%s · "
+                "MA60 위 %s%%)", prefix, ch["d"],
+                ch["raw"][0] or "NULL", ch["raw"][1] or "NULL",
+                ch["label"][0] or "NULL", ch["label"][1] or "NULL",
+                _fmt(ch["kospi_close"][0]), _fmt(ch["kospi_close"][1]),
+                _fmt(ch["kospi_ma200"][0]), _fmt(ch["kospi_ma200"][1]),
+                _fmt(ch["above_ma60_pct"], ".1f"))
+
+
 def backfill(store, start: str = "2024-01-01", cache_dir=None,
              index=None, min_n: int | None = None,
              allow_network: bool = True) -> dict:
-    """달력 전 기간 국면 소급. '실시간' 행의 관측값은 덮어쓰지 않는다.
+    """달력 전 기간 국면 소급. 지수는 공식 값 시계열(모듈 머리말 '소급').
 
     index : 테스트용 주입구. KOSPI 일봉 DataFrame/Series. 없으면
             `events.load_index_history(start=, cache_dir=)`.
+            어느 쪽이든 market_context 의 KRX 확정 종가를 덮어쓴다.
     """
     t0 = time.perf_counter()
     cal = _calendar(store)
@@ -471,26 +555,53 @@ def backfill(store, start: str = "2024-01-01", cache_dir=None,
                                   cache_dir=cache_dir,
                                   allow_network=allow_network)
         index = hist.get(str(C.REGIME_INDEX).upper())
-    kospi = index_close_series(index)
+    from .index_confirm import stored_official
+    krx = stored_official(store).get(str(C.REGIME_INDEX).upper(), {})
+    kospi = overlay_series(index_close_series(index), krx)
     t_idx = time.perf_counter()
     br = breadth_by_date(store, cal)
     t_br = time.perf_counter()
 
+    calset = set(cal)
     stored = _stored(store)
     live = {d: r for d, r in stored.items() if r.get("kind") == KIND_LIVE}
-    new = {d: raw_row(d, kospi, br, min_n=min_n) for d in cal if d not in live}
-    raws = {d: r.get("raw_label") for d, r in live.items()}
+    # 실시간 행 중 공식 값으로 다시 계산할 것 = 달력 안 + 지수에 그날 행 있음.
+    # 나머지(지수 히스토리에 그날이 없음)는 그날 밤 관측값을 유지한다.
+    redo = {d for d in live if d in calset and kospi is not None
+            and d in kospi.index}
+    keep = {d: r for d, r in live.items() if d not in redo}
+    new = {d: raw_row(d, kospi, br, min_n=min_n)
+           for d in cal if d not in keep}
+    raws = {d: r.get("raw_label") for d, r in keep.items()}
     raws.update({d: r["raw_label"] for d, r in new.items()})
-    seq = sorted(set(cal) | set(raws))
+    seq = sorted(calset | set(raws))
     states = _apply_states(seq, raws)
     created = _now()
-    rows = [_finish(new[d], states[d], KIND_BACKFILL, created)
-            for d in seq if d in new]
-    # '실시간' 행: 그날 밤 관측값(fresh·지수 칸·비율·raw)은 그대로 두고,
-    # 확정 국면(label·pending)만 전 기간 상태 기계로 다시 쓴다. 실시간
-    # 기록은 기록이 시작된 날부터 상태 기계를 돌리므로 소급 전에는 '확정
-    # 전' 으로 남아 있을 수 있다. 추천 시점 스냅샷(reco_regime)은 그대로다.
-    for d, r in live.items():
+    rows: list[dict] = []
+    changed: list[dict] = []
+    for d in seq:
+        if d not in new:
+            continue
+        src = SRC_KRX if d in krx else SRC_FDR
+        if d in redo:
+            old = live[d]
+            r = _finish(new[d], states[d], KIND_LIVE, old.get("created"),
+                        source=src,
+                        confirmed_at=old.get("confirmed_at") or created)
+            if _obs_changed(old, r):
+                ch = _change(d, old, r)
+                changed.append(ch)
+                if ch["raw"][0] != ch["raw"][1] or \
+                        ch["label"][0] != ch["label"][1]:
+                    _log_change("국면 소급: 실시간 기록 공식 값으로 갱신", ch)
+        else:
+            r = _finish(new[d], states[d], KIND_BACKFILL, created, source=src,
+                        confirmed_at=created)
+        rows.append(r)
+    # 지수 히스토리에 그날이 없는 '실시간' 행: 그날 밤 관측값은 그대로 두고
+    # 확정 국면(label·pending)만 전 기간 상태 기계로 다시 쓴다.
+    # 추천 시점 스냅샷(reco_regime)은 그대로다.
+    for d, r in keep.items():
         st = states[d]
         r2 = {c: r.get(c) for c in _COLS}
         r2["label"] = st["label"]
@@ -510,7 +621,12 @@ def backfill(store, start: str = "2024-01-01", cache_dir=None,
         con.commit()
     t_end = time.perf_counter()
     allrows = regime_rows(store)
-    return {"ok": True, "rows": len(rows) - len(live), "kept_live": len(live),
+    return {"ok": True, "rows": len(rows) - len(live), "kept_live": len(keep),
+            "live_recomputed": len(redo),
+            "live_changed": len(changed),
+            "live_label_changed": [c for c in changed
+                                   if c["label"][0] != c["label"][1]],
+            "krx_overlay": len(krx),
             "calendar": [cal[0], cal[-1], len(cal)],
             "index_range": (None if kospi is None
                             else [kospi.index[0], kospi.index[-1], len(kospi)]),
@@ -519,6 +635,94 @@ def backfill(store, start: str = "2024-01-01", cache_dir=None,
             "elapsed_index_sec": round(t_idx - t0, 2),
             "elapsed_breadth_sec": round(t_br - t_idx, 2),
             "counts": summarize(allrows)}
+
+
+# ══════════════════════════ 지수 확정 (daily 단계) ══════════════════════════
+def apply_confirmed(store, kospi: pd.Series | None, dates, upto: str | None = None,
+                    confirmed_at: str | None = None,
+                    min_n: int | None = None) -> dict:
+    """KRX 공식 값으로 확정된 날짜들의 국면 행을 다시 판정한다.
+
+    kospi : 공식 값을 덮어쓴 KOSPI 종가 시계열 (`overlay_series`).
+    dates : 확정된 날짜. 이미 있는 행만 고친다(없는 날은 뒤이은
+            `record_daily` 보충이 공식 값 시계열로 채운다).
+    MA60 위 비율은 그 행에 기록된 값을 그대로 쓴다(지수와 무관).
+    지수 칸·raw 를 다시 계산하고 is_final=1 · index_source='KRX' 로 표시한
+    뒤, 상태 기계를 다시 돌려 확정 날짜 중 가장 이른 날 이후 행의
+    label·pending 을 고친다. 잠정 판정과 조건·국면이 달라진 날은
+    WARNING 한 줄씩 남긴다. 값이 그대로면 쓰지 않는다(멱등).
+    """
+    created = confirmed_at or _now()
+    stored = _stored(store)
+    targets = sorted(_ds(d) for d in dates if _ds(d) in stored)
+    out = {"updated": 0, "changed": [], "targets": targets}
+    if not targets or kospi is None:
+        return out
+    upd: dict[str, dict] = {}
+    for d in targets:
+        old = stored[d]
+        br = {d: (old.get("above_ma60_pct"), None,
+                  int(old.get("n_ma60_universe") or 0))}
+        rr = raw_row(d, kospi, br, min_n=min_n)
+        r = {c: old.get(c) for c in _COLS}
+        for c in ("fresh", "kospi_close", "kospi_ma200", "ma200_gap_pct",
+                  "kospi_ret_20d", "raw_label", "null_reason"):
+            r[c] = rr[c]
+        if r["fresh"]:
+            r["is_final"], r["index_source"] = 1, SRC_KRX
+            r["confirmed_at"] = (old.get("confirmed_at")
+                                 if old.get("is_final") == 1
+                                 and old.get("index_source") == SRC_KRX
+                                 else created)
+        upd[d] = r
+    merged = {**stored, **upd}
+    raws = {d: r.get("raw_label") for d, r in merged.items()}
+    last = max(raws) if upto is None else max(_ds(upto), max(raws))
+    first = min(raws)
+    seq = sorted({x for x in _calendar(store) if first <= x <= last}
+                 | set(raws))
+    states = _apply_states(seq, raws)
+    writes = []
+    for d in sorted(merged):
+        if d < targets[0]:
+            continue
+        old, r = stored[d], dict(merged[d])
+        st = states[d]
+        r["label"] = st["label"]
+        r["pending_label"] = st["pending_label"]
+        r["pending_days"] = int(st["pending_days"] or 0)
+        if r["raw_label"] is not None:
+            r["null_reason"] = None if st["label"] is not None else R_UNCONFIRMED
+        same = all(_same(old.get(c), r.get(c)) for c in _COLS)
+        if same:
+            continue
+        writes.append(r)
+        if old.get("raw_label") != r.get("raw_label") or \
+                old.get("label") != r.get("label"):
+            ch = _change(d, old, r)
+            ch["confirmed"] = d in upd
+            out["changed"].append(ch)
+            _log_change("국면 잠정→확정 변경" if d in upd
+                        else "국면 확정값 반영으로 변경", ch)
+    if writes:
+        with closing(sqlite3.connect(store.path, timeout=30.0)) as con:
+            _upsert(con, writes)
+            con.commit()
+    out["updated"] = len(writes)
+    return out
+
+
+def _same(a, b) -> bool:
+    """저장값 비교. NULL·NaN 은 같다고 보고, 숫자는 숫자로 비교한다."""
+    na, nb = not _ok(a), not _ok(b)
+    if na or nb:
+        return na and nb
+    if isinstance(a, str) or isinstance(b, str):
+        return a == b
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return a == b
 
 
 # ══════════════════════════ 요약 ══════════════════════════

@@ -111,7 +111,19 @@ CREATE TABLE IF NOT EXISTS reco_regime (
   PRIMARY KEY (d, rank)
 );
 """
-MIGRATIONS_C = ()
+# 지수 확정 표시 (R3-3, stocknews/index_confirm.py) — market_context·market_regime 공통
+#   is_final      1 = KRX 오픈API 공식 값으로 확정. 0 = 잠정. NULL = 이 컬럼 이전 기록
+#   index_source  'KRX'(공식) / 'FDR잠정'(그날 밤 FinanceDataReader) /
+#                 'FDR'(regime-backfill 이 FDR 히스토리 현재 값으로 소급) / NULL
+#   confirmed_at  확정 시각(KST)
+MIGRATIONS_C = (
+    ("market_context", "is_final", "INTEGER"),
+    ("market_context", "index_source", "TEXT"),
+    ("market_context", "confirmed_at", "TEXT"),
+    ("market_regime", "is_final", "INTEGER"),
+    ("market_regime", "index_source", "TEXT"),
+    ("market_regime", "confirmed_at", "TEXT"),
+)
 # (C 구역 끝)
 
 

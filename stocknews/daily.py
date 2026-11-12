@@ -380,9 +380,16 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     # 국면 스냅샷(reco_regime)도 같이 남긴다. 실패를 삼킨다(기록 전용).
     # 지수는 market_context 와 별개로 다시 받는다 — 신선도는 regime 이
     # 그날 행 유무로 독립 판정한다.
+    # [C] 지수 확정(R3-3): 국면 기록 전에 직전 5거래일 지수를 KRX 공식 값으로
+    # 확정하고(market_context·market_regime), 당일 행은 잠정 표시한다. 키
+    # 없음·KRX 실패면 생략(경고만). record_daily 는 공식 값을 덮어쓴 지수를
+    # 받는다 — 확정이 없으면 아래 조회 그대로다.
+    from .index_confirm import confirm_recent
     from .regime import record_daily
-    reg = record_daily(store, trade_date,
-                       fetch=lambda name, bars: load_index(name, bars=bars))
+    idxc = confirm_recent(
+        store, trade_date,
+        fetch=lambda name, bars: load_index(name, bars=bars))
+    reg = record_daily(store, trade_date, fetch=idxc.fetch)
 
     # [E] 종목별 EWMA σ. 기록 전용(점수에 들어가지 않는다) · 플래그 OFF 면
     # 아무것도 하지 않는다. 실패해도 스캔·추천 기록은 이미 커밋돼 있다.
@@ -400,7 +407,8 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     out = {"trade_date": trade_date, "results": results, "errors": errors,
            "picks": picks, "snapshot_rows": saved,
            "market_context": mkt, "sector_metrics": sec,
-           "regime": reg, "indicator_log": ind}
+           "regime": reg, "indicator_log": ind,
+           "index_confirm": idxc.summary}
     if risk_rep is not None:
         out["risk_metrics"] = risk_rep
     return out
