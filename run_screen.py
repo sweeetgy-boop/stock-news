@@ -59,6 +59,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from stocknews import config as _cfg
 from stocknews.config import DEFAULT
 from stocknews.data import krx_daily_prices
 from stocknews.daily import run_daily, scan_all, select_recommendations
@@ -207,7 +208,8 @@ _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "credit-kiwoom", "collect-dividends", "dividend-report",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
                 "flash", "pos-open", "fill", "pos-close", "holidays",
-                "reconcile", "reco-events-backfill", "regime-backfill"}
+                "reconcile", "reco-events-backfill", "regime-backfill",
+                "paper"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -230,7 +232,8 @@ def _say(*args, **kwargs) -> None:
     print(*args, **kwargs)
 
 
-def _emit(text: str, dry: bool) -> None:
+def _emit(text: str, dry: bool) -> bool | None:
+    """발송. 반환: 실발송이면 한 명 이상 받았는가(bool), dry-run 이면 None."""
     if dry:
         # --json 과 함께 쓸 때 stdout 을 오염시키지 않도록 stderr 로 보낸다.
         out = _out()
@@ -238,14 +241,14 @@ def _emit(text: str, dry: bool) -> None:
         print(text, file=out)
         print("=" * 62, file=out)
         SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
-        return
+        return None
     # 발송 실패를 성공으로 집계하면 무음 장애를 알아챌 수 없다.
     report = send_telegram(text)
     SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
     if report:
         log.info("텔레그램 발송 완료 (%d자 · 수신자 %d명)",
                  len(text), report.sent)
-        return
+        return True
     # 수신자별 상세를 남긴다. 개수만 세면 "두 명 중 누가 못 받았나"를
     # 알 수 없고, 그게 바로 알아야 하는 정보다.
     SUMMARY["send_failed"] = (SUMMARY.get("send_failed", 0)
@@ -253,6 +256,7 @@ def _emit(text: str, dry: bool) -> None:
     SUMMARY.setdefault("send_failures", []).extend(report.as_dicts())
     log.error("텔레그램 %s (%d자 · 성공 %d명)",
               report.summary(), len(text), report.sent)
+    return report.sent > 0
 
 
 def _partial(ok: int, failed: int) -> bool:
@@ -584,8 +588,12 @@ def _holdings_msg(store: Store, args, asof, trade_date: str, scanned: int,
     """발송 요일이 아닌 날의 daily 메시지. 신규 추천은 넣지 않는다."""
     positions = store.list_positions("OPEN")
     pm = {p.ticker: store.load_ohlcv(p.ticker, days=5) for p in positions}
+    # [v2 D·F] 평일 종목 발송을 켜면 추천은 저녁 브리핑에서 나간다.
+    note = ("• 새 추천은 저녁 브리핑에서 발송됩니다"
+            if (_cfg.PAPER_TRACKING or _cfg.DAILY_LIST_V2) else None)
     _emit(render_daily_holdings(positions, pm, asof, trade_date,
-                                scanned, picks, dow_label), args.dry_run)
+                                scanned, picks, dow_label, reco_note=note),
+          args.dry_run)
 
 
 def _send_charts(store: Store, args, trade_date: str, picks=None,
@@ -754,6 +762,9 @@ def _daily_send_only(store: Store, args, asof, send_ok: bool,
         SUMMARY.update({"skipped": True, "reason": "off_dow"})
         return EXIT_OK
     expected = _prev_trading_day(store, asof.date())
+    if _cfg.PAPER_TRACKING:
+        # [v2 D] 새 추천 목록 대신 주간 성적표. 추천은 평일 저녁에 이미 나갔다.
+        return _paper_sunday(store, args, asof, expected)
     rows = store.reco_history(days=1)
     got = str(rows.iloc[0]["d"]) if rows is not None and len(rows) else None
     SUMMARY.update({"trade_date": expected, "reco_date": got})
@@ -839,6 +850,9 @@ def mode_daily(store: Store, args) -> int:
                         "trade_date": trade_date})
         if not send_ok:
             return EXIT_OK
+        if _cfg.PAPER_TRACKING:
+            return _paper_sunday(store, args, asof,
+                                 _prev_trading_day(store, asof.date()))
         # 발송 요일이다. 새로 스캔하지 않고 마지막 거래일에 기록된 추천을 낸다.
         rows = store.reco_history(days=1)
         n = 0 if rows is None else int(len(rows))
@@ -949,6 +963,15 @@ def mode_weekly(store: Store, args) -> int:
         except Exception as exc:  # noqa: BLE001 - 주간 리포트 본문은 지킨다
             log.warning("추천 필터 검증 표 실패 (%s: %s)",
                         type(exc).__name__, exc)
+    if _cfg.PAPER_TRACKING:
+        # [v2 D] 그림자 청산 비교표 (기록 전용 · 신호 발송 아님)
+        try:
+            from stocknews import paper, paper_render
+            pd_ = paper.PaperData(
+                store, paper.brief_date(store, getattr(args, "asof", None)))
+            text += "\n\n" + paper_render.weekly_shadow_block(pd_, pd_.upto)
+        except Exception as exc:  # noqa: BLE001 - 부가 표
+            log.warning("그림자 청산 표 실패 — 생략: %s", exc)
     _emit(text, args.dry_run)
     return EXIT_OK
 
@@ -1067,6 +1090,9 @@ def mode_brief_evening(store: Store, args) -> int:
                           use_dart=not args.no_dart)
         process_and_store(store, raw)
 
+    if _cfg.PAPER_TRACKING or _cfg.DAILY_LIST_V2:
+        return _brief_evening_v2(store, args)
+
     picks = None
     foot = None
     rec = store.reco_history(days=1)
@@ -1132,6 +1158,152 @@ def _send_watch_charts(store: Store, args) -> None:
     SUMMARY["watch_charts"] = info
     log.info("관심종목 차트 앨범 없음 (%s)",
              info.get("skipped") or info.get("error") or "등급 매겨진 관심종목 0")
+
+
+def _paper_update(store, d) -> dict:
+    """[v2 D] 추적 갱신. 실패해도 발송은 계속한다."""
+    from stocknews import paper
+    try:
+        st = paper.update(store, upto=d)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("추천 추적 갱신 실패 — 발송은 계속: %s", exc)
+        SUMMARY["paper"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+        return {}
+    data = st.pop("_data", None)
+    SUMMARY["paper"] = st
+    if st.get("warning"):
+        SUMMARY.setdefault("warnings", []).append(st["warning"])
+    return {"data": data}
+
+
+def _brief_evening_v2(store, args) -> int:
+    """[v2 D·F] 평일 저녁 브리핑 — 뉴스 + 종목 부분(①②③④).
+
+    관심종목 목록·관심종목 앨범은 DAILY_LIST_V2 면 빠진다. 앨범은 ① 종목만.
+    ① 이 실제로 발송되면(dry-run 아님, 한 명 이상 수신) 발송 기록을 남긴다
+    — 추적 편입의 근거다(PAPER_TRACKING 이면 다음 거래일 시가에 편입).
+    """
+    from stocknews import paper, paper_render
+    d = paper.brief_date(store, getattr(args, "asof", None))
+    SUMMARY.update({"news_hours": args.news_hours, "trade_date": d})
+    if d is None:
+        log.error("시세가 없어 기준 거래일을 정할 수 없습니다")
+        return EXIT_PRECOND
+    pdata = None
+    if _cfg.PAPER_TRACKING:
+        pdata = _paper_update(store, d).get("data")
+    block, info = paper_render.weekday_block(store, d, pdata=pdata)
+    asof = _asof(args)
+    show_watch = not _cfg.DAILY_LIST_V2
+    text = render_evening_brief(store, asof, picks=None, hours=args.news_hours,
+                                stock_block=block, watchlist=show_watch)
+    if len(text) > paper_render.TEXT_LIMIT and _cfg.PAPER_TRACKING:
+        # ③ 을 먼저 줄인다. 그래도 넘으면 send_telegram 이 4,096 자로 나눈다.
+        room = paper_render.TEXT_LIMIT - (len(text) - len(block))
+        block, info = paper_render.weekday_block(store, d, pdata=pdata,
+                                                 limit_room=max(0, room))
+        text = render_evening_brief(store, asof, picks=None,
+                                    hours=args.news_hours, stock_block=block,
+                                    watchlist=show_watch)
+    SUMMARY.update({"picks": info.get("rows", 0),
+                    "new_recos": info.get("new_tickers", []),
+                    "stale_recos": info.get("stale"),
+                    "tracking": info.get("tracking"),
+                    "text_len": len(text)})
+    # [C] 국면 배너는 맨 위 한 줄 (REGIME_BANNER OFF 면 그대로).
+    text = with_regime_banner(store, text)
+    sent = _emit(text, args.dry_run)
+    if sent and info.get("new_tickers"):
+        SUMMARY["sends_recorded"] = paper.record_sends(
+            store, d, info["new_tickers"], paper.KIND_NEW)
+    if info.get("new_rows"):
+        rows = pd.DataFrame(info["new_rows"])
+        rows["rank"] = range(1, len(rows) + 1)      # ① 의 번호와 같게
+        _send_charts(store, args, d, rows=rows, key="new_charts", prefix="N")
+    if show_watch:
+        _send_watch_charts(store, args)
+    return EXIT_OK
+
+
+def _paper_sunday(store, args, asof, trade_d: str | None) -> int:
+    """[v2 D] 일요일 — 새 추천 목록 대신 주간 성적표 + 누적 곡선 1장 +
+    이번 주 새 추천 차트 앨범(없으면 생략)."""
+    from stocknews import paper, paper_render
+    from stocknews.chart import chart_path
+    trade_d = trade_d or paper.brief_date(store, None)
+    SUMMARY.update({"trade_date": trade_d, "paper_scorecard": True,
+                    "reco_sent": False})
+    if trade_d is None:
+        return EXIT_PRECOND
+    pdata = _paper_update(store, trade_d).get("data")
+    pd_ = pdata or paper.PaperData(store, trade_d)
+    text, info = paper_render.sunday_scorecard(store, asof, trade_d, pdata=pd_)
+    SUMMARY["scorecard"] = {k: v for k, v in info.items() if k != "week_tickers"}
+    _emit(text, args.dry_run)
+    try:
+        pts = paper_render.curve_points(pd_, trade_d)
+        path = paper_render.curve_chart(
+            pd_, trade_d, chart_path(trade_d, 0, "curve", DEFAULT, prefix="P"))
+        if path is not None:
+            cap = paper_render.curve_caption(pts, trade_d)
+            SUMMARY["curve_chart"] = str(path)
+            if args.dry_run:
+                _say("-" * 62)
+                _say(f"[누적 곡선 1장] {path}")
+                _say("    " + cap.replace("\n", "\n    "))
+            else:
+                send_album([(path, cap)])
+    except Exception as exc:  # noqa: BLE001 - 차트는 부가 정보
+        log.warning("누적 곡선 실패 — 건너뜀: %s", exc)
+        SUMMARY["curve_chart_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    wk = info.get("week_tickers") or []
+    if wk:
+        # 이번 주 새로 추천된 종목만. 신호일의 recos 행으로 그린다.
+        rec = store.recos_between(info["week"][0], info["week"][1])
+        pos = paper.PaperBook(store).positions()
+        pos = pos[pos["signal_d"].between(info["week"][0], info["week"][1])]
+        keys = set(zip(pos["signal_d"], pos["ticker"]))
+        rows = rec[[(str(d), str(t)) in keys
+                    for d, t in zip(rec["d"], rec["ticker"])]]
+        rows = rows.drop_duplicates("ticker").reset_index(drop=True)
+        rows["rank"] = range(1, len(rows) + 1)
+        if len(rows):
+            _send_charts(store, args, trade_d, rows=rows, key="week_charts",
+                         prefix="P")
+    return EXIT_OK
+
+
+def mode_paper(store: Store, args) -> int:
+    """[v2 D] 추천 추적 갱신 / 소급 편입(--backfill). nightly 밖 1회성 명령.
+
+    --backfill : 운영 로그(--sent-log-dir, 기본 logs)에서 실제 발송된 추천
+                 기준일을 찾아 발송 기록을 만들고, 같은 날짜로 편입·성적·
+                 무작위 대조군·그림자 청산을 채운다. 다시 돌려도 같다(추가 전용).
+    """
+    from stocknews import paper
+    t0 = time.time()
+    upto = paper.brief_date(store, getattr(args, "asof", None))
+    if args.backfill:
+        st = paper.backfill(store, log_dir=args.sent_log_dir, upto=upto)
+        SUMMARY["event_counts"] = paper.event_counts(
+            store, st.get("sent_dates") or [])
+    else:
+        st = paper.update(store, upto=upto)
+    st.pop("_data", None)
+    SUMMARY["paper"] = st
+    book = paper.PaperBook(store)
+    pos = book.positions()
+    SUMMARY["totals"] = {
+        "positions": int(len(pos)),
+        "enrolled": int((pos["enrolled"] == 1).sum()) if len(pos) else 0,
+        "not_enrolled": int((pos["enrolled"] == 0).sum()) if len(pos) else 0,
+        "results": int(len(book.results())),
+        "bundles": int(len(book.bundles())),
+        "random_results": int(len(book.random_results())),
+        "shadow": int(len(book.shadow())),
+    }
+    SUMMARY["elapsed_paper_sec"] = round(time.time() - t0, 1)
+    return EXIT_PARTIAL if st.get("errors") else EXIT_OK
 
 
 class _RecoRow:
@@ -2215,6 +2387,7 @@ MODES = {
     "pos-close": mode_pos_close,
     "reco-events-backfill": mode_reco_events_backfill,
     "regime-backfill": mode_regime_backfill,
+    "paper": mode_paper,
 }
 
 
@@ -2313,6 +2486,10 @@ def main(argv=None) -> int:
     ap.add_argument("--export-days", type=int, default=10,
                     help="export: 스냅샷 소급 일수")
     # ── 에이전트 연동 ──
+    ap.add_argument("--backfill", action="store_true",
+                    help="paper: 운영 로그 기준 소급 편입 (1회성)")
+    ap.add_argument("--sent-log-dir", default="logs",
+                    help="paper --backfill: 발송 기록을 찾을 로그 폴더")
     ap.add_argument("--json", action="store_true",
                     help="결과 요약을 stdout 에 JSON 한 줄로 출력 "
                          "(로그는 stderr 로 분리)")

@@ -849,6 +849,37 @@ REGIME_CALC_VERSION = 1
 
 # ── [D·F] 추천 추적 · 평일 종목 발송 개편 ──
 # (DF 구역 시작)
+# [D] 추천 추적(종이 편입). 실제 발송된 새 추천을 다음 거래일 시가로 편입해
+#     20거래일까지 표시, 40·60거래일까지 기록한다. 기록 전용 — 점수·추천
+#     선정·실제 보유(positions)와 무관하다. OFF = 평일·일요일 발송이 지금과
+#     바이트 단위로 같다. 모듈: stocknews/paper.py, paper_render.py
+PAPER_TRACKING = False
+# [F] 평일 저녁 브리핑의 종목 부분을 ①새 추천 ②만기 ③추적 요약 ④제외 한 줄로
+#     바꾼다. 관심종목 목록·관심종목 앨범은 발송에서 빠진다(데이터는 그대로).
+#     PAPER_TRACKING 이 꺼져 있으면 ①④ + "추천 유지 n일째" 한 줄만.
+DAILY_LIST_V2 = False
+# 표시 기간(거래일). 만기 = 진입일을 1일째로 센 20일째 종가.
+PAPER_DISPLAY_DAYS = 20
+# 기록 보유기간(거래일). 표시하지 않는 40·60 도 확정 기록한다.
+PAPER_RECORD_HORIZONS = (5, 10, 20, 40, 60)
+# 무작위 대조군: 편입일마다 같은 수를 100묶음, 고정 시드.
+# 시드 = (PAPER_RANDOM_SEED, 신호일 YYYYMMDD) — 날짜마다 다르고 재실행해도 같다.
+PAPER_RANDOM_BUNDLES = 100
+PAPER_RANDOM_SEED = 20261112
+# ③ 추적 요약의 상위·하위 표시 수.
+PAPER_SUMMARY_TOPN = 3
+# 지수 히스토리 CSV 캐시 (네트워크 실패 시 사용). cwd 기준.
+PAPER_INDEX_CACHE = "data/index_cache"
+# 그림자 청산 — 대안 세트 1개. **2026-11-12 고정. 이후 변경 금지.**
+#   손절 = 진입가 − 2×ATR14, 단 손절폭은 10% 이상 15% 이하로 자른다.
+#   MA20 이탈 = 2일 연속 확인. 고점 트레일링 15%, 진입가 대비 +10% 이후 활성.
+#   나머지 규칙(익절·목표·시간·만기)은 현행 엔진 그대로.
+PAPER_ALT_ATR_MULT = 2.0
+PAPER_ALT_STOP_MIN_PCT = 10.0
+PAPER_ALT_STOP_MAX_PCT = 15.0
+PAPER_ALT_MA_CONFIRM_DAYS = 2
+PAPER_ALT_TRAIL_PCT = 15.0
+PAPER_ALT_TRAIL_ARM_PCT = 10.0
 # (DF 구역 끝)
 
 # ── [E] 위험 정보 ──

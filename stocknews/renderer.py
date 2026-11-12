@@ -420,7 +420,8 @@ def render_reco_missing(asof, expected: str | None, got: str | None) -> str:
 
 def render_daily_holdings(positions: list, price_map: dict | None, asof,
                           trade_date: str, scanned: int, picks: int,
-                          send_dow_label: str = "일요일") -> str:
+                          send_dow_label: str = "일요일",
+                          reco_note: str | None = None) -> str:
     """발송 요일이 아닌 날의 daily 메시지. 보유 종목 상태만.
 
     신규 추천 종목은 한 종목도 넣지 않는다. 개수만 알린다 — 파이프라인이
@@ -430,7 +431,7 @@ def render_daily_holdings(positions: list, price_map: dict | None, asof,
     out.append("━━ 오늘 스캔 ━━")
     out.append(f"• 기준일 {trade_date} · {scanned:,}종목 스캔 · "
                f"추천 {picks}건 기록")
-    out.append(f"• 추천 목록은 {send_dow_label}에 발송됩니다")
+    out.append(reco_note or f"• 추천 목록은 {send_dow_label}에 발송됩니다")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
     return "\n".join(out)
 
@@ -946,15 +947,23 @@ def render_morning_brief(store, asof, hours: int = 16,
 
 def render_evening_brief(store, asof, picks: list | None = None,
                          hours: int = 12, per_section: int = 6,
-                         foot_lines: list | None = None) -> str:
+                         foot_lines: list | None = None,
+                         stock_block: str | None = None,
+                         watchlist: bool = True) -> str:
     """저녁 브리핑 (장마감 후). 국내 뉴스 정리 + 추천 10선 교차.
 
     foot_lines : 종목 부분 맨 아래 줄 ([B] "오늘 제외 — ..."). None 이면 예전과 같다.
+    stock_block : [v2 D·F] 종목 부분(①②③④). 주면 '추천 10선 뉴스 연동'
+                  자리에 들어가고, 뉴스가 없어도 나간다. None = 지금 그대로.
+    watchlist   : False 면 관심종목 목록을 넣지 않는다 (DAILY_LIST_V2).
     """
     df = store.news_since(hours=hours, region="KR")
     out = [f"🌙 <b>[저녁 뉴스 정리]</b> {asof:%Y-%m-%d %H:%M}"]
     if df is None or df.empty:
         out.append("\n• 국내 뉴스 수집분이 없습니다.")
+        if stock_block is None:
+            return "\n".join(out)
+        out += ["", stock_block, "", f"⏰ {asof:%Y-%m-%d %H:%M:%S}"]
         return "\n".join(out)
 
     tm = _tick_map(store, [r for _, r in df.iterrows()])
@@ -979,7 +988,10 @@ def render_evening_brief(store, asof, picks: list | None = None,
         out.append("")
 
     # 추천 10선과 뉴스 교차 — 뉴스가 붙은 추천 종목을 표시한다
-    if picks:
+    if stock_block is not None:
+        out.append(stock_block)
+        out.append("")
+    elif picks:
         codes = {r.ticker for _, r in picks}
         m = store.news_ticker_map(df["id"].tolist())
         hit: dict = {}
@@ -1005,8 +1017,9 @@ def render_evening_brief(store, asof, picks: list | None = None,
         out += list(foot_lines)
         out.append("")
 
-    out.append(render_watchlist(store))
-    out.append("")
+    if watchlist:
+        out.append(render_watchlist(store))
+        out.append("")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
     return "\n".join(out)
 

@@ -71,6 +71,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "reco-events-backfill": 300,
     # [C] 국면 소급. 1회성. 지수 조회 + 전 기간 시세 1회 읽기.
     "regime-backfill": 900,
+    # [v2 D] 추천 추적 갱신 / 소급 편입(--backfill). nightly 밖 1회성.
+    "paper": 1800,
 }
 DEFAULT_TIMEOUT = 900
 
