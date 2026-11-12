@@ -845,6 +845,19 @@ REGIME_MIN_BREADTH_N = 500
 # daily 가 기록할 때 최근 이 거래일 수 안의 빠진 날을 같이 채운다.
 REGIME_GAP_FILL_DAYS = 10
 REGIME_CALC_VERSION = 1
+# 지수 확정값 (R3-3, stocknews/index_confirm.py). daily 단계 안, 국면 기록 전에
+# 직전 N거래일 KOSPI·KOSDAQ 종가를 KRX 오픈API 지수 서비스로 다시 받아
+# market_context·market_regime 을 공식 값으로 갱신하고 확정 표시한다.
+# 당일분은 익영업일 08:00 이후 제공이라 21:30 회차에서는 받을 수 없다(잠정).
+# 키(KRX_API_KEY) 없음·호출 실패·빈 응답이면 갱신을 생략한다(daily 종료 코드 무관).
+INDEX_CONFIRM_DAYS = 5
+INDEX_CONFIRM_API_BASE = "https://data-dbg.krx.co.kr/svc/apis/idx/"
+# 지수 이름 -> (서비스, 응답 IDX_NM)
+INDEX_CONFIRM_SERVICES = {"KOSPI": ("kospi_dd_trd", "코스피"),
+                          "KOSDAQ": ("kosdaq_dd_trd", "코스닥")}
+INDEX_CONFIRM_TIMEOUT_SEC = 20.0
+# 저장값과 공식 값이 이 이하 차이면 '같다'(지수는 소수 둘째 자리까지 공시)
+INDEX_CONFIRM_TOL = 0.005
 # (C 구역 끝)
 
 # ── [D·F] 추천 추적 · 평일 종목 발송 개편 ──

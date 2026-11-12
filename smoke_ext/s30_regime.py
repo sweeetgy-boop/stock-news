@@ -5,7 +5,8 @@
 끼어든 다른 값 · NULL 날), MA60 위 비율 정의(60봉 미만 제외 · 종가=평균은
 '위' 아님), 지수 신선하지 않으면 NULL·"지수 데이터 없음", 배너 OFF 시
 텍스트 불변, recos 기존 컬럼·값 불변, 훅(regime_on/regime_row), 소급이
-'실시간' 행을 덮어쓰지 않음.
+지수 히스토리에 그날이 없는 '실시간' 행을 덮어쓰지 않음(그날이 있으면
+공식 값으로 다시 계산 — R3-3, smoke_ext/s31_index_confirm.py).
 """
 from __future__ import annotations
 
@@ -225,7 +226,10 @@ def run(check, near, tmp):
         # 그날 밤 지수가 묵어 있었던 '실시간' 기록
         R.record_daily(s, cal[70], fetch=lambda *_: idx_full[idx_full.index
                        < pd.Timestamp(cal[70])], min_n=1)
-        res = R.backfill(s, index=idx_full, min_n=1)
+        # R3-3: 소급은 지수에 그날이 있으면 실시간 행도 공식 값으로 다시
+        # 계산한다. 여기서는 '그날이 없는' 경로(관측값 유지)를 본다.
+        idx_no70 = idx_full[idx_full.index != pd.Timestamp(cal[70])]
+        res = R.backfill(s, index=idx_no70, min_n=1)
         assert res["ok"] and res["kept_live"] >= 1
         r70 = H.regime_row(s, cal[70])
         assert r70["kind"] == R.KIND_LIVE and r70["fresh"] is False
@@ -244,7 +248,7 @@ def run(check, near, tmp):
         assert pd.isna(lab_[cal[70]]) and lab_[cal[71]] == R.UP
         tr = R.transitions(df)
         assert tr == [{"d": cal[63], "from": None, "to": R.UP}], tr
-        res2 = R.backfill(s, index=idx_full, min_n=1)
+        res2 = R.backfill(s, index=idx_no70, min_n=1)
         df2 = R.regime_rows(s)
         assert list(df2["label"].fillna("-")) == list(df["label"].fillna("-")), \
             "소급 재실행 멱등"
