@@ -391,6 +391,7 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
            paper (추천 추적 갱신 · --backfill 소급 편입 · nightly 밖 1회성)
            risk-backfill (σ 소급 1회성 · nightly 밖 · 지시가 있을 때만)
            indicators-backfill (지표 소급 1회성 · nightly 밖 · docs/지표등록.md)
+           hurst-backfill (1회성 소급 · nightly 밖 · 지시가 있을 때만)
 읽기 모드: weekly fib export pos-list brief-weekly runs
            backtest credit-probe kiwoom-plan rebalance (락 없음)
 ```
@@ -398,6 +399,9 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
 `rebalance` 는 `data/holdings.csv`(커밋 금지 · 템플릿
 `data/holdings.csv.example`)의 비중 한도 위반과 줄일 금액만 콘솔에
 냅니다. 발송하지 않습니다.
+`weekly` 는 `WEEKLY_ANALYSIS_V2`(기본 OFF)가 켜졌을 때만 허스트 기록
+INSERT 순간에 락을 **기다리지 않고** 시도합니다. 점유 중이면 기록만
+건너뛰고 리포트는 그대로 냅니다(다른 잡을 막지 않습니다).
 
 이 두 목록과 `stocknews/joblock.py` 의 `MODE_TIMEOUTS` 키 집합이 정확히
 일치해야 합니다. 스모크 테스트가 강제합니다. 예전에는 락을 잡지 않는

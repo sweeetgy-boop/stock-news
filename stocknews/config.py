@@ -996,6 +996,40 @@ IND_KALMAN_P0_SLOPE = 1.0e-4     # 초기 기울기 분산 (일 1%) · 초기 �
 
 # ── [I] 주간 분석 ──
 # (I 구역 시작)
+# weekly 모드에서만 도는 주간 분석(stocknews/weekly_v2.py). nightly 에 넣지
+# 않는다. 기본 OFF = 지금과 같은 weekly. `--weekly-v2` 로 1회 강제 실행 가능.
+# 기록 전용 — 점수·등급·추천 선정에 아무 값도 돌려주지 않는다.
+WEEKLY_ANALYSIS_V2 = False
+# 리포트를 텔레그램으로도 보낼지. False 면 파일(+ --dry-run 시 콘솔)만.
+WEEKLY_V2_SEND = False
+WEEKLY_V2_REPORT_DIR = "data/reports"
+# 채점 보유기간(거래일). [0] score_events 의 ex_med_20 을 쓴다.
+WEEKLY_V2_HORIZON = 20
+# 허스트(DFA-1): 최근 이 수의 일간 수익률. 미만이면 NULL 기록.
+WEEKLY_V2_HURST_WINDOW = 250
+WEEKLY_V2_HURST_CALC_VERSION = 1
+# 3요인: 시총·모멘텀 분위(상·하위 30%), 모멘텀 룩백 60거래일.
+WEEKLY_V2_FACTOR_QUANTILE = 0.3
+WEEKLY_V2_MOM_LOOKBACK = 60
+# 시장 요인 가중: "equal"(전 종목 동일가중) / "cap"(전일 시총가중).
+# 시총가중은 초대형 2~3종목이 지배해 일반 종목 β_시장 ≈ 0.1 (2026-11 실측).
+WEEKLY_V2_MKT_WEIGHT = "equal"
+# 팩터 노출(β) 추정: 이벤트일까지 직전 120거래일, 최소 60개 관측.
+WEEKLY_V2_BETA_WINDOW = 120
+WEEKLY_V2_BETA_MIN_OBS = 60
+# 상관 행렬: 최근 26개 주별 표본일. |ρ| 이 값 이상인 쌍을 표시.
+WEEKLY_V2_CORR_WEEKS = 26
+WEEKLY_V2_CORR_FLAG = 0.8
+# 5분위: 그날 값이 있는 종목이 이 수 미만이면 그날은 뺀다.
+WEEKLY_V2_QUINTILE_MIN_TICKERS = 50
+# GARCH vs EWMA: 원점 간격(겹치지 않는 20일 실현 구간) · 적합 창 · 최소 관측.
+WEEKLY_V2_GARCH_STEP = 20
+WEEKLY_V2_GARCH_WINDOW = 250
+WEEKLY_V2_GARCH_MIN_OBS = 250
+# '적중' = |예측 σ − 실현 σ| ≤ 실현 σ × 이 비율.
+WEEKLY_V2_VOL_HIT_TOL = 0.25
+# E 구역에 λ 가 없을 때만 쓰는 EWMA λ (RiskMetrics 0.94).
+WEEKLY_V2_EWMA_LAMBDA = 0.94
 # (I 구역 끝)
 
 # ── [J] 정리 ──
