@@ -944,8 +944,14 @@ def test_store(tmp: Path):
 
     def t_credit_manual():
         """수동 신용잔고 주입. LPS credit_heat 캡을 벗기는 경로다."""
+        # '최신' 기준일을 하드코딩하면 안 된다. load_credit_ratios() 의
+        # max_age_days 는 '오늘(KST)로부터 N일' 창이라, 고정 날짜는 달력이
+        # 지나면 창을 벗어나 코드 변경 없이 깨진다 (2026-08-24 고정값이
+        # 2026-09-08 부터 깨졌다). 비교 기준과 같은 시계(store._now_kst)로 뽑는다.
+        import stocknews.store as _store_mod
+        fresh = (_store_mod._now_kst() - timedelta(days=1)).strftime("%Y-%m-%d")
         st.upsert_credit([
-            {"ticker": "000001", "ratio": 5.5, "asof": "2026-08-24",
+            {"ticker": "000001", "ratio": 5.5, "asof": fresh,
              "source": "manual", "note": "스모크"},
             {"ticker": "000003", "ratio": 1.1,
              "asof": "2020-01-01"},          # 오래된 기준일 → 제외돼야 함
