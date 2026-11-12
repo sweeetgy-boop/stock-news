@@ -67,6 +67,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "pos-open": 120,
     "fill": 120,
     "pos-close": 120,
+    # [C] 국면 소급. 1회성. 지수 조회 + 전 기간 시세 1회 읽기.
+    "regime-backfill": 900,
 }
 DEFAULT_TIMEOUT = 900
 

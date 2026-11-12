@@ -808,6 +808,27 @@ PRICE_JUMP_BREAK_PCT = 30.0
 
 # ── [C] 국면 라벨 ──
 # (C 구역 시작)
+# 국면 기록(market_regime)은 플래그와 무관하게 **항상** 한다(daily 단계).
+# 아래 두 플래그는 표시·필터만 켠다. 정의는 stocknews/regime.py 머리말.
+#   상승 = KOSPI 종가 > MA200  그리고  MA60 위 비율 ≥ 50%
+#   하락 = KOSPI 종가 < MA200  그리고  MA60 위 비율 < 40%
+#   중립 = 그 외
+# 브리핑(brief-morning·brief-evening) 맨 위 국면 한 줄. OFF = 텍스트 완전 동일.
+REGIME_BANNER = False
+# 하락 국면에서만 TREND 슬롯 절반. 실제 자르기는 B(추천 필터 ③)가 한다.
+REGIME_TREND_CUT = False
+REGIME_INDEX = "KOSPI"
+REGIME_MA_LONG = 200              # 지수 이동평균 봉 수
+REGIME_BREADTH_MA = 60            # 종목별 이동평균 봉 수 (그 종목 자기 봉)
+REGIME_UP_BREADTH_PCT = 50.0      # 상승: 비율 ≥ 이 값
+REGIME_DOWN_BREADTH_PCT = 40.0    # 하락: 비율 < 이 값
+REGIME_RET_BARS = 20              # 배너의 지수 N일 수익률
+REGIME_CONFIRM_DAYS = 5           # 새 조건이 이 거래일 수 연속이면 전환
+# MA60 판정 가능 종목이 이보다 적으면 비율을 믿지 않는다(부분 적재 방어).
+REGIME_MIN_BREADTH_N = 500
+# daily 가 기록할 때 최근 이 거래일 수 안의 빠진 날을 같이 채운다.
+REGIME_GAP_FILL_DAYS = 10
+REGIME_CALC_VERSION = 1
 # (C 구역 끝)
 
 # ── [D·F] 추천 추적 · 평일 종목 발송 개편 ──
