@@ -304,6 +304,29 @@ def _matured_section(pd_, d: str) -> list[str]:
     return out
 
 
+def _move_x(store, r) -> str:
+    """[E] RISK_INFO ON 일 때 " · 평소 출렁임의 n배". σ 는 신호일(편입 기준일) 값.
+
+    n = ln(1+R) / (σ·√h) — `risk.move_multiple` 정의 그대로(R = 비용 차감 전
+    보유 수익률, h = 보유 거래일). σ 없음·플래그 OFF 면 빈 문자열.
+    """
+    if not getattr(C, "RISK_INFO", False):
+        return ""
+    try:
+        from . import v2_hooks
+        from .risk import move_multiple
+        sig = v2_hooks.sigma_on(store, r.get("signal_d"), str(r["ticker"]))
+        ret = P._nan(r.get("ret"))
+        if ret is None:
+            ret = P._nan(r.get("net"))
+        if sig is None or ret is None:
+            return ""
+        n = move_multiple(float(ret) / 100.0, sig, max(1, int(r.get("day_n") or 1)))
+        return "" if n is None else f" · 평소 출렁임의 {abs(n):.1f}배"
+    except Exception:  # noqa: BLE001 - 부가 표기
+        return ""
+
+
 def _tracking_section(pd_, d: str, topn: int) -> tuple[list[str], dict]:
     a = P.active_marks(pd_, d)
     info: dict = {"n": 0}
@@ -324,7 +347,7 @@ def _tracking_section(pd_, d: str, topn: int) -> tuple[list[str], dict]:
     def _ln(r):
         tag = " [소급]" if int(r.get("backfill") or 0) else ""
         return (f"  {_e(r.get('name') or r['ticker'])} {_pct(P._nan(r['net']))}"
-                f" ({int(r['day_n'])}일째){tag}")
+                f"{_move_x(pd_.store, r)} ({int(r['day_n'])}일째){tag}")
     if topn > 0 and len(s):
         top = s.head(topn)
         bot = s.tail(min(topn, max(0, len(s) - len(top))))
