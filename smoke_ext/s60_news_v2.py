@@ -123,12 +123,22 @@ def run(check, near, tmp):
         st2.save_recos(cal[-25], [("VALUE", _reco("000020", "오래된"))])
         st2.save_recos(cal[-3], [("TREND", _reco("000030", "최근"))])
         p.set(ev, "trading_calendar", lambda store, since=None: list(cal))
+        # 폴백 경로(send_targets 가 None — B 미구현)를 고정해서 본다.
+        # B 병합 후 훅은 항상 list 를 돌리므로 여기서 None 으로 패치한다.
+        p.set(v2_hooks, "send_targets", lambda store, d: None)
         try:
             f = nv.focus_tickers(st2, _now())
         finally:
             p.undo()
         assert f.source == "events" and f.reco == {"000030"}, (f.source, f.reco)
         assert f.d_ref == cal[-3]
+        # B 경로: 실제 훅(필터 OFF = 그날 recos 전체)이면 그날 종목만.
+        p.set(ev, "trading_calendar", lambda store, since=None: list(cal))
+        try:
+            g = nv.focus_tickers(st2, _now())
+        finally:
+            p.undo()
+        assert g.source == "send_targets" and g.reco == {"000030"}, (g.source, g.reco)
     check(S, "추천 대상 = [0] 이벤트 기간 안(21거래일 전 추천은 제외)", window)
 
     def hooks():
