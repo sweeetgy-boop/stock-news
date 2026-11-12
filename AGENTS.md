@@ -149,8 +149,11 @@ exit 4 는 순서가 틀렸거나 설정이 빠졌다는 뜻이고, exit 64 는 
   credit     신용잔고 CSV 적재 (선택)         수초
 
 [매일]
-  master  →  update  →  flags  →  daily  →  exits
+  reconcile  →  master  →  update  →  flags  →  daily  →  exits
 ```
+
+`reconcile` 은 **전 거래일** 시세를 KRX 확정값으로 덮는 단계라 그날 적재
+(`update`)보다 앞입니다(4장 '종가 확정 보정').
 
 `credit-kiwoom` 은 `daily` 가 만든 스캔 이력에서 대상을 고르므로 `daily`
 뒤에 두는 것이 이상적입니다. 대상이 0종목이면 `exit 4` 가 납니다.
@@ -209,7 +212,7 @@ stock-news-weekly           45 22 * * 5       금 22:45    stocknews_weekly.py
 09:00~15:55 flash    notify.WINDOWS 의 4대 창(09:00~09:35 / 10:00~10:25 /
                   14:00~14:25 / 15:20~15:35)을 전부 덮는다. 창 밖 호출은
                   즉시 {"skipped":true} 로 끝난다.
-21:30 nightly     기존. master -> update -> flags -> ... -> daily -> exits
+21:30 nightly     reconcile -> master -> update -> flags -> ... -> daily -> exits
 23:00 brief-evening  ★ nightly 뒤여야 한다. 저녁 브리핑은 '오늘 추천
                   10선'을 recos 에서 읽는데, 그 행을 만드는 것이
                   nightly 의 daily 단계다. 앞에 두면 어제 것이 나간다.
@@ -307,9 +310,29 @@ LLM 을 빼면 그 판단 자체가 존재하지 않습니다.
 `STEPS` 상수 그대로입니다. 순서는 3장의 의존 관계를 따릅니다.
 
 ```
-master -> update -> flags -> credit-kiwoom -> stock-flow(미구현, 스킵)
-       -> news -> daily -> exits
+reconcile -> master -> update -> flags -> credit-kiwoom
+          -> stock-flow(미구현, 스킵) -> news -> daily -> exits
 ```
+
+**종가 확정 보정 (`reconcile`, 첫 단계 · 2026-11 R3-4).** 밤 적재는
+잠정입니다(`prices.is_final=0`, `source` = 적재 경로 `naver`(종목별 폴백) /
+`fdr_snapshot`(전종목 스냅샷) / `pykrx`(백필·기존 행)). KRX 오픈API 는
+D일분을 익영업일 08:00 에 여므로, 다음 nightly 첫 단계가 **전 거래일**분의
+고가·저가·종가·거래량을 확정값으로 덮습니다(`source='krx_api'`,
+`is_final=1`). 시가·거래대금은 덮지 않습니다. 덮기 전 행 전체는
+`price_provisional`, 달라진 필드는 `price_diffs` 에 남습니다.
+
+- 기준일은 '이미 공개된 전 거래일'입니다. 자정을 넘긴 catch-up 은 그 앞날을
+  고릅니다. 하루가 통째로 빠지면 그날은 잠정으로 남습니다(자동 소급 없음 —
+  과거분 보정은 지시가 있을 때만 `--mode reconcile --date`).
+- `RECONCILE_MIN_DATE`(2026-08-28) 이전 = 백필 수정주가 구간은 거부합니다.
+- 분할 흔적(수정주가 모양 · KRX 종가가 직전 종가 대비 ±30% 밖)이 있는
+  종목·날짜는 건너뛰고 잠정값을 둡니다. 수정주가 모양이 차이 종목의 10% 를
+  넘으면 그날 전체를 쓰지 않습니다(exit 4).
+- `KRX_API_KEY` 가 없으면 exit 4 `no_api_key` = 기대된 스킵. 미공개
+  (`not_published`) · 수정주가 중단 · KRX 호출 실패는 **실패**로 셉니다.
+- scans · recos 는 다시 계산하지 않습니다. 결과 한 줄은 관리자 채팅에만
+  갑니다.
 
 `daily` 는 매일 스캔하지만 추천 발송은 일요일만 합니다(12장).
 `credit-kiwoom` 은 앱키가 없거나 대상이 0종목이면 exit 4 로 즉시 끝나고,
@@ -326,7 +349,7 @@ master -> update -> flags -> credit-kiwoom -> stock-flow(미구현, 스킵)
 ```
 토요일 (휴장)   전체 스킵 · "휴장" 알림 · 마커 휴장(CLOSED_WEEKEND)
 일요일 (휴장)   daily --send-only --asof <그날> 만 실행 (SEND_DAY_STEPS)
-                master·update·flags·credit-kiwoom·news·exits 는 돌지 않음
+                reconcile·master·update·flags·credit-kiwoom·news·exits 는 돌지 않음
                 마커 추천 발송(완주) / 추천 발송(기록 없음)
 ```
 
@@ -384,6 +407,7 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
 ```
 쓰기 모드: master backfill update flags credit credit-kiwoom daily exits
            news brief-morning brief-evening flash pos-open fill pos-close
+           reconcile (nightly 첫 단계 · 4장)
            holidays (분기 1회 수동 · nightly 밖)
            reco-events-backfill (1회성 · nightly 밖 · RECO_COOLDOWN_DAYS 켜기 전,
                                  지시가 있을 때만. recos 는 읽기만 한다)
@@ -419,8 +443,8 @@ INSERT 순간에 락을 **기다리지 않고** 시도합니다. 점유 중이�
 
 ## 6. 절대 하지 말 것
 
-- **파이프라인 단계를 개별 모드로 부르지 마십시오.** `master` · `update` ·
-  `flags` · `credit-kiwoom` · `news` · `daily` · `exits` 는 `nightly.cmd` 가
+- **파이프라인 단계를 개별 모드로 부르지 마십시오.** `reconcile` · `master` ·
+  `update` · `flags` · `credit-kiwoom` · `news` · `daily` · `exits` 는 `nightly.cmd` 가
   순서대로 돕니다. 하나씩 부르면 완주 마커와 단계 집계가 우회되고, 1장의
   사고가 그대로 재현됩니다. 형님의 명시적 지시가 있을 때만 예외입니다.
 - `data/quant.db` 를 삭제하지 마십시오. 재구축에 20~40분이 걸립니다.

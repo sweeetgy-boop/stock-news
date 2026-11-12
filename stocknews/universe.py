@@ -398,7 +398,7 @@ def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
     prices, _ = market_snapshot()
     ok, why = verify_snapshot_date(prices, trade_date)
     if ok:
-        total = store.upsert_cross_section(iso, prices)
+        total = store.upsert_cross_section(iso, prices, source="fdr_snapshot")
         log.info("%s 시세 적재 %d건 (스냅샷, %s)", iso, total, why)
         if floor and 0 < total < floor:
             # 소스가 반쯤 살아 있는 상태다. 이 날짜를 완료로 굳히지 않고
@@ -515,7 +515,8 @@ def _upsert_one_day(store, ticker: str, trade_date: str, iso: str) -> int:
             return 0
     except (IndexError, ValueError, TypeError):
         return 0
-    return store.upsert_prices(ticker, df.tail(1))
+    # pykrx 종목별 조회(adjusted=True)는 네이버 차트를 읽는다.
+    return store.upsert_prices(ticker, df.tail(1), source="naver")
 
 
 def backfill_one(store, ticker: str, days: int = 420,

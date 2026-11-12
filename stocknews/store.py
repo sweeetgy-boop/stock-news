@@ -99,7 +99,9 @@ _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
--- source   : 'pykrx'(nightly update · 잠정) / 'krx_api'(reconcile · 확정)
+-- source   : 잠정 적재 경로 'pykrx'(백필·기존 행) / 'naver'(update 종목별
+--            폴백 = pykrx 종목별 조회) / 'fdr_snapshot'(update 전종목 스냅샷)
+--            / 'krx_api'(reconcile · 확정)
 -- is_final : 0 잠정 / 1 확정. 확정 행은 pykrx 경로가 덮어쓰지 않는다.
 CREATE TABLE IF NOT EXISTS prices (
   ticker TEXT NOT NULL,
@@ -516,7 +518,8 @@ class Store:
         return all(v > 0 and v == v for v in vals)   # v == v : NaN 배제
 
     def upsert_prices(self, ticker: str, df: pd.DataFrame,
-                      allow_today: bool = False) -> int:
+                      allow_today: bool = False,
+                      source: str = "pykrx") -> int:
         """한 종목의 OHLCV 적재. 컬럼은 한글 규격을 기대한다.
 
         장중이면 오늘 행을 버린다. 미완성 봉을 종가로 적재하면 그날
@@ -552,19 +555,22 @@ class Store:
             return 0
         with closing(self._conn()) as con:
             con.executemany(
-                "INSERT INTO prices(ticker,d,o,h,l,c,v,amt) VALUES(?,?,?,?,?,?,?,?) "
+                "INSERT INTO prices(ticker,d,o,h,l,c,v,amt,source) "
+                "VALUES(?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(ticker,d) DO UPDATE SET "
                 "o=excluded.o,h=excluded.h,l=excluded.l,c=excluded.c,"
-                "v=excluded.v,amt=excluded.amt "
+                "v=excluded.v,amt=excluded.amt,source=excluded.source "
                 # KRX 확정 행은 잠정값으로 되돌리지 않는다 (reconcile).
+                # source 는 마지막으로 잠정값을 쓴 경로다.
                 "WHERE prices.is_final=0",
-                rows,
+                [(*r, source) for r in rows],
             )
             con.commit()
         return len(rows)
 
     def upsert_cross_section(self, trade_date, df: pd.DataFrame,
-                             allow_today: bool = False) -> int:
+                             allow_today: bool = False,
+                             source: str = "pykrx") -> int:
         """'특정 일자 전종목' 한 판을 통째로 적재.
 
         df : index=종목코드, columns=['시가','고가','저가','종가','거래량','거래대금']
@@ -600,13 +606,15 @@ class Store:
             return 0
         with closing(self._conn()) as con:
             con.executemany(
-                "INSERT INTO prices(ticker,d,o,h,l,c,v,amt) VALUES(?,?,?,?,?,?,?,?) "
+                "INSERT INTO prices(ticker,d,o,h,l,c,v,amt,source) "
+                "VALUES(?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(ticker,d) DO UPDATE SET "
                 "o=excluded.o,h=excluded.h,l=excluded.l,c=excluded.c,"
-                "v=excluded.v,amt=excluded.amt "
+                "v=excluded.v,amt=excluded.amt,source=excluded.source "
                 # KRX 확정 행은 잠정값으로 되돌리지 않는다 (reconcile).
+                # source 는 마지막으로 잠정값을 쓴 경로다.
                 "WHERE prices.is_final=0",
-                rows,
+                [(*r, source) for r in rows],
             )
             con.commit()
         return len(rows)

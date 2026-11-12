@@ -22,6 +22,21 @@ __all__ = ["apply"]
 
 # ── [A] 측정 바로잡기 ──
 # (A 구역 시작)
+# price_provisional : 확정 보정(reconcile)이 덮기 직전의 잠정 행 전체.
+#   price_diffs 는 '달랐던 필드'만 남기므로, 보정 전 행을 그대로 되살리려면
+#   이 표가 필요하다. (ticker, d) 당 한 번만 쓴다(INSERT OR IGNORE) — 처음
+#   덮은 잠정값이 남는다. 확정 행은 다시 보정하지 않으므로 두 번 쓸 일도 없다.
+DDL_A = """
+CREATE TABLE IF NOT EXISTS price_provisional (
+  ticker TEXT NOT NULL,
+  d      TEXT NOT NULL,
+  o REAL, h REAL, l REAL, c REAL, v REAL, amt REAL,
+  source TEXT,                    -- 잠정 적재 경로 (pykrx/naver/fdr_snapshot)
+  saved  TEXT,
+  PRIMARY KEY (ticker, d)
+);
+CREATE INDEX IF NOT EXISTS ix_price_provisional_d ON price_provisional(d);
+"""
 # (A 구역 끝)
 
 

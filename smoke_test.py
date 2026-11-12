@@ -3469,7 +3469,8 @@ def test_market_source(tmp: Path):
         assert "catch-up 실행" in logtxt and "네트워크 대기 2/6" in logtxt, logtxt
         assert "네트워크 확인됨 (20초 대기)" in logtxt, logtxt
         assert sent and "네트워크 대기 20초" in sent[-1], sent
-        assert steps and steps[0] == "master", steps
+        # R3-4: 첫 단계는 reconcile (STEPS 정본을 따른다)
+        assert steps and steps[0] == mod.STEPS[0].name == "reconcile", steps
 
         # 끝내 못 닿음 -> 10초 x 6회 뒤 그대로 진행
         rc, sent, sleeps, probes, steps, logtxt = run(
@@ -3770,12 +3771,13 @@ def test_krx_reconcile(tmp: Path):
         assert res["compared"] == 3, res
         assert res["diff_tickers"] == 2, res
         assert res["diff_fields"] == {"c": 2, "v": 1}, res["diff_fields"]
-        assert res["amt_filled"] == 2, res
+        # R3-4: 거래대금은 보정 대상이 아니다 — 비어 있으면 그대로 둔다
+        assert res["amt_missing"] == 2, res
         assert res["added"] == 1, "마스터 밖 222220 · 거래정지 333330 은 추가 안 함"
         assert res["missing_in_krx"] == ["111110"], res
-        # KRX 가 정본: 종가·거래량·거래대금 전부 덮어쓴다
+        # KRX 가 정본: 고가·저가·종가·거래량을 덮는다 (R3-4: 시가·거래대금 제외)
         p = _price(st, "005930")
-        assert p[3] == 248500 and p[5] == 2.8e12, p
+        assert p[3] == 248500 and p[5] is None, p
         assert p[6:] == ("krx_api", 1), p
         assert _price(st, "000660")[4] == 2732031
         # 같은 값이어도 확정으로 표시한다
@@ -4077,7 +4079,9 @@ def test_krx_reconcile(tmp: Path):
         # 정확히 10% 는 '넘지' 않는다 -> 진행하고 의심 수를 보고한다
         st2, krx2 = _adj_case("recon_adj_edge.db", n_adj=1, n_vol=9)
         res = reconcile_day(st2, DAY, krx2)
-        assert res["adjusted_suspects"] == 1 and res["written"] == 10, res
+        # R3-4: 수정주가 모양 종목만 건너뛰고 나머지 9종목은 덮는다
+        assert res["adjusted_suspects"] == 1 and res["written"] == 9, res
+        assert res["skipped_split"] == [("100000", "adjusted")], res
 
     def t_mode_refusals():
         mod = importlib.import_module("run_screen")
