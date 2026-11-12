@@ -10424,6 +10424,30 @@ def test_send_day(tmp: Path):
 
 
 # ══════════════════════════ 보고 ══════════════════════════
+def run_smoke_ext(tmp: Path) -> None:
+    """smoke_ext/ 아래 모듈을 이름순으로 실행한다 (v2 개편 묶음별 검사).
+
+    각 모듈은 `run(check, near, tmp)` 를 정의한다. 묶음마다 파일을 따로
+    두는 이유는 병렬 작업이 smoke_test.py 한 파일의 같은 자리를 고쳐
+    병합 충돌이 나지 않게 하려는 것이다.
+    """
+    import importlib
+    base = Path(__file__).resolve().parent / "smoke_ext"
+    if not base.is_dir():
+        return
+    for f in sorted(base.glob("s*.py")):
+        name = f"smoke_ext.{f.stem}"
+        try:
+            mod = importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001
+            _RESULTS.append((f"ext:{f.stem}", "import",
+                             f"ERROR: {type(exc).__name__}: {exc}"))
+            continue
+        sub = tmp / f"ext_{f.stem}"
+        sub.mkdir(parents=True, exist_ok=True)
+        mod.run(check, near, sub)
+
+
 def report() -> int:
     width = 62
     print()
@@ -10510,6 +10534,7 @@ def main() -> int:
         if st is not None:
             test_renderer(st)
             test_daily_weekly(st, tmp)
+        run_smoke_ext(tmp)
         return report()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

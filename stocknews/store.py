@@ -489,6 +489,9 @@ class Store:
                     f"PRAGMA table_info({table})").fetchall()}
                 if col not in have:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+            # v2 개편 테이블. 묶음별 구역은 schema_v2.py 에 있다.
+            from . import schema_v2
+            schema_v2.apply(con)
             con.commit()
 
     # ────────────────────────── 시세 ──────────────────────────
