@@ -69,8 +69,11 @@ from stocknews.dividend_data import (collect_dividends, dart_key_present,
 from stocknews.env import load_env
 from stocknews.exits import run_exits, stop_price_for
 from stocknews.backtest import (BacktestConfig, control_random, control_rsi,
-                                run_backtest, simulate_exit_rules,
+                                attach_regime, exits_vs_hold, score_context,
+                                backtest_candidates, finish_events,
+                                score_rows, simulate_exit_rules,
                                 summarize, summarize_exits, sweep_thresholds)
+from stocknews.events import fmt_cell, load_index_history, trading_calendar
 from stocknews.flags import (flag_summary, refresh_credit,
                              refresh_credit_chain, refresh_flags)
 from stocknews import kiwoom_rest
@@ -1653,40 +1656,57 @@ def mode_backtest(store: Store, args) -> int:
     log.info("백테스트 시작: %d종목 · 간격 %d거래일 · 비용 %.2f%%",
              len(tickers), bt.step, bt.cost_pct)
 
-    events = run_backtest(store, tickers, DEFAULT, bt)
+    outdir = Path(args.export_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    # 채점 재료는 한 번만 만든다 — 전략·대조군이 같은 재료로 채점돼야
+    # 같은 지표가 된다(v2-A). 지수는 지수 대비(ex_idx) 참고용이다.
+    cal = trading_calendar(store)
+    index = load_index_history(start=cal[0] if cal else "2024-01-01",
+                               cache_dir=outdir / "index_cache")
+    ctx = score_context(store, index=index)
+
+    cands = backtest_candidates(store, tickers, DEFAULT, bt)
+    events = finish_events(store, cands, bt, ctx)
     if events.empty:
         log.error("이벤트가 0건입니다. 시세 기간이나 --limit 을 확인하십시오.")
         SUMMARY["events"] = 0
         return EXIT_PRECOND
+    raw_n = int(events.attrs.get("raw_events", len(events)))
+    events = attach_regime(events, store)
+    events.attrs["raw_events"] = raw_n
 
-    rnd = control_random(store, tickers, len(events), bt) \
+    rnd = control_random(store, tickers, len(events), bt, ctx=ctx) \
         if not args.bt_no_controls else pd.DataFrame()
-    rsi = control_rsi(store, tickers, 30.0, bt) \
+    rsi = control_rsi(store, tickers, 30.0, bt, ctx=ctx) \
         if not args.bt_no_controls else pd.DataFrame()
 
     summary = summarize(events, bt, rnd, rsi)
+    # 중복 제거 전(판정 후보 전체)을 같은 지표로 채점해 둔다. 전후 비교용
+    # 기록이며 판정·경고에는 쓰지 않는다.
+    cands_scored = score_rows(cands, ctx, bt)
+    summary["no_dedup"] = summarize(cands_scored, bt).get("by_horizon")
     sweep = sweep_thresholds(events, bt)
     exits_sim = (simulate_exit_rules(store, events, DEFAULT, bt)
                  if not args.bt_no_exits else pd.DataFrame())
     exit_sum = summarize_exits(exits_sim)
+    exit_sum["vs_hold"] = exits_vs_hold(exits_sim)
 
     _print_backtest_report(summary, sweep, exit_sum, bt, args)
 
-    outdir = Path(args.export_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
     stamp = now_kst().strftime("%Y%m%d_%H%M")
     events.to_csv(outdir / f"bt_events_{stamp}.csv", index=False,
                   encoding="utf-8-sig")
-    if not sweep.empty:
-        sweep.to_csv(outdir / f"bt_sweep_{stamp}.csv", index=False,
-                     encoding="utf-8-sig")
-    if not exits_sim.empty:
-        exits_sim.to_csv(outdir / f"bt_exits_{stamp}.csv", index=False,
+    for tag, frame in (("candidates", cands_scored), ("random", rnd),
+                       ("rsi", rsi), ("sweep", sweep), ("exits", exits_sim)):
+        if frame is not None and not frame.empty:
+            frame.to_csv(outdir / f"bt_{tag}_{stamp}.csv", index=False,
                          encoding="utf-8-sig")
-    log.info("결과 CSV: %s", outdir)
+    log.info("결과 CSV: %s (bt_*_%s.csv)", outdir, stamp)
 
-    SUMMARY.update({"events": int(len(events)), "summary": summary,
-                    "exits": exit_sum, "out_dir": str(outdir)})
+    SUMMARY.update({"events": int(len(events)), "raw_events": raw_n,
+                    "event_window": bt.event_window, "summary": summary,
+                    "exits": exit_sum, "out_dir": str(outdir),
+                    "stamp": stamp})
     # 경고가 있으면 부분 실패로 알린다. 전략이 검증되지 않았다는 신호다.
     return EXIT_PARTIAL if summary.get("warnings") else EXIT_OK
 
@@ -1703,7 +1723,11 @@ def _print_backtest_report(s: dict, sweep, ex: dict, bt, args) -> None:
         return
     p(f"  표본 {s['n']:,}건 · 종목 {s['tickers']}개 · "
       f"기간 {s['period'][0]} ~ {s['period'][1]}")
-    p(f"  익일 시가 체결 · 왕복비용 {bt.cost_pct}% 차감")
+    if s.get("raw_events") is not None:
+        p(f"  판정 후보 {s['raw_events']:,}건 → 이벤트 {s['n']:,}건 "
+          f"(같은 종목 {s.get('event_window')}거래일 안 재포착은 같은 이벤트)")
+    p(f"  익일 시가 진입(1일째) → h일째 종가 · 왕복비용 {bt.cost_pct}% 차감")
+    p("  초과 = 같은 구간 전종목 중위 대비 (전략·대조군 같은 지표)")
 
     p("\n── 보유기간별 (비용 차감 후) ──")
     p(f"  {'구간':<6}{'표본':>7}{'승률':>8}{'평균':>9}{'중위':>9}"
@@ -1719,20 +1743,27 @@ def _print_backtest_report(s: dict, sweep, ex: dict, bt, args) -> None:
           f"{m.get('mean', float('nan')):>+10.2f}")
 
     ref = s.get("ref_horizon")
-    p(f"\n── 대조군 비교 ({ref}일 기준, 초과수익) ──")
+    p(f"\n── 대조군 비교 ({ref}일 기준, 시장 중위 대비 초과수익 — 같은 지표) ──")
     ctrl = s.get("controls") or {}
+    cnet = s.get("controls_net") or {}
     base = (s.get("by_horizon", {}).get(ref, {}).get("alpha", {}) or {})
     p(f"  우리 전략      {base.get('mean', float('nan')):>+8.2f}%p  "
-      f"(승률 {base.get('win', 0):.0f}%, n={base.get('n', 0):,})")
-    for key, label in (("market", "시장 중위"), ("random", "무작위 진입"),
-                       ("rsi30", "단순 RSI<30")):
+      f"(승률 {base.get('win', 0):.0f}%, n={base.get('n', 0):,})  "
+      f"순수익 {cnet.get('strategy', {}).get('mean', float('nan')):+.2f}%")
+    for key, label in (("random", "무작위 진입"), ("rsi30", "단순 RSI<30")):
         c = ctrl.get(key)
         if c:
-            p(f"  {label:<14}{c.get('mean', float('nan')):>+8.2f}%   "
-              f"(승률 {c.get('win', 0):.0f}%, n={c.get('n', 0):,})")
+            p(f"  {label:<14}{c.get('mean', float('nan')):>+8.2f}%p  "
+              f"(승률 {c.get('win', 0):.0f}%, n={c.get('n', 0):,})  "
+              f"순수익 {cnet.get(key, {}).get('mean', float('nan')):+.2f}%")
+    mr = s.get("market_ret")
+    if mr:
+        p(f"  (참고) 같은 구간 시장 중위 수익률 평균 {mr['mean']:+.2f}% "
+          f"— 시장 중위의 초과수익은 정의상 0")
 
     for key, label in (("by_grade", "등급"), ("by_track", "트랙"),
-                       ("by_regime", "국면")):
+                       ("by_regime", "국면(구 20일 중위)"),
+                       ("by_regime_v2", "국면(C 라벨)")):
         d = s.get(key)
         if not d:
             continue
@@ -1763,6 +1794,13 @@ def _print_backtest_report(s: dict, sweep, ex: dict, bt, args) -> None:
             p(f"    {layer} {names.get(layer, '?'):<8}n={v['n']:>6,}  "
               f"평균 {v['mean']:>+7.2f}%  승률 {v['win']:>3.0f}%  "
               f"보유 {v['held_mean']:>4.1f}일")
+        vs = ex.get("vs_hold") or {}
+        if vs:
+            p(f"\n  엔진 청산 vs 같은 이벤트 고정 {bt.hold_compare}일 보유 "
+              "(순수익, 국면별):")
+            for k, v in vs.items():
+                p(f"    {k:<8} 엔진  {fmt_cell(v['engine'])}")
+                p(f"    {'':<8} 보유  {fmt_cell(v['hold'])}")
 
     if s.get("warnings"):
         p("\n" + "!" * w)

@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 __all__ = ["normalize_ohlcv", "load_ohlcv", "load_investor", "load_shorting",
            "make_loader", "market_snapshot", "verify_snapshot_date",
            "close_on", "close_on_status", "net_reachable", "load_index",
+           "index_last_date", "index_is_fresh",
            "INDEX_SYMBOLS", "REF_TICKERS", "REF_PROBE_RETRIES",
            "TICKER_PATTERN", "krx_daily_prices", "krx_base_info",
            "KRX_API_KEY_ENV"]
@@ -324,13 +325,44 @@ def close_on(ticker: str, trade_date: str) -> float | None:
 INDEX_SYMBOLS = {"KOSPI": "KS11", "KOSDAQ": "KQ11"}
 
 
-def load_index(name: str, bars: int = 300) -> pd.DataFrame | None:
+def index_last_date(df, asof: str | None = None) -> str | None:
+    """지수 프레임에서 `asof` 이하 마지막 날짜('YYYY-MM-DD'). 없으면 None."""
+    if df is None or len(df) == 0:
+        return None
+    col = next((c for c in ("종가", "Close") if c in df.columns), None)
+    if col is None:
+        return None
+    s = df[col].dropna()
+    if not len(s):
+        return None
+    idx = pd.DatetimeIndex(s.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    if asof:
+        idx = idx[idx <= pd.Timestamp(str(asof)[:10])]
+    return idx.max().strftime("%Y-%m-%d") if len(idx) else None
+
+
+def index_is_fresh(df, asof: str) -> bool:
+    """`asof`(스캔 기준일) 이하 마지막 지수 날짜가 정확히 `asof` 인가.
+
+    2026-09-17~10-13 에 FDR 이 갱신되지 않은 지수를 돌려줬고, 기준일
+    이하로 자른 마지막 값(09-17)이 15거래일 동안 market_context 에 그대로
+    기록됐다(KOSPI 6,724.34 고정). 기준일 값이 없으면 기록하지 않는다.
+    """
+    return bool(asof) and index_last_date(df, asof) == str(asof)[:10]
+
+
+def load_index(name: str, bars: int = 300,
+               asof: str | None = None) -> pd.DataFrame | None:
     """지수 일봉. FinanceDataReader 만 쓴다.
 
     name : "KOSPI" / "KOSDAQ" (또는 FDR 심볼 자체)
     bars : 확보하려는 **거래일** 수. MA200 을 구하려면 200거래일이
            필요하고 그건 달력으로 약 290일이다. 그래서 달력 창을
            거래일의 1.6배 + 여유로 잡는다.
+    asof : 기준일('YYYY-MM-DD'). 주면 `index_is_fresh` 로 검사해 그날
+           값이 없으면 경고하고 None 을 돌린다(지난 값으로 대신하지 않는다).
 
     실패하면 None 을 돌린다. 예외를 던지지 않는 이유는 호출부(daily)가
     이 값 없이도 정상 완료해야 하기 때문이다.
@@ -349,7 +381,13 @@ def load_index(name: str, bars: int = 300) -> pd.DataFrame | None:
     if df is None or df.empty or "Close" not in df.columns:
         log.warning("지수 응답이 비어 있습니다 %s(%s)", name, sym)
         return None
-    return df.sort_index()
+    df = df.sort_index()
+    if asof and not index_is_fresh(df, asof):
+        log.warning("지수가 기준일과 다릅니다 %s(%s): 마지막 %s ≠ 기준일 %s "
+                    "— 쓰지 않음", name, sym, index_last_date(df, asof),
+                    str(asof)[:10])
+        return None
+    return df
 
 
 def verify_snapshot_date(prices: pd.DataFrame, trade_date: str,
