@@ -898,6 +898,16 @@ def backfill(store, log_dir: str | Path = "logs",
     만들고(source = log:<파일>), update 로 편입·성적·대조군·그림자를 같은
     날짜로 채운다. nightly 와 무관한 1회성 명령."""
     t0 = time.time()
+    # 이벤트 창이 0(RECO_COOLDOWN_DAYS=0)이면 매 발송이 별개 이벤트가 된다.
+    # cooldown_warning() 은 PAPER_TRACKING 이 켜졌을 때만 말하므로, 소급은
+    # 플래그와 무관하게 여기서 따로 경고한다. 실측(운영 사본, 6회 발송):
+    # 창 0 → 60건(같은 이벤트 중복) / 창 20 → 44건(이벤트당 첫 발송 1회).
+    warn = None
+    if paper_window() == 0:
+        warn = ("RECO_COOLDOWN_DAYS=0 — 소급 편입이 이벤트 단위로 묶이지 않고 "
+                "발송된 행마다 편입됩니다(같은 종목 중복). 재추천 제한을 켠 뒤 "
+                "소급하십시오")
+        log.warning("paper --backfill: %s", warn)
     found = dict(sent_dates) if sent_dates is not None else \
         sent_dates_from_logs(log_dir)
     rec = _recos_all(store, upto)
@@ -910,8 +920,10 @@ def backfill(store, log_dir: str | Path = "logs",
     st = update(store, upto=upto, index=index, markets=markets,
                 allow_network=allow_network)
     st.update({"sent_dates": sorted(found), "sends_added": added,
-               "sent_rows": len(rows),
+               "sent_rows": len(rows), "window": paper_window(),
                "elapsed_total_sec": round(time.time() - t0, 1)})
+    if warn:
+        st["warning"] = warn
     return st
 
 
