@@ -27,6 +27,7 @@ from .trading_day import is_definitely_closed, trading_days_between
 __all__ = ["AlertWindow", "WINDOWS", "AlertGate", "send_telegram", "now_kst",
            "TelegramNotConfigured", "DOW_KR", "reco_send_allowed",
            "reco_send_dow_label", "parse_chat_ids", "mask_chat_id",
+           "admin_chat_id", "send_admin",
            "SendFailure", "SendReport", "send_photo", "fit_caption",
            "send_album", "album_payload", "MEDIA_GROUP_MAX",
            "caption_units", "TELEGRAM_CAPTION_MAX"]
@@ -479,6 +480,28 @@ def send_telegram(text: str, chat_id: str | None = None,
     if failures:
         log.error("텔레그램 %d명 중 %d명 실패", len(targets), len(failures))
     return SendReport(sent=sent, failures=tuple(failures))
+
+
+def admin_chat_id(raw: str | None = None) -> str | None:
+    """관리자 채팅 = TELEGRAM_CHAT_ID 의 **첫 번째** 수신자. 없으면 None."""
+    ids = parse_chat_ids(raw if raw is not None else os.getenv("TELEGRAM_CHAT_ID"))
+    return ids[0] if ids else None
+
+
+def send_admin(text: str, dry_run: bool = False,
+               token: str | None = None) -> "SendReport | None":
+    """운영 알림을 **관리자 채팅에만** 보낸다(전 수신자 발송 아님).
+
+    catch-up 보충 실행·뉴스 소스 0건 같은 운영 신호용이다. dry_run 이면
+    보내지 않고 로그만 남긴다(None). 설정이 없으면 TelegramNotConfigured.
+    """
+    if dry_run:
+        log.info("[dry-run · 관리자 채팅] %s", text)
+        return None
+    cid = admin_chat_id()
+    if not cid:
+        raise TelegramNotConfigured("TELEGRAM_CHAT_ID 미설정 — 관리자 채팅 없음")
+    return send_telegram(text, chat_id=cid, token=token)
 
 
 # sendPhoto 캡션 상한. 텍스트 메시지(4096)와 달리 분할 발송이 없다 —

@@ -67,3 +67,24 @@ def run(check, near, tmp):
         finally:
             ev.trading_calendar, ind.backfill = o_cal, o_bf
     check(S, "지표 소급 기본 = 최근 250거래일 · --ind-all 전 기간 · --ind-from 우선", ind_default)
+
+    def admin_only():
+        import os
+        from stocknews import notify as N
+        assert N.admin_chat_id("111, 222;333") == "111"
+        assert N.admin_chat_id("") is None
+        calls = []
+        orig, old = N.send_telegram, os.environ.get("TELEGRAM_CHAT_ID")
+        N.send_telegram = lambda text, chat_id=None, token=None, retries=3: calls.append(chat_id)
+        os.environ["TELEGRAM_CHAT_ID"] = "111,222"
+        try:
+            assert N.send_admin("x", dry_run=True) is None and calls == []
+            N.send_admin("x")
+            assert calls == ["111"], calls                  # 첫 수신자에게만
+        finally:
+            N.send_telegram = orig
+            if old is None:
+                os.environ.pop("TELEGRAM_CHAT_ID", None)
+            else:
+                os.environ["TELEGRAM_CHAT_ID"] = old
+    check(S, "관리자 채팅 = 첫 수신자에게만 · dry-run 은 미발송", admin_only)
