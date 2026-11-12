@@ -65,6 +65,7 @@ FIB = "#008300"
 VP = "#9c9a92"
 CONE = "#138d90"     # [E] 20일 예상 범위 (RISK_INFO)
 STOP = "#b42318"     # [E] 가정 손절선 (원뿔 구간에만)
+HIGH52 = "#b07d2b"   # [H] 52주 고가선 (INDICATOR_LOG ON 일 때만)
 
 TRACK_KR = {"VALUE": "매집", "TREND": "추세", "BOTH": "시퀀스"}
 OBV_NULL_KR = {"split": "분할 흔적", "price_gap": "가격 단절",
@@ -323,12 +324,14 @@ def draw_obv_panel(axo, res: ScreenResult, df: pd.DataFrame,
 
 def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
                  cfg: Config = DEFAULT, trade_date: str | None = None,
-                 risk: dict | None = None) -> Path:
+                 risk: dict | None = None,
+                 high52: float | None = None) -> Path:
     """최근 N봉 캔들 + MA + 청산밴드 + 피보 + P0 + 매물대(상위 3) + OBV 띠 PNG.
 
     risk : [E] `risk.chart_risk()` 결과. 있으면 마지막 봉 오른쪽에 20일
            예상 범위(±1σ·±2σ 원뿔)와 가정 손절선을 그린다. None 이면
            지금과 같은 그림이다(RISK_INFO OFF).
+    high52 : [H] 52주 고가. 있으면 고가선 1줄(INDICATOR_LOG ON). None 이면 그대로.
     """
     from matplotlib import rc_context
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -358,6 +361,11 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
     if risk:
         from .risk import cone_bounds
         cone = cone_bounds(risk["price"], risk["sigma"], cone_n)
+    # [H] 52주 고가선 1줄 (INDICATOR_LOG ON 일 때 build_charts 가 값을 준다).
+    # None 이면 지금과 같은 차트다.
+    if high52 is not None and np.isfinite(high52) and high52 > 0:
+        levels = levels + [{"kind": "high52", "key": "h52",
+                            "price": float(high52), "label": "52주 고가"}]
     pmin, pmax = float(np.nanmin(lo)), float(np.nanmax(h))
     span = max(pmax - pmin, pmax * 0.02)
     reach_lo = pmin - max(0.5 * span, 0.10 * pmin)
@@ -465,6 +473,8 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
                 color = BAND
             elif lv["kind"] == "fib":
                 (ls, lw), color = style["fib"], FIB
+            elif lv["kind"] == "high52":
+                ls, lw, color = "-", 1.2, HIGH52
             else:
                 (ls, lw), color = style["p0"], INK
             ax.hlines(lv["price"], -0.5, line_end, colors=color, linestyles=ls,
@@ -568,8 +578,11 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
             from matplotlib.patches import Patch
             handles.append(Patch(facecolor=CONE, alpha=0.3, edgecolor=CONE,
                                  label=f"{cone_n}일 예상 범위 ±1σ·±2σ"))
+        if any(lv["kind"] == "high52" for lv in levels):
+            handles.append(Line2D([], [], color=HIGH52, lw=1.2, ls="-",
+                                  label="52주 고가"))
         fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.07, top_y(0.68)),
-                   ncol=len(handles), frameon=False, fontsize=8.5, handlelength=2.2,
+                   ncol=max(6, len(handles)), frameon=False, fontsize=8.5, handlelength=2.2,
                    columnspacing=1.4, labelcolor=INK2)
 
         fig.savefig(path, facecolor=SURFACE)
@@ -742,6 +755,16 @@ def prune_chart_dirs(cfg: Config = DEFAULT, root=None,
     return removed
 
 
+def _high52_or_none(store, ticker: str, trade_date: str) -> float | None:
+    """[H] 차트 52주 고가선 값. INDICATOR_LOG OFF·계산 불가·실패면 None."""
+    try:
+        from .indicator_log import high52_level
+        return high52_level(store, ticker, trade_date)
+    except Exception as exc:  # noqa: BLE001 - 선 하나 때문에 차트를 잃지 않는다
+        log.warning("52주 고가선 계산 실패 %s — 선 없이 그립니다 (%s)", ticker, exc)
+        return None
+
+
 def build_charts(store, jobs: list[ChartJob], trade_date: str,
                  cfg: Config = DEFAULT, root=None,
                  prefix: str = "") -> list[ChartOut]:
@@ -766,7 +789,9 @@ def build_charts(store, jobs: list[ChartJob], trade_date: str,
             path = render_chart(res, ohlcv,
                                 chart_path(trade_date, job.rank, job.ticker, cfg,
                                            root, prefix),
-                                cfg, trade_date=trade_date, risk=risk)
+                                cfg, trade_date=trade_date, risk=risk,
+                                high52=_high52_or_none(store, job.ticker,
+                                                       trade_date))
             cap = chart_caption(res, rank=job.rank,
                                 flags=ctx["flags"].get(job.ticker),
                                 exclusion=exclusion_of(job.ticker, ohlcv, ctx),

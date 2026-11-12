@@ -235,6 +235,24 @@ CREATE INDEX IF NOT EXISTS idx_risk_metrics_ticker
 
 # ── [H] 지표 기록 ──
 # (H 구역 시작)
+# 지표 기록. 1행 = (날짜, 종목, 지표, 계산버전). value NULL = 계산했지만 규칙상
+# 값 없음(점프·신선도·상장일수). kind = '소급' | '실시간'.
+# 이전 calc_version 행은 덮어쓰지 않는다 — 쓰기는 전부 INSERT OR IGNORE.
+# WITHOUT ROWID: PK 가 곧 테이블이라 PK 인덱스 사본이 따로 생기지 않는다
+# (약 1천만 행 규모. 사본 실측 rowid 표 1,158MB → 782MB). 소급 행은
+# created 를 NULL 로 둬 560MB (계산 시각은 runs 테이블에 있다).
+DDL_H = """
+CREATE TABLE IF NOT EXISTS indicator_log (
+  d            TEXT    NOT NULL,
+  ticker       TEXT    NOT NULL,
+  name         TEXT    NOT NULL,
+  value        REAL,
+  calc_version INTEGER NOT NULL,
+  kind         TEXT    NOT NULL,
+  created      TEXT,
+  PRIMARY KEY (d, ticker, name, calc_version)
+) WITHOUT ROWID;
+"""
 # (H 구역 끝)
 
 

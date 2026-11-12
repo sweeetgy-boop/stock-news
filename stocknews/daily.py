@@ -389,6 +389,11 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     # 아무것도 하지 않는다. 실패해도 스캔·추천 기록은 이미 커밋돼 있다.
     risk_rep = _record_risk(store, trade_date)
 
+    # [H] 지표 기록 (INDICATOR_LOG ON 일 때만 · 기록 전용 · 예외를 삼킨다).
+    # 추천 저장 뒤라 점수·추천에 닿지 않는다. OFF 면 None 이고 아무것도 안 한다.
+    from .indicator_log import maybe_record_daily
+    ind = maybe_record_daily(store, trade_date)
+
     store.log_run("daily", started, len(results), len(errors),
                   note=f"snapshot={saved}, picks={len(picks)}")
 
@@ -412,3 +417,8 @@ def _record_risk(store, trade_date: str) -> dict | None:
         log.warning("risk_metrics 기록 실패 (스캔·추천은 기록됨): %s", exc)
         return {"d": trade_date, "written": 0,
                 "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+    return {"trade_date": trade_date, "results": results, "errors": errors,
+            "picks": picks, "snapshot_rows": saved,
+            "market_context": mkt, "sector_metrics": sec,
+            "indicator_log": ind}

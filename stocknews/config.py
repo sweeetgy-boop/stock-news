@@ -970,6 +970,28 @@ NEWS_V2_MARKET_MAX_AGE_DAYS = 5
 
 # ── [H] 지표 기록 ──
 # (H 구역 시작)
+# 지표 기록(stocknews/indicator_log.py). **기록 전용 — 점수·추천·발송에 쓰지
+# 않는다.** OFF 면 daily 기록·차트 52주 고가선 전부 지금과 같다.
+INDICATOR_LOG = False
+# 지표별 계산버전. 계산식이나 파라미터를 바꾸면 그 지표의 숫자를 올린다.
+# 이전 버전 행은 덮어쓰지 않고 남는다(PK 에 calc_version 포함). docs/지표등록.md
+INDICATOR_VERSIONS = {
+    "rs20": 1, "rs60": 1, "rs20_pct": 1, "rs60_pct": 1,
+    "dist_52w_high": 1, "mfi14": 1, "atr14_pct": 1, "bb_width20": 1,
+    "kalman_slope": 1,
+}
+IND_RS_WINDOWS = (20, 60)        # 거래일. 종목 수익률 − 소속 시장 지수 수익률
+IND_HIGH52_BARS = 250            # 52주 = 250거래일. 상장(DB 첫 행) 250거래일 미만 NULL
+IND_MFI_WINDOW = 14
+IND_ATR_WINDOW = 14              # 단순평균 TR (exits.atr 와 같은 정의)
+IND_BB_WINDOW = 20
+IND_BB_K = 2.0                   # 모표준편차(ddof=0) × 2
+# 칼만 로컬 선형 추세 모형 (로그 종가). 잡음은 고정값 — 근거는 docs/지표등록.md
+IND_KALMAN_WINDOW = 60           # 매 날짜 직전 60거래일로 새로 돌린다(시작점 고정)
+IND_KALMAN_OBS_VAR = 2.5e-4      # 관측 잡음 R  (일 1.58%)
+IND_KALMAN_LEVEL_VAR = 1.0e-4    # 수준 잡음 Qμ (일 1.0%)
+IND_KALMAN_SLOPE_VAR = 4.0e-7    # 기울기 잡음 Qβ (일 0.063%p)
+IND_KALMAN_P0_SLOPE = 1.0e-4     # 초기 기울기 분산 (일 1%) · 초기 수준 분산 = R
 # (H 구역 끝)
 
 # ── [I] 주간 분석 ──

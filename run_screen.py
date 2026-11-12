@@ -209,7 +209,8 @@ _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
                 "flash", "pos-open", "fill", "pos-close", "holidays",
                 "reconcile", "reco-events-backfill", "regime-backfill",
-                "paper", "risk-backfill"}
+                "paper", "risk-backfill",
+                "indicators-backfill"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -910,6 +911,8 @@ def mode_daily(store: Store, args) -> int:
                   and r.fib.confidence != "LOW"]
         _emit(render_fib_list(picked[:30], asof, DEFAULT), args.dry_run)
 
+    if res.get("indicator_log") is not None:      # [H] 플래그 ON 일 때만
+        SUMMARY["indicator_log"] = res["indicator_log"]
     ok, failed = len(res["results"]), len(res["errors"])
     reg = res.get("regime") or {}
     SUMMARY["regime"] = {k: reg.get(k) for k in
@@ -2427,6 +2430,30 @@ def mode_rebalance(store: Store, args) -> int:
     return EXIT_OK
 
 
+def mode_indicators_backfill(store: Store, args) -> int:
+    """[H] 지표 소급 기록 — nightly 와 분리된 1회성 명령 (쓰기 · 락).
+
+    보유한 가격 전 기간의 지표를 kind='소급' 으로 indicator_log 에 넣는다.
+    INSERT OR IGNORE 라 실시간 행·이전 계산버전 행은 건드리지 않는다.
+    INDICATOR_LOG 플래그와 무관하게 돈다(사람이 부르는 명령).
+    """
+    from stocknews import indicator_log as ind
+    db = Path(args.db)
+    size0 = db.stat().st_size if db.exists() else 0
+    rep = ind.backfill(store, date_from=args.ind_from, date_to=args.ind_to,
+                       cache_dir=args.index_cache)
+    size1 = db.stat().st_size if db.exists() else 0
+    rep["db_bytes_before"], rep["db_bytes_after"] = size0, size1
+    SUMMARY["indicators"] = rep
+    log.info("지표 소급: %d일 · %d종목 · 후보 %d행 · 추가 %d행 · %.1f초 · DB %.1f→%.1fMB",
+             rep.get("dates", 0), rep.get("tickers", 0), rep.get("rows", 0),
+             rep.get("written", 0), rep.get("elapsed_sec", 0.0),
+             size0 / 1e6, size1 / 1e6)
+    if not rep.get("dates"):
+        return EXIT_PRECOND
+    return EXIT_OK
+
+
 MODES = {
     "master": mode_master,
     "backfill": mode_backfill,
@@ -2461,6 +2488,7 @@ MODES = {
     "paper": mode_paper,
     "risk-backfill": mode_risk_backfill,
     "rebalance": mode_rebalance,
+    "indicators-backfill": mode_indicators_backfill,
 }
 
 
@@ -2637,6 +2665,11 @@ def main(argv=None) -> int:
     ap.add_argument("--cooldown-days", type=int, default=0,
                     help="reco-events-backfill: 재추천 제한 창(거래일). "
                          "0 이면 RECO_COOLDOWN_DAYS, 그것도 0 이면 20")
+    # ── [H] 지표 소급 ──
+    ap.add_argument("--ind-from", help="indicators-backfill: 시작일 (기본 전 기간)")
+    ap.add_argument("--ind-to", help="indicators-backfill: 종료일 (기본 전 기간)")
+    ap.add_argument("--index-cache", default="data/index_cache",
+                    help="indicators-backfill: 지수 히스토리 CSV 캐시 폴더")
     args = ap.parse_args(argv)
 
     SUMMARY.clear()

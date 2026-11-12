@@ -75,6 +75,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "paper": 1800,
     # [E] σ 소급 (1회성). 전 거래일 × 전종목, 실측 수 분.
     "risk-backfill": 1800,
+    # [H] 지표 소급 1회성. 전 종목 × 전 기간 약 1천만 행 쓰기.
+    "indicators-backfill": 3600,
 }
 DEFAULT_TIMEOUT = 900
 
