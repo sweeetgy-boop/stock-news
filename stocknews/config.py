@@ -804,6 +804,22 @@ PRICE_JUMP_BREAK_PCT = 30.0
 
 # ── [B] 추천 필터 ──
 # (B 구역 시작)
+# 추천 선정과 recos 기록은 그대로 두고, 선정이 끝난 뒤 '발송·추적 대상
+# 판정'에만 거는 필터다(stocknews/send_filter.py). 플래그를 켜도 recos
+# 행은 한 글자도 바뀌지 않는다. 빠진 자리를 차순위로 메우지 않는다.
+# 적용 순서 고정: ① SEQ 제외 → ② 보충(FILL) 제외 → ③ 국면 TREND 절반
+# (C 의 REGIME_TREND_CUT, 하락 국면에서만) → ④ 재추천 제한 판정.
+#
+# 재추천 제한 기간(거래일). 0 = 사용 안 함. 켤 때 20 ([0] EVENT_WINDOW_DAYS).
+# 이벤트 판정은 [0] events.assign_events 그대로다(첫 추천일 = 1일째, 연장 없음).
+# 켜기 전에 `--mode reco-events-backfill` 로 과거 recos 전체를 소급 구성한다.
+RECO_COOLDOWN_DAYS = 0
+# slot=SEQ 종목을 발송과 추적 편입에서 뺀다. 계산·recos 기록은 그대로.
+EXCLUDE_SEQ_FROM_SEND = False
+# slot=FILL(·FILL*) 보충 종목을 발송과 추적 편입에서 뺀다. VALUE/TREND
+# 슬롯의 하한 완화 채움은 건드리지 않고, 켜져 있으면 발송 문구에
+# "하한 완화 적용" 만 표기한다.
+EXCLUDE_FILL_FROM_SEND = False
 # (B 구역 끝)
 
 # ── [C] 국면 라벨 ──
