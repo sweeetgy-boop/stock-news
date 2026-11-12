@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 from datetime import datetime
 
@@ -28,13 +29,101 @@ import pandas as pd
 
 from .config import Config, DEFAULT
 from .contracts import ScreenResult
-from .screener import rank_results, screen_one
+from .data import index_is_fresh, index_last_date, load_index
+from .indicators import evaluate_obv
+from .screener import check_exclusion, rank_results, screen_one
+from .sector_metrics import collect_sector_metrics
 
 log = logging.getLogger(__name__)
 
-__all__ = ["scan_all", "select_recommendations", "run_daily"]
+__all__ = ["scan_all", "scan_context", "screen_ticker", "exclusion_of",
+           "select_recommendations", "run_daily",
+           "market_context", "collect_market_context"]
 
 SLOT_PLAN = (("SEQ", 2), ("VALUE", 5), ("TREND", 3))
+
+
+SCAN_BARS = 420   # 종목별로 읽는 봉 수. 피보 1년(252) + 이평 여유
+
+
+def scan_context(store, quiet: bool = False) -> dict:
+    """스캔 입력 중 종목과 무관한 것. 한 번만 읽어 종목별로 넘긴다.
+
+    `scan_all` 과 차트용 재계산(`screen_ticker`)이 같이 쓴다. 둘이 입력을
+    따로 모으면 차트가 발송된 점수와 다른 계산을 그리게 된다.
+    """
+    meta = store.ticker_meta()
+    # 배제 플래그를 한 번만 읽어 종목별로 넘긴다. 비어 있으면(공급원 미구동)
+    # 배제가 걸리지 않으므로 잡주가 상위에 올라올 수 있다.
+    all_flags = store.load_flags()
+    if not all_flags and not quiet:
+        log.warning("배제 플래그가 비어 있다 — 'flags' 모드를 먼저 실행하라")
+
+    # 수동 주입 신용잔고. 있는 종목만 LPS credit_heat 가 만점까지 열린다.
+    # 없으면 프록시 캡(1.25점)이 걸려 매집 점수 상한이 8.49점이 된다.
+    credit_map = store.load_credit_ratios()
+    if credit_map and not quiet:
+        log.info("신용잔고 실측 %d종목 적용 (나머지는 프록시)", len(credit_map))
+
+    # '상장 1년 미만' 배제는 DB 에 1년치가 실제로 있을 때만 의미가 있다.
+    # 백필이 덜 된 상태에서 봉 수로 판정하면 전 종목이 신규상장으로
+    # 배제되어 추천이 0건 나온다. 원인 파악이 어려운 함정이다.
+    market_bars = len(store.existing_dates())
+    check_listing = market_bars >= 252
+    if not check_listing and not quiet:
+        log.warning("DB 거래일 %d일 (<252) — '상장 1년 미만' 배제를 비활성",
+                    market_bars)
+    return {"meta": meta, "flags": all_flags, "credit": credit_map,
+            "check_listing": check_listing}
+
+
+def exclusion_of(code: str, ohlcv, ctx: dict) -> str | None:
+    """`screen_one` 이 내렸을 배제 사유. 스캔과 같은 입력으로 판정한다."""
+    meta = ctx["meta"]
+    mc = None
+    if code in meta.index:
+        v = meta.at[code, "market_cap"]
+        mc = float(v) if pd.notna(v) else None
+    listed = len(ohlcv) if (ctx["check_listing"] and ohlcv is not None) else None
+    return check_exclusion(ctx["flags"].get(code), mc, listed)
+
+
+def screen_ticker(store, code: str, name: str, ctx: dict,
+                  cfg: Config = DEFAULT, until=None,
+                  apply_exclusion: bool = True):
+    """한 종목을 스캔과 같은 입력으로 채점한다. (결과, 시세) 또는 (None, 시세).
+
+    until : 이 날짜(포함)까지의 봉만 쓴다. 일요일에 금요일 기록을
+            재현할 때 기준일 뒤 봉이 섞이지 않게 한다.
+    apply_exclusion=False 면 배제 판정을 건너뛰고 분석값을 채운다.
+            차트는 기록 뒤에 배제 사유가 생긴 종목도 그려서 경고해야
+            하는데, 배제된 결과에는 피보·밴드가 비어 있다.
+    """
+    ohlcv = store.load_ohlcv(code, days=SCAN_BARS)
+    if ohlcv is not None and until is not None:
+        ohlcv = ohlcv[ohlcv.index <= pd.Timestamp(str(until))]
+    if ohlcv is None or len(ohlcv) < cfg.ma.long + 30:
+        return None, ohlcv
+    meta = ctx["meta"]
+    mc = None
+    if code in meta.index:
+        v = meta.at[code, "market_cap"]
+        mc = float(v) if pd.notna(v) else None
+    listed = len(ohlcv) if ctx["check_listing"] else None
+    res = screen_one(
+        code, name, ohlcv,
+        credit=None, investor=None, shorting=None,
+        credit_ratio=ctx["credit"].get(code),
+        flags=ctx["flags"].get(code) if apply_exclusion else None,
+        market_cap=mc if apply_exclusion else None,
+        listed_days=listed if apply_exclusion else None, cfg=cfg,
+    )
+    # OBV 는 채점이 **끝난 뒤** 덧붙인다(기록·표시 전용). screen_one 안에서
+    # 계산하면 점수 경로가 그 값을 볼 수 있게 된다. 배제 종목은 scans 에
+    # 기록되지 않으므로 계산하지 않는다.
+    if not res.excluded:
+        res = dataclasses.replace(res, obv=evaluate_obv(ohlcv, cfg.obv))
+    return res, ohlcv
 
 
 def scan_all(store, tickers: dict, cfg: Config = DEFAULT,
@@ -44,27 +133,7 @@ def scan_all(store, tickers: dict, cfg: Config = DEFAULT,
     종목 하나가 터져도 배치가 죽지 않게 예외를 개별 격리한다.
     이게 없으면 신규상장/액면분할 종목 하나 때문에 매일 배치가 실패한다.
     """
-    meta = store.ticker_meta()
-    # 배제 플래그를 한 번만 읽어 종목별로 넘긴다. 비어 있으면(공급원 미구동)
-    # 배제가 걸리지 않으므로 잡주가 상위에 올라올 수 있다.
-    all_flags = store.load_flags()
-    if not all_flags:
-        log.warning("배제 플래그가 비어 있다 — 'flags' 모드를 먼저 실행하라")
-
-    # 수동 주입 신용잔고. 있는 종목만 LPS credit_heat 가 만점까지 열린다.
-    # 없으면 프록시 캡(1.25점)이 걸려 매집 점수 상한이 8.49점이 된다.
-    credit_map = store.load_credit_ratios()
-    if credit_map:
-        log.info("신용잔고 실측 %d종목 적용 (나머지는 프록시)", len(credit_map))
-
-    # '상장 1년 미만' 배제는 DB 에 1년치가 실제로 있을 때만 의미가 있다.
-    # 백필이 덜 된 상태에서 봉 수로 판정하면 전 종목이 신규상장으로
-    # 배제되어 추천이 0건 나온다. 원인 파악이 어려운 함정이다.
-    market_bars = len(store.existing_dates())
-    check_listing = market_bars >= 252
-    if not check_listing:
-        log.warning("DB 거래일 %d일 (<252) — '상장 1년 미만' 배제를 비활성",
-                    market_bars)
+    ctx = scan_context(store)
 
     results: list[ScreenResult] = []
     errors: list[tuple] = []
@@ -76,21 +145,9 @@ def scan_all(store, tickers: dict, cfg: Config = DEFAULT,
             log.info("  스캔 진행 %d/%d (통과 %d, 배제 %d, 실패 %d)",
                      i, total, len(results) - excluded_n, excluded_n, len(errors))
         try:
-            ohlcv = store.load_ohlcv(code, days=420)
-            if ohlcv is None or len(ohlcv) < cfg.ma.long + 30:
+            res, _ = screen_ticker(store, code, name, ctx, cfg)
+            if res is None:
                 continue
-            mc = None
-            listed = len(ohlcv)
-            if code in meta.index:
-                v = meta.at[code, "market_cap"]
-                mc = float(v) if pd.notna(v) else None
-            res = screen_one(
-                code, name, ohlcv,
-                credit=None, investor=None, shorting=None,
-                credit_ratio=credit_map.get(code), flags=all_flags.get(code),
-                market_cap=mc,
-                listed_days=listed if check_listing else None, cfg=cfg,
-            )
             if res.excluded:
                 excluded_n += 1
             results.append(res)
@@ -177,10 +234,128 @@ def select_recommendations(results: list[ScreenResult], meta: pd.DataFrame,
     return picked[:top_n]
 
 
+# ══════════════════ 시장 상태 기록 (기록 전용) ══════════════════
+# 이 블록의 산출물은 `market_context` 테이블에만 들어간다. 점수·추천·
+# 게이트·리포트 어디에도 쓰지 않는다. 채점 표본이 쌓인 뒤 '어떤 장에서
+# 통했나'를 되짚기 위한 것이고, 지금 판단에 쓰면 표본 20건도 안 되는
+# 시점에 국면 필터를 넣는 셈이 된다.
+def _close_series(df, scan_date) -> pd.Series | None:
+    """`scan_date` 이하 구간의 종가 시리즈 (오름차순).
+
+    FDR 은 'Close', 내부 규격은 '종가' 를 쓰므로 둘 다 받는다.
+    """
+    if df is None or len(df) == 0:
+        return None
+    col = next((c for c in ("종가", "Close") if c in df.columns), None)
+    if col is None:
+        return None
+    s = df[col].astype("float64").dropna()
+    idx = pd.DatetimeIndex(s.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    s.index = idx
+    s = s.sort_index()
+    s = s[s.index <= pd.Timestamp(scan_date)]
+    return s if len(s) else None
+
+
+def _ret_pct(s: pd.Series | None, bars: int) -> float | None:
+    """`bars` 거래일 수익률(%). 봉이 부족하면 None.
+
+    달력일이 아니라 봉 개수로 센다. `s.iloc[-1]` 대비 `s.iloc[-(bars+1)]`
+    이므로 두 지점이 정확히 `bars` 봉 떨어져 있다.
+    """
+    if s is None or len(s) < bars + 1:
+        return None
+    a = float(s.iloc[-(bars + 1)])
+    b = float(s.iloc[-1])
+    if a <= 0:
+        return None
+    return (b / a - 1.0) * 100.0
+
+
+def market_context(kospi, kosdaq, scan_date: str,
+                   ma_window: int = 200) -> dict | None:
+    """추천 시점 시장 상태. 순수 계산 — 네트워크·DB 를 만지지 않는다.
+
+    KOSPI 종가를 못 구하면 None (기록할 게 없다). 봉이 부족한 항목만
+    None 으로 남기고 나머지는 채운다. 0 으로 채우면 '보합'으로 읽힌다.
+    """
+    ks = _close_series(kospi, scan_date)
+    if ks is None:
+        return None
+    close = float(ks.iloc[-1])
+    ma = float(ks.iloc[-ma_window:].mean()) if len(ks) >= ma_window else None
+    kq = _close_series(kosdaq, scan_date)
+    return {
+        "scan_date": scan_date,
+        "kospi_close": close,
+        "kospi_ma200": ma,
+        "kospi_above_ma200": None if ma is None else int(close > ma),
+        "kospi_ret_5d": _ret_pct(ks, 5),
+        "kospi_ret_20d": _ret_pct(ks, 20),
+        "kosdaq_close": None if kq is None else float(kq.iloc[-1]),
+        "kosdaq_ret_5d": _ret_pct(kq, 5),
+    }
+
+
+def collect_market_context(store, trade_date: str, bars: int = 300,
+                           fetch=None) -> dict | None:
+    """지수를 조회해 시장 상태를 기록한다. 하루 1회.
+
+    **실패해도 예외를 올리지 않는다.** 지수 조회가 안 되는 날에 daily
+    전체가 실패하면 정작 중요한 스캔·추천 기록이 날아간다. 경고만 남기고
+    None 을 돌린다.
+
+    fetch : 테스트용 주입구. (name, bars) -> DataFrame|None
+    """
+    if not trade_date:
+        return None
+    try:
+        if store.has_market_context(trade_date):
+            return None
+        get = fetch or (lambda name, n: load_index(name, bars=n))
+        kospi = get("KOSPI", bars)
+        kosdaq = get("KOSDAQ", bars)
+        # 신선도 가드(v2-A): 기준일 값이 없는 지수로 기록하지 않는다.
+        # 기준일 이하로 자른 '마지막 값'은 지난 날의 값일 수 있다 —
+        # 2026-09-17~10-13 에 KOSPI 6,724.34 가 15거래일 고정 기록됐다.
+        if kospi is not None and len(kospi) and \
+                not index_is_fresh(kospi, trade_date):
+            log.warning("지수가 기준일과 다릅니다 KOSPI: 마지막 %s ≠ 기준일 %s "
+                        "— 시장 상태 미기록",
+                        index_last_date(kospi, trade_date), trade_date)
+            return None
+        if kosdaq is not None and len(kosdaq) and \
+                not index_is_fresh(kosdaq, trade_date):
+            log.warning("지수가 기준일과 다릅니다 KOSDAQ: 마지막 %s ≠ 기준일 %s "
+                        "— 코스닥 칸만 비우고 기록",
+                        index_last_date(kosdaq, trade_date), trade_date)
+            kosdaq = None
+        row = market_context(kospi, kosdaq, trade_date)
+        if row is None:
+            log.warning("시장 상태 계산 불가 (KOSPI 종가 없음) — %s 생략",
+                        trade_date)
+            return None
+        store.upsert_market_context(row)
+    except Exception as exc:  # noqa: BLE001 - daily 를 죽이지 않는다
+        log.warning("시장 상태 기록 실패 — 건너뜁니다 (%s: %s)",
+                    type(exc).__name__, exc)
+        return None
+
+    ma = row["kospi_ma200"]
+    log.info("시장 상태 기록 %s · KOSPI %.2f (MA200 %s · %s) · 5일 %s",
+             trade_date, row["kospi_close"],
+             f"{ma:.2f}" if ma is not None else "-",
+             {1: "위", 0: "아래"}.get(row["kospi_above_ma200"], "판정불가"),
+             f"{row['kospi_ret_5d']:+.2f}%"
+             if row["kospi_ret_5d"] is not None else "-")
+    return row
+
+
 def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
               tickers: dict | None = None) -> dict:
     """저녁 배치 본체. 스캔 → 스냅샷 저장 → 10선 선정 → 저장."""
-    started = datetime.now()
     tickers = tickers or store.active_tickers()
     trade_date = store.last_price_date()
     if not trade_date:
@@ -194,8 +369,59 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     meta = store.ticker_meta()
     picks = select_recommendations(results, meta, top_n=top_n, cfg=cfg)
     store.save_recos(trade_date, picks)
-    store.log_run("daily", started, len(results), len(errors),
-                  note=f"snapshot={saved}, picks={len(picks)}")
 
-    return {"trade_date": trade_date, "results": results, "errors": errors,
-            "picks": picks, "snapshot_rows": saved}
+    # 추천 저장 **뒤에** 둔다. 지수 조회가 실패해도 스캔·추천 기록은
+    # 이미 커밋돼 있어야 한다. 둘 다 기록 전용이고 예외를 삼킨다.
+    mkt = collect_market_context(store, trade_date)
+    # 섹터 지표는 market_context 뒤에 둔다. 코스피 수익률을 그 기록에서
+    # 가져다 쓰므로, 순서가 바뀌면 같은 날 지수를 두 번 조회한다.
+    sec = collect_sector_metrics(store, trade_date, cfg=cfg)
+    # [C] 국면 기록 — 플래그와 무관하게 항상. 추천 저장 뒤라 그날 recos 의
+    # 국면 스냅샷(reco_regime)도 같이 남긴다. 실패를 삼킨다(기록 전용).
+    # 지수는 market_context 와 별개로 다시 받는다 — 신선도는 regime 이
+    # 그날 행 유무로 독립 판정한다.
+    # [C] 지수 확정(R3-3): 국면 기록 전에 직전 5거래일 지수를 KRX 공식 값으로
+    # 확정하고(market_context·market_regime), 당일 행은 잠정 표시한다. 키
+    # 없음·KRX 실패면 생략(경고만). record_daily 는 공식 값을 덮어쓴 지수를
+    # 받는다 — 확정이 없으면 아래 조회 그대로다.
+    from .index_confirm import confirm_recent
+    from .regime import record_daily
+    idxc = confirm_recent(
+        store, trade_date,
+        fetch=lambda name, bars: load_index(name, bars=bars))
+    reg = record_daily(store, trade_date, fetch=idxc.fetch)
+
+    # [E] 종목별 EWMA σ. 기록 전용(점수에 들어가지 않는다) · 플래그 OFF 면
+    # 아무것도 하지 않는다. 실패해도 스캔·추천 기록은 이미 커밋돼 있다.
+    risk_rep = _record_risk(store, trade_date)
+
+    # [H] 지표 기록 (INDICATOR_LOG ON 일 때만 · 기록 전용 · 예외를 삼킨다).
+    # 추천 저장 뒤라 점수·추천에 닿지 않는다. OFF 면 None 이고 아무것도 안 한다.
+    from .indicator_log import maybe_record_daily
+    ind = maybe_record_daily(store, trade_date)
+
+    # 배치 이력은 run_screen.main() 이 한 곳에서 기록한다(AGENTS 10장).
+    # 여기서도 log_run 을 부르면 runs 에 daily 가 두 줄씩 남았다 — 하나는
+    # TZ=UTC 자식에서 datetime.now() 라 9시간 어긋난 started 로.
+
+    out = {"trade_date": trade_date, "results": results, "errors": errors,
+           "picks": picks, "snapshot_rows": saved,
+           "market_context": mkt, "sector_metrics": sec,
+           "regime": reg, "indicator_log": ind,
+           "index_confirm": idxc.summary}
+    if risk_rep is not None:
+        out["risk_metrics"] = risk_rep
+    return out
+
+
+def _record_risk(store, trade_date: str) -> dict | None:
+    """RISK_INFO 가 켜져 있으면 그 거래일 σ 를 risk_metrics 에 기록한다."""
+    from . import risk
+    if not risk.enabled():
+        return None
+    try:
+        return risk.record_daily(store, trade_date)
+    except Exception as exc:  # noqa: BLE001 - 기록 전용
+        log.warning("risk_metrics 기록 실패 (스캔·추천은 기록됨): %s", exc)
+        return {"d": trade_date, "written": 0,
+                "error": f"{type(exc).__name__}: {exc}"[:200]}

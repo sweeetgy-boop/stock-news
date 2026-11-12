@@ -89,6 +89,25 @@ class LiquidationSignal:
 
 
 @dataclass(frozen=True)
+class ObvSignal:
+    """OBV 20일 흐름. **기록·표시 전용** — 점수·등급·슬롯·게이트·exits 금지.
+
+    slope 가 None 이면 그 종목 OBV 는 NULL 이다. 사유는 null_reason.
+      split      창 안에 가격 비율과 거래량 비율이 역수로 튄 날 (분할 흔적)
+      price_gap  창 안에 가격제한폭 밖 점프. 거래량은 역수가 아니지만 가격
+                 시계열이 끊겨 20일 변화율·OBV 부호가 둘 다 무의미하다
+      short      봉 부족
+      no_volume  창 안 거래량 평균이 0
+    """
+
+    slope: Optional[float]          # 20일 OBV 회귀 기울기 / 20일 평균 거래량
+    divergence: Optional[int]       # +1 강세 / -1 약세 / 0 없음 / None 판정불가
+    price_ret_pct: Optional[float]  # 같은 창의 종가 변화율(%)
+    null_reason: Optional[str] = None
+    split_dates: tuple = ()         # 창 안 분할 흔적 날짜 (YYYY-MM-DD)
+
+
+@dataclass(frozen=True)
 class ScreenResult:
     """한 종목에 대한 최종 스크리닝 산출물."""
 
@@ -110,6 +129,9 @@ class ScreenResult:
     mark: str = ""                  # ⭐⭐⭐ 🔵 등
     reasons: tuple = ()
     excluded: Optional[str] = None  # 배제 사유(있으면 발송 금지)
+    # 기록·표시 전용. screen_one 은 채우지 않는다 — 채점이 끝난 뒤
+    # daily.screen_ticker 가 덧붙인다. 그래서 점수 경로가 볼 수 없다.
+    obv: Optional[ObvSignal] = None
 
 
 # ══════════════════════════ 포지션 / 청산 ══════════════════════════
@@ -140,6 +162,11 @@ class Position:
     remaining: int
 
     # ── 진입 시점 스냅샷 (재계산 금지) ──
+    # stop_price 는 진입 시 확정 기록되는 손절선이다. 청산 판정은 이 값만
+    # 본다. 판정 시점에 다시 계산하면 손절선이 주가를 따라 내려간다.
+    # 사후 수정 API 는 의도적으로 두지 않았다 — 손절선을 옮길 수 있으면
+    # 손절은 규칙이 아니라 기분이 된다.
+    stop_price: Optional[float] = None
     entry_p0: Optional[float] = None
     entry_band_hi: Optional[float] = None
     entry_band_mid: Optional[float] = None
@@ -188,6 +215,23 @@ class ExitDecision:
     fill_note: str = "익일 시가 집행 가정"
     detail: dict = field(default_factory=dict)
 
+
+# 계층 0 은 두 규칙이 공유한다: 무효화(invalidation:*)와 보유기간
+# 만료(hold:expired). 사람이 읽는 이름은 규칙으로 갈라야 하므로
+# RULE_NAME 을 먼저 본다.
+RULE_NAME = {
+    "hold:expired": "보유만료",
+}
+
+# 계층 1 손절 규칙 접두사. 재진입 쿨다운을 걸 대상을 이걸로 판별한다.
+STOP_RULE_PREFIX = "stop:"
+
+# 배제 플래그의 사유 코드. 자동 판정과 사람이 넣은 것을 구분한다.
+# 자동 쿨다운은 만료되면 코드가 스스로 지우지만, 수동 플래그는 사람이
+# 지울 때까지 남아야 한다. 같은 컬럼에 섞으면 만료 청소가 수동 항목을
+# 지운다.
+COOLDOWN_REASON = "AUTO:STOP_COOLDOWN"
+MANUAL_REASON = "MANUAL"
 
 LAYER_NAME = {
     0: "무효화",

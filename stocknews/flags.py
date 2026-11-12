@@ -40,6 +40,9 @@ from xml.etree import ElementTree
 import pandas as pd
 import requests
 
+from .config import COOLDOWN_DAYS, DART_LIST_MAX_PAGES, DART_MARKETS
+from .contracts import COOLDOWN_REASON, STOP_RULE_PREFIX
+
 log = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
@@ -49,7 +52,7 @@ __all__ = [
     "fetch_admin_issues", "dart_corp_codes", "dart_capital_impairment",
     "dart_disclosure_events", "scan_local_flags", "detect_halt_history",
     "detect_penny_risk", "detect_price_discontinuity", "load_manual_flags",
-    "refresh_flags", "flag_summary",
+    "refresh_flags", "flag_summary", "sync_stop_cooldowns",
     "load_manual_credit", "refresh_credit",
 ]
 
@@ -235,30 +238,74 @@ _OFFERING_RE = re.compile(r"유상증자|전환사채|신주인수권부사채|�
 _AUDIT_RE = re.compile(r"의견거절|한정의견|감사범위제한|부적정")
 
 
+def _pages_for(market: str, max_pages) -> int:
+    """시장별 페이지 상한. int 를 주면 전 시장 공통, dict 면 시장별."""
+    if isinstance(max_pages, dict):
+        return int(max_pages.get(market, 20))
+    return int(max_pages)
+
+
 def dart_disclosure_events(days: int = 60, page_count: int = 100,
-                           max_pages: int = 20) -> tuple[dict, bool]:
+                           max_pages=None,
+                           markets: tuple[str, ...] | None = None
+                           ) -> tuple[dict, bool]:
     """최근 공시에서 증자/감자·감사의견 이슈 종목을 추출.
 
+    markets
+      corp_cls 튜플. 기본은 config.DART_MARKETS. **순서대로** 돈다.
+      코넥스("N")는 유니버스에 없으므로 들어와도 건너뛴다.
+    max_pages
+      int(전 시장 공통) 또는 {시장: 상한} dict. 기본은 config.DART_LIST_MAX_PAGES.
+      상한에 닿으면 경고를 남긴다 — 그 시장의 뒷 페이지를 못 본 것이다.
+
     반환: ({종목코드: {"offering": bool, "audit": bool, "titles": [...]}}, 성공여부)
+    성공여부는 '한 시장이라도 응답을 받았는가'다. 한 시장이 실패하면
+    그 시장의 플래그가 빠진 채 갱신되므로 로그로 남긴다.
     """
     if not os.getenv("DART_API_KEY"):
         log.info("DART_API_KEY 미설정 → 증자/감사의견 플래그 건너뜀")
         return {}, False
 
+    markets = tuple(markets) if markets is not None else tuple(DART_MARKETS)
+    max_pages = DART_LIST_MAX_PAGES if max_pages is None else max_pages
     end = datetime.now(KST)
     start = end - timedelta(days=days)
     out: dict[str, dict] = {}
     ok = False
+    for market in markets:
+        if market == "N":
+            log.warning("DART corp_cls N(코넥스)은 유니버스 밖 — 건너뜀")
+            continue
+        m_ok, m_items = _scan_market(market, start, end, page_count,
+                                     _pages_for(market, max_pages), out)
+        ok = ok or m_ok
+        log.info("DART 공시 스캔 corp_cls=%s: %d건 %s", market, m_items,
+                 "" if m_ok else "(조회 실패)")
+
+    hits = {k: v for k, v in out.items() if v["offering"] or v["audit"]}
+    log.info("DART 공시 스캔: 증자/감사의견 이슈 %d종목 (시장 %s)",
+             len(hits), ",".join(markets))
+    return hits, ok
+
+
+def _scan_market(market: str, start, end, page_count: int, max_pages: int,
+                 out: dict) -> tuple[bool, int]:
+    """한 시장의 list.json 을 페이지 끝까지 읽어 out 에 누적한다.
+
+    반환: (응답을 한 번이라도 받았는가, 훑은 공시 건수)
+    """
+    ok, seen = False, 0
     for page in range(1, max_pages + 1):
         data = _dart_get("list.json", {
             "bgn_de": start.strftime("%Y%m%d"),
             "end_de": end.strftime("%Y%m%d"),
-            "page_no": page, "page_count": page_count, "corp_cls": "Y",
+            "page_no": page, "page_count": page_count, "corp_cls": market,
         })
         if data is None:
             break
         ok = True
         items = data.get("list") or []
+        seen += len(items)
         for it in items:
             code = (it.get("stock_code") or "").strip()
             if not code:
@@ -278,11 +325,11 @@ def dart_disclosure_events(days: int = 60, page_count: int = 100,
                 rec["titles"].append(title[:60])
         if len(items) < page_count:
             break
+        if page == max_pages:
+            log.warning("DART corp_cls=%s 페이지 상한 %d 도달 — 뒷 페이지 미조회. "
+                        "config.DART_LIST_MAX_PAGES 를 올리십시오", market, max_pages)
         time.sleep(0.3 + random.random() * 0.2)
-
-    hits = {k: v for k, v in out.items() if v["offering"] or v["audit"]}
-    log.info("DART 공시 스캔: 증자/감사의견 이슈 %d종목", len(hits))
-    return hits, ok
+    return ok, seen
 
 
 # ══════════════════════════ ③ 로컬 시세 기반 ══════════════════════════
@@ -294,7 +341,10 @@ def detect_halt_history(store, tickers: dict, lookback_days: int = 90,
     첫 거래일 이후 구간만 비교한다.
     """
     since = (datetime.now(KST) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    market_days = sorted(store.existing_dates(since=since))
+    # 부분 적재일을 거래일로 세면 안 된다. 그날 데이터가 없는 종목이
+    # 전부 '정지'로 잡힌다 — 2026-09 에 구멍 4일 때문에 2,463종목이
+    # 오탐됐다. 상세는 Store.complete_dates docstring.
+    market_days = sorted(store.complete_dates(since=since))
     if len(market_days) < 20:
         return {}
 
@@ -343,7 +393,10 @@ def scan_local_flags(store, tickers: dict, lookback_days: int = 120,
     """
     since = (datetime.now(KST) - timedelta(days=lookback_days)
              ).strftime("%Y-%m-%d")
-    market_days = set(store.existing_dates(since=since))
+    # 부분 적재일 제외. 이걸 안 하면 구멍난 날짜가 거래일로 취급돼
+    # 그날 데이터가 없는 종목이 전부 거래정지로 오탐된다(2026-09 실측
+    # 2,463종목). 상세는 Store.complete_dates docstring.
+    market_days = set(store.complete_dates(since=since))
     can_check_halt = len(market_days) >= 20
     if not can_check_halt:
         log.warning("DB 거래일 %d일 (<20) — 거래정지 판정 생략", len(market_days))
@@ -462,11 +515,43 @@ def load_manual_flags(path: str | Path = "data/flags_manual.csv") -> list[dict]:
 
 
 # ══════════════════════════ 통합 갱신 ══════════════════════════
+def sync_stop_cooldowns(store, cooldown_days: int = COOLDOWN_DAYS,
+                        lookback_days: int = 180) -> dict:
+    """손절 청산 이력에서 재진입 금지를 재구성하고 만료된 것을 해제한다.
+
+    `run_exits` 가 손절이 나는 순간 쿨다운을 걸지만, 그것만으로는 부족하다.
+    청산 이력이 있는데 플래그가 없는 상태가 생길 수 있다 — 배치가 죽었거나
+    DB 를 옮겼거나 이 기능 이전에 쌓인 이력이 있는 경우다. 그래서 이력을
+    정본으로 보고 매번 다시 맞춘다(멱등).
+
+    해제는 **자동 사유 코드만** 대상이다. 사람이 넣은 배제를 자동 청소가
+    지우면 수동 판단이 조용히 풀린다.
+    """
+    hist = store.exit_log_history(days=lookback_days)
+    added: list[str] = []
+    if hist is not None and not hist.empty and "rule" in hist.columns:
+        stops = hist[hist["rule"].astype(str).str.startswith(STOP_RULE_PREFIX)]
+        # 종목별 가장 늦은 손절일부터 센다
+        for ticker, grp in stops.groupby("ticker"):
+            d0 = str(grp["d"].max())
+            store.set_cooldown(str(ticker), d0, COOLDOWN_REASON)
+            added.append(str(ticker))
+
+    released = store.expire_cooldowns(cooldown_days, COOLDOWN_REASON)
+    state = store.cooldown_state(cooldown_days)
+    active = [t for t, s in state.items() if s["active"]]
+    log.info("재진입 금지: 활성 %d종목 · 해제 %d종목 (기준 %d거래일)",
+             len(active), len(released), cooldown_days)
+    return {"seen": len(added), "active": len(active), "active_list": active,
+            "released": released, "cooldown_days": int(cooldown_days)}
+
+
 def refresh_flags(store, tickers: dict | None = None,
                   use_fdr: bool = True, use_dart: bool = True,
                   use_local: bool = True, use_manual: bool = True,
                   dart_limit: int = 0, dart_ttl_days: int = 30,
-                  offering_days: int = 60) -> dict:
+                  offering_days: int = 60,
+                  cooldown_days: int = COOLDOWN_DAYS) -> dict:
     """전 공급원 갱신. 성공한 공급원의 필드만 초기화 후 재기록한다."""
     started = datetime.now(KST)
     tickers = tickers or store.active_tickers()
@@ -539,6 +624,14 @@ def refresh_flags(store, tickers: dict | None = None,
         if manual:
             store.upsert_flags(manual)
         stats["manual"] = len(manual)
+
+    # ── ⑤ 재진입 금지 (손절 이력 기반, 자동 해제 포함) ──
+    # 수동 오버라이드보다 뒤에 둔다. 쿨다운은 전용 컬럼을 쓰므로 수동
+    # 항목과 충돌하지 않는다.
+    cd = sync_stop_cooldowns(store, cooldown_days)
+    stats["cooldown_active"] = cd["active"]
+    stats["cooldown_released"] = len(cd["released"])
+    stats["_cooldown_list"] = cd["active_list"][:20]
 
     store.log_run("flags", started,
                   sum(v for v in stats.values() if isinstance(v, int)), 0,
@@ -628,21 +721,22 @@ def flag_summary(store) -> pd.DataFrame:
 CREDIT_HEADER = ("종목코드", "신용잔고율", "신용잔고주식수", "기준일", "비고")
 
 
-def load_manual_credit(path: str | Path = "data/credit_manual.csv") -> list[dict]:
-    """수동 주입 신용잔고 CSV 파싱.
+def load_credit_csv(path: str | Path,
+                    source: str = "manual") -> list[dict]:
+    """신용잔고 CSV 파싱. 수동 파일과 키움 브릿지 파일이 같은 규격이다.
 
-    이 시스템의 핵심 가설이 '신용 강제청산'인데 종목별 신용잔고 실측을
-    자동으로 확보하지 못하고 있다. 그 사이 구멍을 메우는 경로다.
-    한 사람이 KRX/증권사 화면에서 관심종목분만 받아 CSV 로 넣으면
-    그 종목들은 프록시가 아니라 실측으로 채점된다.
+    `source` 를 인자로 받는 이유: 예전에는 `"manual"` 로 박혀 있어서
+    키움/KRX 가 채운 값도 DB 에 '사람이 넣었다'고 기록됐다. 그러면 커버리지
+    감사가 불가능하다. 어떤 종목이 실측인지, 누가 넣었는지 구분해야
+    프록시 캡(1.25점)이 언제 벗겨졌는지 설명할 수 있다.
 
     형식(헤더 필수):
       종목코드,신용잔고율,신용잔고주식수,기준일,비고
       329180,4.85,1234567,2026-08-22,김차장 제공
       086520,6.20,,2026-08-22,
 
-    신용잔고율만 있어도 동작한다. 상장주식수를 아는 종목은 주식수만
-    넣어도 되지만, 그 경우 마스터의 shares 로 비율을 계산한다.
+    신용잔고율만 있어도 동작한다. 비율이 없고 주식수만 있으면
+    `refresh_credit` 이 마스터의 상장주식수로 역산한다.
     """
     p = Path(path)
     if not p.exists():
@@ -664,23 +758,56 @@ def load_manual_credit(path: str | Path = "data/credit_manual.csv") -> list[dict
                     "ratio": float(ratio) if ratio else None,
                     "shares": float(shares) if shares else None,
                     "asof": asof or None,
-                    "source": "manual",
+                    "source": source,
                     "note": (r.get("비고") or "").strip() or None,
                 })
     except (OSError, ValueError) as exc:
         log.warning("신용잔고 CSV 읽기 실패 %s: %s", p, exc)
         return []
-    log.info("수동 신용잔고 %d종목 파싱", len(rows))
+    log.info("신용잔고 %d종목 파싱 (%s, source=%s)", len(rows), p, source)
     return rows
 
 
-def refresh_credit(store, path: str | Path = "data/credit_manual.csv") -> dict:
-    """수동 신용잔고를 적재하고, 비율이 빈 종목은 상장주식수로 역산한다."""
-    rows = load_manual_credit(path)
+def load_manual_credit(path: str | Path = "data/credit_manual.csv") -> list[dict]:
+    """수동 주입 신용잔고. `load_credit_csv(..., "manual")` 의 별칭.
+
+    사람이 KRX/증권사 화면에서 관심종목분만 받아 CSV 로 넣으면 그
+    종목들은 매물대 POC 프록시가 아니라 실측으로 채점된다.
+    """
+    return load_credit_csv(path, source="manual")
+
+
+# 적재 순서. 뒤가 앞을 덮으므로 **사람의 값이 항상 이긴다.**
+#   krx    은 KRX 자동 수집 (현재는 화면이 없어 사실상 비활성)
+#   kiwoom 은 REST ka10013 실측
+#   manual 은 사람이 넣은 CSV
+CREDIT_CHAIN: tuple[tuple[str, str], ...] = (
+    ("data/credit_kiwoom.csv", "kiwoom"),
+    ("data/credit_manual.csv", "manual"),
+)
+
+
+def refresh_credit(store, path: str | Path = "data/credit_manual.csv",
+                   source: str = "manual") -> dict:
+    """신용잔고 CSV 를 적재하고, 비율이 빈 종목은 상장주식수로 역산한다."""
+    rows = load_credit_csv(path, source=source)
     if not rows:
-        return {"parsed": 0, "stored": 0, "derived": 0,
+        return {"parsed": 0, "stored": 0, "derived": 0, "source": source,
                 "note": f"{path} 없음 또는 유효 행 없음"}
 
+    derived = _derive_ratios(store, rows)
+    usable = [r for r in rows if r["ratio"] is not None]
+    stored = store.upsert_credit(usable)
+    cov = store.credit_coverage()
+    log.info("신용잔고 적재 %d종목 (%s · 주식수 역산 %d) · 커버리지 %d/%d "
+             "· 기준일 %s", stored, source, derived, cov["with_credit"],
+             cov["active"], cov["asof"])
+    return {"parsed": len(rows), "stored": stored, "derived": derived,
+            "source": source, "coverage": cov}
+
+
+def _derive_ratios(store, rows: list[dict]) -> int:
+    """비율이 없고 주식수만 있는 행을 상장주식수로 역산한다."""
     meta = store.ticker_meta()
     derived = 0
     for r in rows:
@@ -689,11 +816,34 @@ def refresh_credit(store, path: str | Path = "data/credit_manual.csv") -> dict:
             if pd.notna(listed) and float(listed) > 0:
                 r["ratio"] = round(float(r["shares"]) / float(listed) * 100.0, 3)
                 derived += 1
+    return derived
 
-    usable = [r for r in rows if r["ratio"] is not None]
-    stored = store.upsert_credit(usable)
-    cov = store.credit_coverage()
-    log.info("신용잔고 적재 %d종목 (주식수 역산 %d) · 커버리지 %d/%d · 기준일 %s",
-             stored, derived, cov["with_credit"], cov["active"], cov["asof"])
-    return {"parsed": len(rows), "stored": stored, "derived": derived,
-            "coverage": cov}
+
+def refresh_credit_chain(store, chain=CREDIT_CHAIN,
+                         manual_path: str | Path | None = None) -> dict:
+    """여러 출처를 **순서대로** 적재한다. 뒤가 앞을 덮는다.
+
+    왜 한 명령 안에서 병합하는가: 예전에는 `--mode credit` 이
+    `credit_manual.csv` 하나만 읽었다. 키움 브릿지가 만든
+    `credit_kiwoom.csv` 는 아무도 읽지 않아서 실측이 DB 에 들어가지
+    않았다. 사람이 두 번 실행해야 했고, 순서를 틀리면 자동값이 수동값을
+    덮었다. 순서를 코드로 고정한다.
+
+    `manual_path` 로 수동 파일 위치를 바꿔도 그 항목은 체인 **마지막**에
+    남는다. CLI 의 `--credit-file` 이 우선순위를 흔들면 안 된다.
+    """
+    steps: list[dict] = []
+    total_parsed = total_stored = total_derived = 0
+    for path, source in chain:
+        p = manual_path if (source == "manual" and manual_path) else path
+        res = refresh_credit(store, p, source=source)
+        steps.append({"path": str(p), "source": source,
+                      "parsed": res["parsed"], "stored": res["stored"],
+                      "derived": res["derived"]})
+        total_parsed += res["parsed"]
+        total_stored += res["stored"]
+        total_derived += res["derived"]
+    return {"parsed": total_parsed, "stored": total_stored,
+            "derived": total_derived, "steps": steps,
+            "by_source": store.credit_sources(),
+            "coverage": store.credit_coverage()}

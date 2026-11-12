@@ -16,7 +16,12 @@ import numpy as np
 import pandas as pd
 
 __all__ = ["vwap_series", "from_credit_balance", "from_retail_netbuy",
-           "from_volume_profile", "estimate_cost_basis"]
+           "volume_profile",
+           "from_volume_profile", "estimate_cost_basis", "POC_MIN_LOOKBACK"]
+
+# 방법 C(매물대 POC)가 보는 최소 구간. 추천 차트의 매물대 막대도 이 값을
+# 쓴다 — 구간이 다르면 차트의 최다 매물대와 P0 가 서로 다른 것을 가리킨다.
+POC_MIN_LOOKBACK = 120
 
 
 def vwap_series(ohlcv: pd.DataFrame) -> pd.Series:
@@ -64,9 +69,14 @@ def from_retail_netbuy(ohlcv: pd.DataFrame, investor: pd.DataFrame,
     return float((df["vwap"].fillna(0.0) * w).sum() / w.sum())
 
 
-def from_volume_profile(ohlcv: pd.DataFrame, lookback: int = 120,
-                        bins: int = 40) -> float | None:
-    """방법 C. 가격대별 거래량 분포의 최다 구간(POC) 중심가."""
+def volume_profile(ohlcv: pd.DataFrame, lookback: int = 120,
+                   bins: int = 40) -> tuple[np.ndarray, np.ndarray] | None:
+    """가격대별 거래량 분포. (구간 경계 bins+1개, 구간별 거래량 bins개).
+
+    봉마다 대표가 (고+저+종)/3 한 점에 그 봉 거래량 전부를 싣는다.
+    POC(방법 C)와 차트의 매물대 막대가 이 함수 하나를 같이 쓴다 —
+    따로 세면 차트의 최다 매물대와 P0 가 어긋나 보인다.
+    """
     df = ohlcv.tail(lookback)
     if len(df) < 30:
         return None
@@ -81,6 +91,16 @@ def from_volume_profile(ohlcv: pd.DataFrame, lookback: int = 120,
     np.add.at(agg, idx, vol.to_numpy())
     if agg.sum() <= 0:
         return None
+    return edges, agg
+
+
+def from_volume_profile(ohlcv: pd.DataFrame, lookback: int = 120,
+                        bins: int = 40) -> float | None:
+    """방법 C. 가격대별 거래량 분포의 최다 구간(POC) 중심가."""
+    vp = volume_profile(ohlcv, lookback, bins)
+    if vp is None:
+        return None
+    edges, agg = vp
     k = int(agg.argmax())
     return float((edges[k] + edges[k + 1]) / 2.0)
 
@@ -99,7 +119,7 @@ def estimate_cost_basis(ohlcv: pd.DataFrame,
     for key, val in (
         ("A", from_credit_balance(ohlcv, credit, lookback, credit_shift)),
         ("B", from_retail_netbuy(ohlcv, investor, lookback)),
-        ("C", from_volume_profile(ohlcv, max(lookback, 120))),
+        ("C", from_volume_profile(ohlcv, max(lookback, POC_MIN_LOOKBACK))),
     ):
         if val is not None and np.isfinite(val) and val > 0:
             cands[key] = float(val)

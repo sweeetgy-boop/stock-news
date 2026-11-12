@@ -72,18 +72,144 @@ class CreditConfig:
     short_shift: int = 2           # 공매도 잔고 공시 지연(영업일)
 
 
+# 성적을 판단 근거로 쓰기 전에 필요한 **채점 완료** 표본 수.
+#
+# 누적 추천 건수가 아니라 채점이 도래한 건수를 세야 한다. 추천 100건을
+# 쌓아도 보유기간이 지나지 않았으면 성적은 0건이다. 진행률을 추천 건수로
+# 표시하면 '거의 다 됐다'고 착각하게 된다.
+#
+# 20건은 승률이 우연과 구분되기 시작하는 최소선이다. 여전히 적다.
+MIN_SCORED_FOR_JUDGMENT = 20
+
+
+@dataclass(frozen=True)
+class AuditConfig:
+    """자기검증(사후 채점) 파라미터.
+
+    보유기간을 하나로 고정하면 '이 전략이 5일물인지 20일물인지' 를 알 수
+    없다. 5일에서 알파가 없어도 20일에서 나올 수 있고 그 반대도 가능하다.
+    그래서 여러 기간을 **병렬로** 채점해 비교한다.
+
+    아직 기간이 경과하지 않은 추천은 '미도래'로 세고 채점에서 뺀다.
+    0으로 넣으면 평균이 0쪽으로 끌려가 성적이 실제보다 나빠 보이고,
+    실패로 처리하면 표본이 조용히 줄어든다. 둘 다 판단을 흐린다.
+    """
+
+    horizons: tuple[int, ...] = (5, 10, 20)   # 채점 보유기간 (거래일)
+    # 판단 기준. 종이거래 배너와 진행률 줄이 같은 숫자를 봐야 하므로
+    # 상수 하나에서 가져온다. 둘이 갈라지면 어느 쪽이 맞는지 알 수 없다.
+    min_sample: int = MIN_SCORED_FOR_JUDGMENT
+    lookback_dates: int = 60    # 조회할 추천 일자 수
+
+
+# 추천 10선을 텔레그램으로 내보내는 요일. `datetime.weekday()` 규격이라
+# 월=0 … 일=6 이다. 6 = 일요일.
+#
+# 왜 주 1회인가: 매일 10선을 보내면 매일 판단을 요구받는다. 그러면 신호가
+# 아니라 알림 빈도가 매매를 지배한다. 스캔·기록은 매일 하되(채점 표본 확보)
+# 결정은 주 1회로 묶는다. 발송 요일을 일요일로 둔 이유는 장이 닫혀 있어
+# 그날 안에 주문을 낼 수 없고, 그래서 반사적 매매가 구조적으로 막히기
+# 때문이다. 월요일 개장까지 최소 하룻밤의 숙려 시간이 강제된다.
+RECO_SEND_DOW = 6
+
+
 @dataclass(frozen=True)
 class GateConfig:
     """알림 게이트 파라미터."""
 
     value_threshold: float = 8.0   # 매집 트랙 발송 하한
     trend_threshold: float = 8.0   # 추세 트랙 발송 하한
-    daily_budget: int = 3          # 즉시 속보 1일 최대 건수
+    # 일일 상한은 여기 없다. **창별 예산의 합이 일일 상한이다** —
+    # notify.WINDOWS 의 budget 2+3+2+2 = 9건. 예전에 daily_budget=3 이
+    # 있었지만 어디서도 읽지 않는 죽은 값이라 2026-09-09 에 지웠다.
+    # "하루 3건"이라고 믿고 있었다면 실제는 9건이었다.
     cooldown_days: int = 5         # 동일 종목 재발송 금지 기간
     rescore_delta: float = 1.0     # 점수가 이만큼 오르면 쿨다운 예외
     sequence_window: int = 20      # 매집 신호 -> 골든크로스 결합 허용 기간
     confluence_tol_pct: float = 3.0  # 피보 0.618선과 청산 중심선 겹침 허용치
     digest_top_n: int = 5
+    reco_send_dow: int = RECO_SEND_DOW  # 추천 10선 발송 요일
+
+
+# 추천 차트 이미지. 추천 10선을 **발송하는 날에만** 텍스트 뒤에 붙는다
+# (평일 daily 는 추천을 보내지 않으므로 차트도 없다 — 12장의 주 1회 리듬).
+# 텔레그램 앨범(sendMediaGroup) 1개로 보낸다. 앨범 상한이 10장이다.
+#
+# CHART_MIN_GRADE  None = 등급 필터 없음 (2026-10-01 부터). 등급 이름
+#                  ("S+"/"S"/"A"/"B")을 주면 그 이상만 남긴다.
+# CHART_MAX_COUNT  추천 **순위 순**으로 앞에서부터 자른다. 10 = 10선 전부.
+#                  한때 5장·등급 우선이었다(f2327db) — 10선 전부로 바꾸며
+#                  순위 순으로 되돌렸다. 앨범 상한(10)을 넘기면 앨범이
+#                  여러 개로 쪼개진다.
+# CHART_DISCLAIMER 앨범 첫 사진 캡션 맨 끝에 붙는다.
+CHART_MIN_GRADE: str | None = None
+CHART_MAX_COUNT = 10
+CHART_DISCLAIMER = "검증 중 · 투자 판단 근거 아님"
+
+# 저녁 브리핑(brief-evening)의 관심종목 차트 앨범. 텍스트 브리핑 **뒤에**
+# 앨범 1개로 붙는다. 대상은 WATCHLIST 중 **당일 스캔** 등급이 아래에 든
+# 종목뿐이다 — NONE 과 '스캔 제외'(스냅샷에 없음)는 뺀다. 등급 높은 순,
+# 같은 등급이면 max(매집, 추세) 높은 순으로 자른다. 대상 0개면 앨범 없음.
+# 차트·캡션은 추천 앨범과 같은 모듈(chart.py)을 쓴다.
+#
+# WATCHLIST_ALBUM_GRADES  chart.GRADE_RANK 의 등급 이름만 쓸 수 있다.
+# WATCHLIST_ALBUM_MAX     앨범 한도(MEDIA_GROUP_MAX = 10)를 넘기지 않는다.
+WATCHLIST_ALBUM_GRADES: tuple[str, ...] = ("S+", "S", "A", "B")
+WATCHLIST_ALBUM_MAX = 10
+
+
+@dataclass(frozen=True)
+class ChartConfig:
+    """추천 차트 파라미터. 모듈 상수를 그대로 배선한다 (RECO_SEND_DOW 와 같은 방식)."""
+
+    min_grade: str | None = CHART_MIN_GRADE
+    max_count: int = CHART_MAX_COUNT
+    disclaimer: str = CHART_DISCLAIMER
+    watch_grades: tuple[str, ...] = WATCHLIST_ALBUM_GRADES
+    watch_max: int = WATCHLIST_ALBUM_MAX
+    bars: int = 120                  # 표시 봉 수. 매물대 POC 구간(120)과 같게 둔다
+    fib_levels: tuple[float, ...] = (0.382, 0.5, 0.618, 0.786)
+    # 매물대는 cost_basis.from_volume_profile 과 **같은 구간·같은 칸 수**로
+    # 센다. 다르게 세면 P0(방법 C)가 차트의 최다 매물대 막대와 어긋난다.
+    vp_bins: int = 40
+    vp_top: int = 3                  # 우측에 그릴 상위 구간 수
+    out_dir: str = "data/charts"     # 그 아래 YYYYMMDD/ (기준 거래일)
+    keep_days: int = 7               # 폴더 이름 날짜가 이보다 오래되면 정리
+    font: str = "Malgun Gothic"      # 맑은 고딕. 없으면 경고 후 기본 폰트
+    dpi: int = 110
+    # 세로 비율 메인 : 거래량 : OBV. OBV 는 거래량과 y축을 공유하지 않는
+    # 별도 패널이다(한 패널에 두면 이중 y축이 된다).
+    panel_ratios: tuple[float, float, float] = (6, 2, 2)
+
+
+# 보유기간 규칙. **거래일 기준**이다. 달력일로 세면 주말·연휴에 카운터가
+# 앞서가서, 실제로는 3거래일밖에 안 지난 포지션이 만료 처리된다.
+#
+# MIN_HOLD_DAYS  이 기간 안에는 계층 2~7(트레일링·목표·시간·순환매)을
+#                억제한다. 진입 직후의 흔들림에 반응해 나가면 그물을
+#                던진 의미가 없다. 단 계층 0(무효화)과 계층 1(손절)은
+#                억제하지 않는다 — 상장폐지 위험과 손절선 이탈을 5일간
+#                막는 것은 최소보유일 규칙이 안전장치를 무력화하는 것이다.
+# MAX_HOLD_DAYS  도달하면 '보유기간 만료 — 재평가'를 계층 0으로 낸다.
+#                진입 근거에 유효기간을 주는 장치다. 어떤 규칙도 걸리지
+#                않아 무한 보유되는 경로를 막는다.
+MIN_HOLD_DAYS = 5
+MAX_HOLD_DAYS = 20
+
+# 진입가 대비 고정 손절 비율(%). 진입 시점에 `positions.stop_price` 로
+# 확정 기록되고, 청산 판정은 그 기록된 값만 본다. 판정 시점에 다시
+# 계산하면(예: 당일 ATR 로 폭을 넓히면) 손절선이 주가를 따라 움직여
+# 손절이 영원히 발동하지 않는다.
+STOP_LOSS_PCT = 10.0
+
+# 손절 청산 후 재진입 금지 기간(거래일). 만료되면 자동 해제된다.
+#
+# 손절은 '진입 판단이 틀렸다'는 기록이다. 그런데 손절 직후의 종목은
+# 스크리너 눈에 가장 매력적으로 보인다 — 더 싸졌고, 피보 되돌림은 더
+# 깊어졌고, 청산 밴드 안으로 더 들어갔다. 그래서 같은 종목을 며칠 만에
+# 다시 사는 일이 반복된다. 그물을 치는 게 아니라 물타기가 된다.
+# 이 기간은 그 경로를 코드로 막는다.
+COOLDOWN_DAYS = 20
 
 
 @dataclass(frozen=True)
@@ -96,8 +222,10 @@ class ExitConfig:
       공통           -> +15% 절반 기계적 익절만 동일
 
     우선순위(작을수록 우선). 같은 날 여러 개가 걸리면 하나만 집행한다.
-      0 무효화 / 1 손절 / 2 트레일링 / 3 목표3차 / 4 목표2차
-      5 목표1차 / 6 시간 / 7 순환매
+      0 무효화 · 보유기간 만료 / 1 손절 / 2 트레일링 / 3 목표3차
+      4 목표2차 / 5 목표1차 / 6 시간 / 7 순환매
+
+    계층 0 안의 순서는 무효화 → 보유기간 만료다. 상세는 `exits.py` 참조.
     """
 
     # ── 계층 2: 목표(익절) ──
@@ -111,11 +239,17 @@ class ExitConfig:
 
     # ── 계층 1: 손절 ──
     band_break_days: int = 3           # 밴드 하단 종가 연속 이탈 일수
-    hard_stop_pct: float = 10.0        # 밴드 외 진입 시 고정 손절(%)
+    stop_loss_pct: float = STOP_LOSS_PCT   # 진입가 대비 고정 손절(%)
     atr_window: int = 14
-    atr_mult: float = 2.0              # 밴드 외 진입 시 ATR 손절 배수
     ma_long_break_days: int = 2        # 종가가 MA60 아래 연속 일수
     cross_low_buffer_pct: float = 3.0  # 골든크로스 봉 저가 이탈 허용폭(%)
+
+    # ── 계층 0-b / 게이트: 보유기간 (거래일 기준) ──
+    min_hold_days: int = MIN_HOLD_DAYS
+    max_hold_days: int = MAX_HOLD_DAYS
+
+    # ── 손절 후 재진입 금지 (거래일 기준) ──
+    cooldown_days: int = COOLDOWN_DAYS
 
     # ── 계층 3: 시간 ──
     time_stop_v_days: int = 15         # 트랙 V 시간 손절
@@ -143,6 +277,897 @@ class ExitConfig:
     min_lot: int = 1                   # 최소 주문 단위
 
 
+# 실적 추정치(컨센서스) 공급원. **미구현이다.**
+#
+# None 은 '아직 정하지 않았다'가 아니라 **무료로 쓸 수 있는 소스가 없다**는
+# 조사 결론이다. 2026-09 확인: FnGuide·WISEfn·에프앤가이드는 유료이고,
+# 네이버 금융의 컨센서스 화면은 스크래핑 금지 대상이며, DART 는 확정
+# 실적만 준다(추정치 없음). FDR 에도 추정치 API 가 없다.
+#
+# 자리만 남겨두는 이유는 나중에 소스가 생겼을 때 붙일 지점을 명시하고,
+# 그때까지 **추정치를 만들어 쓰지 않는다**는 것을 코드로 못박기 위함이다.
+# 과거 실적 성장률로 미래를 대신하면 그건 추정치가 아니라 관성이다.
+EARNINGS_SOURCE = None
+
+
+# 뉴스 테마 키워드 사전. **기록 전용 지표(news_freq)에만 쓴다.**
+#
+# 키(테마명)는 `news.CATEGORY_RULES` 의 카테고리명과 **같은 어휘**를 쓴다.
+# 어휘가 갈라지면 news.category 와 news_freq.sector 를 조인할 수 없고,
+# 어느 쪽이 정본인지도 알 수 없게 된다. 값(키워드)도 CATEGORY_RULES 의
+# 같은 카테고리와 일치시켰고, 스모크 테스트가 그 일치를 강제한다.
+#
+# 분류(classify)와 이 집계는 세는 방식이 다르다.
+#   classify        첫 매치 하나만 남긴다(단일 라벨). 순서가 우선순위다.
+#   news_freq       걸리는 테마마다 센다(다중 라벨). "반도체 실적" 기사는
+#                   반도체와 실적 양쪽에 1건씩 잡힌다.
+# 충돌이 아니라 의도된 차이다. 빈도는 관심도를 보려는 것이므로 한 기사가
+# 두 테마를 건드리면 둘 다 세는 게 맞다.
+#
+# **주의: 여기서 말하는 '섹터'는 KRX 업종이 아니다.** `sector_metrics` 의
+# sector 는 업종명 158종(tickers.sector)이고, 이쪽은 뉴스 테마 10종이다.
+# 두 테이블을 scan_date 로 조인해도 sector 는 한 행도 맞지 않는다.
+NEWS_THEME_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "반도체": ("반도체", "hbm", "d램", "디램", "낸드", "파운드리", "웨이퍼",
+               "asml", "tsmc", "nvidia", "엔비디아", "gpu", "chip"),
+    "2차전지": ("2차전지", "이차전지", "배터리", "양극재", "음극재", "전해질",
+                "리튬", "니켈", "캐즘", "전기차", "ess", "battery"),
+    "방산조선": ("방산", "무기", "미사일", "전차", "잠수함", "조선", "수주",
+                 "lng운반선", "컨테이너선", "mro", "defense", "shipbuild"),
+    "바이오": ("바이오", "임상", "신약", "기술수출", "라이선스", "fda",
+               "adc", "cdmo", "제약", "biotech", "clinical"),
+    "전력AI": ("전력", "변압기", "송전", "배전", "데이터센터", "원전",
+               "smr", "ai인프라", "전선", "grid", "transformer"),
+    "수급": ("공매도", "대차", "신용융자", "반대매매", "순매수", "순매도",
+             "외국인", "기관", "프로그램매매", "블록딜", "지분"),
+    "실적": ("실적", "어닝", "영업이익", "매출", "적자", "흑자", "턴어라운드",
+             "컨센서스", "가이던스", "earnings", "guidance", "revenue"),
+    "매크로": ("금리", "환율", "원달러", "국고채", "연준", "fomc", "cpi",
+               "물가", "유가", "원자재", "구리", "달러", "인플레이션",
+               "fed", "rate", "inflation", "yield"),
+    "정책": ("관세", "수출규제", "제재", "보조금", "규제", "법안", "정부",
+             "국회", "세제", "tariff", "sanction", "subsidy"),
+    "공시": ("유상증자", "무상증자", "전환사채", "신주인수권", "교환사채",
+             "자기주식", "자사주", "감사의견", "감사보고서", "관리종목",
+             "상장폐지", "합병", "분할", "감자", "공급계약", "단일판매",
+             "주요사항보고", "공시"),
+}
+
+
+@dataclass(frozen=True)
+class NewsFreqConfig:
+    """뉴스 빈도 지표 파라미터. **기록 전용이다.**
+
+    사전은 `NEWS_THEME_KEYWORDS` 모듈 상수에 있다. frozen 데이터클래스에
+    가변 dict 를 기본값으로 넣을 수 없어서 분리했다.
+    """
+
+    ma_days: int = 7      # 이동평균 구간. **달력일이다** (뉴스는 휴장일에도 난다)
+    lookback_days: int = 30   # 집계 시 읽어올 뉴스 일자 수
+
+
+@dataclass(frozen=True)
+class SectorConfig:
+    """섹터 지표 파라미터. **기록 전용 지표다.**
+
+    여기서 나온 값은 `sector_metrics` 테이블에만 들어간다. 점수·추천·
+    스크리닝·알림 어디에도 쓰지 않는다. 채점 표본이 쌓인 뒤 '어떤 섹터
+    국면에서 통했나'를 되짚기 위한 것이고, 지금 판단에 쓰면 검증되지
+    않은 축을 하나 더 얹는 셈이 된다.
+    """
+
+    rs_short: int = 5              # 단기 상대강도 구간 (거래일)
+    rs_long: int = 20              # 장기 상대강도 구간. RS 순위의 기준
+    breadth_ma: int = 20           # 폭 판정에 쓰는 이동평균
+    new_high_lookback: int = 252   # 52주 ≈ 252거래일
+    new_high_ratio: float = 0.99   # 최고 종가의 이 비율 이상이면 신고가로 본다
+    turnover_ma: int = 20          # 거래대금 비중의 비교 기준 구간
+    persist_lookback: int = 20     # 모멘텀 지속성: 몇 거래일 전과 대조하나
+    persist_top_fraction: float = 1.0 / 3.0   # 상위 이 비율이면 '상위권'
+
+
+# 배당주 필터 상수. 단계별 탈락 사유를 기록하려면 임계값이 코드 한 곳에
+# 모여 있어야 한다. 필터가 빡빡한지 판단할 때 고칠 곳이 여기 하나다.
+DIV_MIN_YIELD = 3.0      # F1 배당수익률 하한(%)
+DIV_MIN_YEARS = 5        # F2 연속 배당 연수 (감액 없음 포함)
+DIV_MAX_PAYOUT = 80.0    # F3 배당성향 상한(%)
+DIV_TOP_N = 15           # 리포트 상위 N
+# F6 업종 중앙값 비교에 필요한 최소 표본. 업종에 3종목만 있으면 중앙값이
+# 사실상 자기 자신이라 필터가 의미를 잃는다. 그때는 F6 을 스킵한다.
+DIV_SECTOR_MIN_MEMBERS = 5
+
+# 주식 결제 주기. **영업일 기준 T+2** 다 (거래일이 아니다).
+# 연말이 정확히 이 둘이 갈리는 지점이다 — 12월 31일은 증시는 휴장이지만
+# 결제 영업일이다. 그래서 배당락 캘린더는 달력을 두 개 쓴다.
+DIV_SETTLE_DAYS = 2
+
+# 월간 배당 리포트 발송 요일. `datetime.weekday()` 규격(월=0 … 일=6).
+# 5 = 토요일이고, **매월 첫 토요일**에만 보낸다.
+#
+# 토요일을 고른 이유는 추천 10선을 일요일로 고른 것과 같다(12장). 장이
+# 닫혀 있어 그날 안에 주문을 낼 수 없으므로, 읽고 나서 최소 이틀의 숙려
+# 시간이 구조적으로 강제된다. 월 1회인 이유는 배당 데이터가 사업보고서
+# 시즌에만 바뀌기 때문이다 — 매주 보내면 같은 표를 네 번 보낸다.
+DIV_REPORT_DOW = 5
+
+# DPS 성장률(CAGR) 구간. 사업연도 수다. 구간이 5년이면 성장 기간은 4번이다.
+DIV_CAGR_YEARS = 5
+
+# 배당락 회복일수를 볼 과거 연수. **과거 통계이고 예측이 아니다.**
+# 표본이 3건도 안 되고 그 사이 시장 국면이 달랐다. 리포트 컬럼명에
+# '(참고)' 를 붙이는 이유다.
+DIV_RECOVERY_YEARS = 3
+
+
+@dataclass(frozen=True)
+class DividendConfig:
+    """배당주 필터 파라미터.
+
+    **이 값들은 검증되지 않은 초기 설정이다.** 배당수익률 3%·성향 80%·
+    5년 연속은 흔히 쓰이는 관행값이고, 이 저장소의 채점 표본으로 검증한
+    수치가 아니다. 그래서 통과 종목이 0개로 나와도 상수를 먼저 완화하지
+    않는다 — 몇 개가 어느 필터에서 떨어졌는지를 먼저 본다.
+    """
+
+    min_yield: float = DIV_MIN_YIELD
+    min_years: int = DIV_MIN_YEARS
+    max_payout: float = DIV_MAX_PAYOUT
+    top_n: int = DIV_TOP_N
+    sector_min_members: int = DIV_SECTOR_MIN_MEMBERS
+    settle_days: int = DIV_SETTLE_DAYS
+    report_dow: int = DIV_REPORT_DOW
+    cagr_years: int = DIV_CAGR_YEARS
+    recovery_years: int = DIV_RECOVERY_YEARS
+
+
+# ══════════════════════════ 뉴스 중복 제거 ══════════════════════════
+# 매체명 정규화표 (도메인 -> 표시명).
+#
+# Google News RSS 는 같은 매체를 피드마다 도메인으로도 주고 한글 이름으로도
+# 준다. 표기가 갈리면 두 가지가 깨진다.
+#   (1) 같은 기사가 두 건으로 남는다 — make_id 가 (정규화 제목|매체) 해시다.
+#   (2) 클러스터의 '매체 수'가 부풀어 중요도가 따라 오른다.
+#
+# 이 표는 추측이 아니라 **같은 URL 을 공유한 source 짝**에서 자동 도출했다
+# (2026-09-09 · news 2,316행 -> 67쌍). 포털/애그리게이터(네이트 · 네이버금융
+# · v.daum.net 등)는 원 기사의 매체가 아니라 재배포처라 도출에서 뺐다.
+#
+# 표에 없는 도메인은 **그대로 둔다.** 도메인에서 한글 매체명을 기계적으로
+# 만들어낼 방법은 없고, 틀린 이름을 지어내는 것보다 도메인이 그대로 보이는
+# 편이 낫다. 새 짝이 보이면 여기에 줄을 추가하면 된다.
+MEDIA_ALIASES: dict[str, str] = {
+    "ajunews.com": "아주경제",
+    "asiatoday.co.kr": "아시아투데이",
+    "banronbodo.com": "반론보도닷컴",
+    "biz.chosun.com": "Chosunbiz",
+    "biz.heraldcorp.com": "헤럴드경제",
+    "biz.sbs.co.kr": "SBS Biz",
+    "blockmedia.co.kr": "블록미디어",
+    "businesspost.co.kr": "비즈니스포스트",
+    "cbci.co.kr": "CBC뉴스",
+    "ceomagazine.co.kr": "CEONEWS",
+    "choicenews.co.kr": "초이스경제",
+    "chosundaily.com": "미주조선일보",
+    "coinreaders.com": "코인리더스",
+    "daily25news.com": "데일리25",
+    "ddaily.co.kr": "디지털데일리",
+    "digitaltoday.co.kr": "디지털투데이",
+    "donga.com": "동아일보",
+    "econovill.com": "ER 이코노믹리뷰",
+    "ekoreanews.co.kr": "이코리아",
+    "etoday.co.kr": "이투데이",
+    "financialpost.co.kr": "파이낸셜포스트",
+    "g-enews.com": "글로벌이코노믹",
+    "goodkyung.com": "굿모닝경제",
+    "greened.kr": "녹색경제신문",
+    "hankyung.com": "한국경제",
+    "hansbiz.co.kr": "한스경제",
+    "hellot.net": "헬로티",
+    "hkn24.com": "헬스코리아뉴스",
+    "icnweb.kr": "아이씨엔매거진",
+    "idomin.com": "경남도민일보",
+    "ikld.kr": "국토일보",
+    "infostockdaily.co.kr": "인포스탁데일리",
+    "kbthink.com": "KB Think",
+    "kidd.co.kr": "산업일보",
+    "koreapost.co.kr": "코리아포스트 한글판",
+    "kr.benzinga.com": "Benzinga",
+    "livebiz.today": "생생비즈플러스",
+    "m-economynews.com": "M이코노미뉴스",
+    "m-i.kr": "매일일보",
+    "market-ink.co.kr": "마켓잉크",
+    "medworld.co.kr": "메드월드뉴스",
+    "moneyneversleeps.co.kr": "머니네버슬립",
+    "mt.co.kr": "머니투데이",
+    "namdonews.com": "남도일보",
+    "newneek.co": "뉴닉",
+    "news.einfomax.co.kr": "연합인포맥스",
+    "news.mtn.co.kr": "MTN 머니투데이방송",
+    "news2day.co.kr": "뉴스투데이",
+    "newspim.com": "뉴스핌",
+    "pinpointnews.co.kr": "핀포인트뉴스",
+    "polinews.co.kr": "폴리뉴스 Polinews",
+    "sankyungtoday.com": "산경투데이",
+    "sanupin-news.kr": "산업인뉴스",
+    "sedaily.com": "서울경제",
+    "segye.com": "세계일보",
+    "segyebiz.com": "세계비즈",
+    "seoul.co.kr": "서울신문",
+    "sisajournal-e.com": "시사저널e",
+    "smedaily.co.kr": "중소기업신문",
+    "specialtimes.co.kr": "스페셜타임스",
+    "speconomy.com": "스페셜경제",
+    "straightnews.co.kr": "스트레이트뉴스",
+    "techflowpost.com": "深潮TechFlow",
+    "thebigdata.co.kr": "빅데이터뉴스",
+    "theviewers.co.kr": "뷰어스",
+    "topstarnews.net": "톱스타뉴스",
+    "youthdaily.co.kr": "청년일보",
+    # ── 아래는 위 자동 도출에 잡히지 않았으나 도메인이 자명한 국내 주요
+    #    매체다. 같은 URL 짝이 관측되지 않았을 뿐이라 손으로 넣었다. ──
+    "edaily.co.kr": "이데일리",
+    "mk.co.kr": "매일경제",
+    "chosun.com": "조선일보",
+    "joongang.co.kr": "중앙일보",
+    "yna.co.kr": "연합뉴스",
+    "newsis.com": "뉴시스",
+    "news1.kr": "뉴스1",
+    "fnnews.com": "파이낸셜뉴스",
+    "asiae.co.kr": "아시아경제",
+    "etnews.com": "전자신문",
+    "inews24.com": "아이뉴스24",
+    "heraldcorp.com": "헤럴드경제",
+    "dt.co.kr": "디지털타임스",
+    "hani.co.kr": "한겨레",
+    "khan.co.kr": "경향신문",
+    "munhwa.com": "문화일보",
+}
+
+# 대표 기사 선정에 쓰는 주요 매체. 순위표가 아니라 집합이다 — 이 안에
+# 들면 대표 후보에서 한 칸 앞선다. 매체에 점수를 매기는 게 아니므로
+# 세부 서열은 두지 않는다. (교리: 뉴스에는 점수를 매기지 않는다)
+MAJOR_MEDIA: frozenset[str] = frozenset({
+    "연합뉴스", "연합인포맥스", "뉴시스", "뉴스1", "매일경제", "매일경제 마켓",
+    "한국경제", "서울경제", "이데일리", "파이낸셜뉴스", "머니투데이",
+    "아시아경제", "헤럴드경제", "조선일보", "Chosunbiz", "중앙일보",
+    "동아일보", "전자신문", "비즈니스포스트", "인포스탁데일리",
+    "DART", "네이버금융", "Yahoo Finance", "Reuters", "Bloomberg",
+})
+
+
+# ══════════════════════════ 증시 전용 휴장일 보완 ══════════════════════════
+# 공휴일 API(한국천문연구원 getRestDeInfo)가 못 잡는 증시 휴장.
+# 공휴일이 아니지만 한국거래소는 쉬는 날이다. (월, 일) -> 명칭.
+#
+#   근로자의 날 5/1   법정 공휴일이 아니라 API 에 없다. 증시는 휴장.
+#   연말 폐장일 12/31 증시는 한 해의 마지막 날 쉰다. 12/31 이 주말이면
+#                    실제 폐장일은 직전 평일로 당겨지는데, 그 날은 이 표에
+#                    없으므로 기준 종목 프로브가 잡는다 (사전 필터는 보완일 뿐).
+#
+# 임시휴장·조기폐장은 여기에도 API 에도 없다. 그건 프로브의 몫이다.
+EXTRA_MARKET_HOLIDAYS: dict[tuple[int, int], str] = {
+    (5, 1): "근로자의 날 (증시 휴장)",
+    (12, 31): "연말 폐장일 (증시 휴장)",
+}
+
+
+# ══════════════════════════ DART 조회 시장 ══════════════════════════
+# Open DART list.json 의 corp_cls.  Y=유가(코스피)  K=코스닥  N=코넥스  E=기타
+#
+# 기본은 코스피만이다. 코스닥을 켜려면 ("Y", "K") 로 바꾼다. 코넥스(N)는
+# 유니버스에 없으므로 어떤 경우에도 넣지 않는다 — flags.dart_disclosure_events
+# 와 news_sources.collect_dart 가 이 튜플을 **순서대로** 돈다.
+#
+# 켜는 절차 (한 줄): 아래 두 값을 바꾸고 커밋하면 다음 nightly(21:30)부터
+# 적용된다. 켠 날짜는 채점 데이터를 나누는 기준일이 되므로 반드시 적는다 —
+# 그날 이전 스냅샷은 코스닥 DART 플래그(증자·감사의견)가 비어 있는 상태로
+# 채점된 것이다.
+DART_MARKETS: tuple[str, ...] = ("Y", "K")
+DART_KOSDAQ_ENABLED_ON: str | None = "2026-09-10"   # 코스닥 ON + 코스피 페이지 정상화 기준일
+
+# 시장별 list.json 최대 페이지 (page_count=100 기준). flags 가 60일을 소급한다.
+#
+# 2026-09-09 실측 (60일 소급, 100건/페이지):
+#     corp_cls=Y  total_count 10,474  -> 105페이지   1.2초/호출
+#     corp_cls=K  total_count 11,266  -> 113페이지   0.9초/호출
+#
+# ★ 2026-09-09 까지 Y 는 20 이었다 — 실측 필요량(105)의 1/5 라 최근 약
+#   11일치만 읽고 나머지 49일은 조용히 버려졌다. 코스닥 확장 중 발견한
+#   기존 결함이고, 2026-09-10 코스닥 ON 과 같은 날 160 으로 정상화했다.
+#   그래서 그날 이전 스냅샷은 코스피 증자·감사의견 플래그도 11일치 기준이다
+#   (DART_KOSDAQ_ENABLED_ON 이 두 변경 공통의 채점 구분 기준일).
+# 둘 다 실측의 1.5배. 3월(사업보고서)·8월(반기)에는 flags 로그의
+# '페이지 상한 도달' 경고를 보고 올린다.
+DART_LIST_MAX_PAGES: dict[str, int] = {"Y": 160, "K": 170}
+# 뉴스 수집(news_sources.collect_dart)은 하루치만 본다.
+# 2026-09-09 실측(1일): Y 127건=2페이지, K 215건=3페이지. 5 면 충분하다.
+DART_NEWS_MAX_PAGES: dict[str, int] = {"Y": 5, "K": 5}
+
+
+# ══════════════════════════ 시세 보정 (reconcile) ══════════════════════════
+# 이 날짜 **이전**은 보정하지 않는다. 실행 자체를 거부한다.
+#
+# 2026-08-27 까지는 백필(pykrx 종목별 = 네이버 수정주가)로 적재됐다.
+# 2026-09-16 실측: 백필 473일 중 464일이 KRX 와 달랐고, 차이 난 470종목
+# 전부 거래량 비율이 가격 비율의 정확한 역수였다(380540 가격 x0.5 · 거래량
+# x2.0). 분할·증자를 소급 반영한 값이라는 뜻이다. KRX 오픈API 는 원시
+# 가격만 주므로 덮어쓰면 권리락 지점마다 가짜 급락·급등이 생겨 이평·피보·
+# 청산밴드가 전부 틀어진다. 우회 옵션은 두지 않는다 — 필요하면 이 값을
+# 바꾸는 커밋으로 남긴다.
+RECONCILE_MIN_DATE = "2026-08-28"
+
+# 날짜와 무관한 방어. 차이 난 종목 중 '가격 비율 x 거래량 비율 = 1'
+# (수정주가 모양) 인 종목의 비율이 이 값을 **넘으면** 보정을 중단한다.
+# 2026-08-28 · 08-31 · 09-02 는 기준일 이후지만 9/07 복구 때 범위 조회로
+# 다시 받아 수정주가가 섞여 있다(각 3 · 1 · 2종목 전부).
+RECONCILE_ADJ_SUSPECT_RATIO = 0.10
+
+
+# ══════════════════════════ 관심종목 (표시·태깅 전용) ══════════════════════════
+# 외부에서 받은 관심종목. **보유가 아니다** — positions 에 넣지 않는다.
+#
+# 쓰는 곳은 셋뿐이다.
+#   renderer.render_watchlist   저녁 브리핑 '📌 관심종목 현황' 섹션 (팩트만)
+#   news.held_codes             뉴스 중요도의 '내 종목' 자리에 연결 (브리핑 정렬)
+#   chart.watchlist_jobs        저녁 브리핑 관심종목 차트 앨범 대상 (스캔 결과를
+#                               읽기만 한다 — WATCHLIST_ALBUM_* 참조)
+# 점수·스크리닝·추천·채점·청산 어디에서도 참조하지 않는다. smoke 의
+# [watchlist] 검사가 screener/daily/exits 등에서 이 이름이 나오면 실패한다.
+#
+# 코드는 화면 캡처 OCR 출처라 오독 가능성이 있었다. 2026-09-09 에 43건 전부를
+# pykrx(KRX 원천)·네이버금융·로컬 tickers 세 소스로 이름 대조해 43/43 일치를
+# 확인하고 등록했다 (FDR StockListing 은 KRX 404 로 당시 사용 불가).
+# 이전에 OCR 코드가 실존하는 다른 회사를 가리켜 에러 없이 통과한 사고가
+# 있었다 — 코드를 추가할 때는 반드시 이름 대조를 먼저 한다.
+#
+# ETF/ETN/ADR/레버리지/인버스/우선주는 의도적으로 뺐다. 추가하지 않는다.
+WATCHLIST: dict[str, list[tuple[str, str]]] = {
+    "반도체": [
+        ("403870", "HPSP"),
+        ("003160", "디아이"),
+        ("009150", "삼성전기"),
+    ],
+    "전지": [
+        ("450080", "에코프로머티"),
+        ("054210", "이랜텍"),
+        ("093370", "후성"),
+        ("005070", "코스모신소재"),
+        ("066970", "엘앤에프"),
+        ("086520", "에코프로"),
+        ("078600", "대주전자재료"),
+    ],
+    "전력": [
+        ("033100", "제룡전기"),
+        ("217590", "티엠씨"),
+        ("267260", "HD현대일렉트릭"),
+        ("298040", "효성중공업"),
+        ("034020", "두산에너빌리티"),
+        ("001440", "대한전선"),
+        ("010120", "LS ELECTRIC"),
+    ],
+    "방산": [
+        ("005810", "풍산홀딩스"),
+        ("103140", "풍산"),
+        ("079550", "LIG디펜스앤에어로스페이스"),
+        ("012450", "한화에어로스페이스"),
+        ("005870", "휴니드"),
+        ("064350", "현대로템"),
+    ],
+    "인공지능로봇": [
+        ("034220", "LG디스플레이"),
+        ("130580", "나이스디앤비"),
+        ("454910", "두산로보틱스"),
+        ("035420", "NAVER"),
+        ("058610", "에스피지"),
+        ("282880", "코윈테크"),
+        ("389500", "에스비비테크"),
+    ],
+    "건설자동차": [
+        ("018500", "동원모빌리티"),
+        ("005380", "현대차"),
+        ("071970", "HD현대마린엔진"),
+        ("307950", "현대오토에버"),
+    ],
+    "대형주": [
+        ("066570", "LG전자"),
+        ("005930", "삼성전자"),
+        ("000660", "SK하이닉스"),
+    ],
+    "바이오": [
+        ("298380", "에이비엘바이오"),
+        ("397030", "에이프릴바이오"),
+        ("196170", "알테오젠"),
+        ("141080", "리가켐바이오"),
+        ("207940", "삼성바이오로직스"),
+        ("068270", "셀트리온"),
+    ],
+}
+
+
+def watchlist_codes() -> dict[str, tuple[str, str]]:
+    """{종목코드: (이름, 섹터)}. 표시와 뉴스 태깅이 같은 역인덱스를 쓴다."""
+    out: dict[str, tuple[str, str]] = {}
+    for sector, items in WATCHLIST.items():
+        for code, name in items:
+            out.setdefault(str(code).zfill(6), (name, sector))
+    return out
+
+
+@dataclass(frozen=True)
+class NewsDedupConfig:
+    """뉴스 중복 제거 3층 파라미터.
+
+    3층(같은 사건 묶기)의 임계값은 픽스처
+    `tests/fixtures/news_brief_20260909.json` (187건) 으로 맞췄다.
+    바꾸면 그 회귀 검사부터 다시 보십시오.
+
+    왜 Jaccard 하나로 안 되는가
+    --------------------------
+    실측한 사례:
+      A "중동 확전 우려 뉴욕증시 하락…유가 100달러 육박·엔화 급등"
+      B "뉴욕증시, 국제 유가 상승에 하락 출발…다우, 0.88%↓"
+    사람이 보면 같은 사건인데 토큰 Jaccard 는 **0.214** 다. 공통 토큰이
+    {뉴욕증시, 유가, 하락} 3개인데 합집합이 14개라 분모가 커진다. 이걸
+    묶으려고 임계값을 0.21 까지 내리면 관계없는 기사들이 줄줄이 붙는다
+    (실측: 오병합 후보가 5개 -> 12개).
+
+    그래서 두 번째 통로를 둔다. **공통 토큰이 충분히 많고(>=3) 짧은 쪽
+    제목의 상당 부분(>=0.40)이 겹치면** 같은 사건으로 본다. 위 사례는
+    포함도 3/7 = 0.429 로 통과한다. 긴 제목이 짧은 제목을 삼키는 것을
+    막기 위해 절대 개수(min_shared_tokens)를 함께 걸었다.
+    """
+
+    sim_threshold: float = 0.50       # 1통로: 토큰 Jaccard
+    min_shared_tokens: int = 3        # 2통로: 공통 토큰 최소 개수
+    min_containment: float = 0.40     # 2통로: 짧은 쪽 기준 포함도
+    seed_hours: int = 48              # 배치 경계를 넘기 위한 씨앗 조회 구간
+
+
+# 추천 10선 메시지의 규모 구분. **표시 전용** — 선정·등급·슬롯·게이트와
+# 무관하고, 같은 10종목을 두 묶음으로 나눠 보여줄 뿐이다(순위 번호 유지).
+#
+#   대형   시가총액 >= RECO_LARGE_MCAP_MIN  그리고  일거래대금 >= RECO_LARGE_AMT_MIN
+#   그 외  둘 중 하나라도 미달이거나 값을 모르는 종목
+#
+# 일거래대금은 기준일까지 RECO_LARGE_AMT_DAYS 거래일 평균이다. 하루치만 보면
+# 급등락 하루에 묶음이 바뀐다(유동성 필터의 20일 평균과 같은 방식).
+# 시가총액은 종목 마스터(tickers.market_cap)의 최신값이다.
+RECO_LARGE_MCAP_MIN = 1e12        # 1조원
+RECO_LARGE_AMT_MIN = 100e8        # 100억원
+RECO_LARGE_AMT_DAYS = 20
+
+
+@dataclass(frozen=True)
+class RecoGroupConfig:
+    """추천 10선 규모 구분 (표시 전용). 모듈 상수를 그대로 배선한다."""
+
+    mcap_min: float = RECO_LARGE_MCAP_MIN
+    amt_min: float = RECO_LARGE_AMT_MIN
+    amt_days: int = RECO_LARGE_AMT_DAYS
+
+
+@dataclass(frozen=True)
+class ObvConfig:
+    """OBV 파라미터. **기록·표시 전용이다.**
+
+    여기서 나온 값은 `scans.obv_slope20` / `scans.obv_divergence` 와 차트·
+    앨범 캡션에만 쓴다. LPS·피보·추세 점수, 등급, 슬롯, 게이트, exits 어디에도
+    쓰지 않는다(스모크가 강제). 표본이 쌓인 뒤 '거래량 흐름이 추천 성적과
+    관계가 있었나'를 되짚기 위한 것이고, 지금 판단에 넣으면 검증되지 않은
+    축을 하나 더 얹는 셈이 된다. 아래 임계값도 그래서 튜닝 전 초기값이다.
+
+    window          기울기·가격 변화율 구간(거래일). 봉 window+1 개를 본다.
+    split_price_jump  전일 대비 종가 비율이 이 값 이상 / 1/이 값 이하면 분할
+                    흔적 후보. 가격제한폭(±30%)으로는 0.70~1.30 이 한계라
+                    1.45 는 정상 거래일이 닿지 않는다. 2026-10-01 운영 DB 실측
+                    으로 이 밖의 날 75건은 전부 액면병합·분할·정리매매였다.
+    split_recip_tol 후보일의 (가격 비율 x 거래량 비율)이 [1/tol, tol] 안이고
+                    거래량이 반대 방향으로 움직였으면 '역수' 로 본다. 같은 날
+                    자연 변동이 섞이므로 reconcile 의 0.5% 처럼 좁힐 수 없다.
+    div_price_pct   다이버전스의 가격 조건. 20일 변화율 절대값이 이 이상.
+    div_slope       다이버전스의 OBV 조건. 정규화 기울기 절대값이 이 이상.
+                    둘 다 2026-09-30 운영 DB 2,459종목 분포의 대략 1·3사분위
+                    (가격 -7.3% / +5.3%, 기울기 -0.21 / +0.31)에서 잡았다.
+                    그때 강세 56 · 약세 15 = 2.9%. 0.10 이면 7.6% 가 걸려
+                    '여부'가 아니라 소음이 된다. 기울기 원값은 그대로 기록되므로
+                    임계값은 나중에 바꿔도 과거 스냅샷에서 다시 셀 수 있다.
+    """
+
+    window: int = 20
+    split_price_jump: float = 1.45
+    split_recip_tol: float = 3.0
+    div_price_pct: float = 5.0
+    div_slope: float = 0.25
+
+
+# ══════════════════════════ v2 측정·추적 개편 ══════════════════════════
+# 2026-11-12 시작. 묶음([0], A~K)마다 구역을 나눈다. **자기 구역 안에만
+# 추가한다** — 구역을 나눈 이유는 병렬 작업의 병합 충돌을 막기 위해서다.
+# 새 동작 플래그는 전부 기본 OFF(= 지금과 같은 동작)다.
+
+# ── [0] 공통 기반: 이벤트 판정·채점 (stocknews/events.py) ──
+# 같은 종목이 이 거래일 수 안에 다시 추천되면 새 이벤트가 아니다.
+# 이벤트 날짜를 1일째로 센다. 기간 중 재추천으로 연장하지 않는다.
+EVENT_WINDOW_DAYS = 20
+# 채점 보유기간(거래일). 진입일(이벤트 다음 거래일)을 1일째로 센다.
+SCORE_HORIZONS = (5, 10, 20, 40, 60)
+# 왕복 비용(%p). 수익률에서 뺀다. 대조 수익률(지수·전종목 중위)에는 빼지 않는다.
+ROUND_TRIP_COST_PCT = 0.5
+# 진입 시가가 전일 종가 대비 이 % 이상이면 상한가 시가 = 실제로 살 수 없음.
+ENTRY_LIMIT_UP_PCT = 29.5
+# 하루 종가 변동이 이 % 를 넘으면 가격제한폭(±30%) 밖 = 수정주가 불연속.
+PRICE_JUMP_BREAK_PCT = 30.0
+
+# ── [A] 측정 바로잡기 ──
+# (A 구역 시작)
+# 종가 확정값 보정 (stocknews/reconcile.py · nightly 첫 단계 `reconcile`).
+# 밤 적재는 잠정(is_final=0, source=적재 경로)이고, 다음 nightly 첫 단계가
+# 전 거래일분을 KRX 오픈API 확정값으로 덮는다(is_final=1, source='krx_api').
+#
+# 덮는 필드. 2026-09-14 이후 종목별(네이버) 경로의 종가는 78~89% 가 KRX 와
+# 달랐고(정규장 뒤 체결가로 추정) 고가 19.7% · 저가 14.6% · 거래량 8.6% 도
+# 달랐다. 시가는 51거래일 전부 일치해서 넣지 않는다. 거래대금은 종목별
+# 경로가 아예 주지 않으므로(NULL) 보정 대상이 아니다 — 채우면 유동성
+# 필터(20일 평균 거래대금)의 표본이 바뀌어 스캔 대상이 달라진다.
+PRICE_CONFIRM_FIELDS = ("h", "l", "c", "v")
+# KRX 오픈API 는 D일분을 익영업일 이 시각(KST) 이후에 연다. 기준일을 고를
+# 때 아직 열리지 않은 날을 건너뛴다 — 자정 넘어 뜬 catch-up 이 미공개일을
+# 겨냥해 exit 4 로 끝나고 그 앞날을 놓치지 않게.
+KRX_PUBLISH_HOUR = 8
+# 분할 흔적 판정에서 직전 종가를 찾을 범위(달력일). 분할·병합은 보통
+# 며칠 거래정지 뒤 재개되므로 바로 앞 거래일만 보면 놓친다.
+PRICE_CONFIRM_NEIGHBOR_DAYS = 60
+# (A 구역 끝)
+
+# ── [B] 추천 필터 ──
+# (B 구역 시작)
+# 추천 선정과 recos 기록은 그대로 두고, 선정이 끝난 뒤 '발송·추적 대상
+# 판정'에만 거는 필터다(stocknews/send_filter.py). 플래그를 켜도 recos
+# 행은 한 글자도 바뀌지 않는다. 빠진 자리를 차순위로 메우지 않는다.
+# 적용 순서 고정: ① SEQ 제외 → ② 보충(FILL) 제외 → ③ 국면 TREND 절반
+# (C 의 REGIME_TREND_CUT, 하락 국면에서만) → ④ 재추천 제한 판정.
+#
+# 재추천 제한 기간(거래일). 0 = 사용 안 함. 켤 때 20 ([0] EVENT_WINDOW_DAYS).
+# 이벤트 판정은 [0] events.assign_events 그대로다(첫 추천일 = 1일째, 연장 없음).
+# 켜기 전에 `--mode reco-events-backfill` 로 과거 recos 전체를 소급 구성한다.
+RECO_COOLDOWN_DAYS = 0
+# slot=SEQ 종목을 발송과 추적 편입에서 뺀다. 계산·recos 기록은 그대로.
+EXCLUDE_SEQ_FROM_SEND = False
+# slot=FILL(·FILL*) 보충 종목을 발송과 추적 편입에서 뺀다. VALUE/TREND
+# 슬롯의 하한 완화 채움은 건드리지 않고, 켜져 있으면 발송 문구에
+# "하한 완화 적용" 만 표기한다.
+EXCLUDE_FILL_FROM_SEND = False
+# (B 구역 끝)
+
+# ── [C] 국면 라벨 ──
+# (C 구역 시작)
+# 국면 기록(market_regime)은 플래그와 무관하게 **항상** 한다(daily 단계).
+# 아래 두 플래그는 표시·필터만 켠다. 정의는 stocknews/regime.py 머리말.
+#   상승 = KOSPI 종가 > MA200  그리고  MA60 위 비율 ≥ 50%
+#   하락 = KOSPI 종가 < MA200  그리고  MA60 위 비율 < 40%
+#   중립 = 그 외
+# 브리핑(brief-morning·brief-evening) 맨 위 국면 한 줄. OFF = 텍스트 완전 동일.
+REGIME_BANNER = False
+# 하락 국면에서만 TREND 슬롯 절반. 실제 자르기는 B(추천 필터 ③)가 한다.
+REGIME_TREND_CUT = False
+REGIME_INDEX = "KOSPI"
+REGIME_MA_LONG = 200              # 지수 이동평균 봉 수
+REGIME_BREADTH_MA = 60            # 종목별 이동평균 봉 수 (그 종목 자기 봉)
+REGIME_UP_BREADTH_PCT = 50.0      # 상승: 비율 ≥ 이 값
+REGIME_DOWN_BREADTH_PCT = 40.0    # 하락: 비율 < 이 값
+REGIME_RET_BARS = 20              # 배너의 지수 N일 수익률
+REGIME_CONFIRM_DAYS = 5           # 새 조건이 이 거래일 수 연속이면 전환
+# MA60 판정 가능 종목이 이보다 적으면 비율을 믿지 않는다(부분 적재 방어).
+REGIME_MIN_BREADTH_N = 500
+# daily 가 기록할 때 최근 이 거래일 수 안의 빠진 날을 같이 채운다.
+REGIME_GAP_FILL_DAYS = 10
+REGIME_CALC_VERSION = 1
+# 지수 확정값 (R3-3, stocknews/index_confirm.py). daily 단계 안, 국면 기록 전에
+# 직전 N거래일 KOSPI·KOSDAQ 종가를 KRX 오픈API 지수 서비스로 다시 받아
+# market_context·market_regime 을 공식 값으로 갱신하고 확정 표시한다.
+# 당일분은 익영업일 08:00 이후 제공이라 21:30 회차에서는 받을 수 없다(잠정).
+# 키(KRX_API_KEY) 없음·호출 실패·빈 응답이면 갱신을 생략한다(daily 종료 코드 무관).
+INDEX_CONFIRM_DAYS = 5
+INDEX_CONFIRM_API_BASE = "https://data-dbg.krx.co.kr/svc/apis/idx/"
+# 지수 이름 -> (서비스, 응답 IDX_NM)
+INDEX_CONFIRM_SERVICES = {"KOSPI": ("kospi_dd_trd", "코스피"),
+                          "KOSDAQ": ("kosdaq_dd_trd", "코스닥")}
+INDEX_CONFIRM_TIMEOUT_SEC = 20.0
+# 저장값과 공식 값이 이 이하 차이면 '같다'(지수는 소수 둘째 자리까지 공시)
+INDEX_CONFIRM_TOL = 0.005
+# (C 구역 끝)
+
+# ── [D·F] 추천 추적 · 평일 종목 발송 개편 ──
+# (DF 구역 시작)
+# [D] 추천 추적(종이 편입). 실제 발송된 새 추천을 다음 거래일 시가로 편입해
+#     20거래일까지 표시, 40·60거래일까지 기록한다. 기록 전용 — 점수·추천
+#     선정·실제 보유(positions)와 무관하다. OFF = 평일·일요일 발송이 지금과
+#     바이트 단위로 같다. 모듈: stocknews/paper.py, paper_render.py
+PAPER_TRACKING = False
+# [F] 평일 저녁 브리핑의 종목 부분을 ①새 추천 ②만기 ③추적 요약 ④제외 한 줄로
+#     바꾼다. 관심종목 목록·관심종목 앨범은 발송에서 빠진다(데이터는 그대로).
+#     PAPER_TRACKING 이 꺼져 있으면 ①④ + "추천 유지 n일째" 한 줄만.
+DAILY_LIST_V2 = False
+# 표시 기간(거래일). 만기 = 진입일을 1일째로 센 20일째 종가.
+PAPER_DISPLAY_DAYS = 20
+# 기록 보유기간(거래일). 표시하지 않는 40·60 도 확정 기록한다.
+PAPER_RECORD_HORIZONS = (5, 10, 20, 40, 60)
+# 무작위 대조군: 편입일마다 같은 수를 100묶음, 고정 시드.
+# 시드 = (PAPER_RANDOM_SEED, 신호일 YYYYMMDD) — 날짜마다 다르고 재실행해도 같다.
+PAPER_RANDOM_BUNDLES = 100
+PAPER_RANDOM_SEED = 20261112
+# ③ 추적 요약의 상위·하위 표시 수.
+PAPER_SUMMARY_TOPN = 3
+# 브리핑이 4,096자를 넘어도 ③ 상위·하위는 이 수 밑으로 줄이지 않는다
+# (넘는 분량은 send_telegram 이 나눠 보낸다). 2026-11-12 저녁 dry-run 에서
+# 뉴스 링크 길이 때문에 상위·하위가 0줄까지 깎여 요약 한 줄만 남았다.
+PAPER_SUMMARY_MIN_TOPN = 3
+# 지수 히스토리 CSV 캐시 (네트워크 실패 시 사용). cwd 기준.
+PAPER_INDEX_CACHE = "data/index_cache"
+# 그림자 청산 — 대안 세트 1개. **2026-11-12 고정. 이후 변경 금지.**
+#   손절 = 진입가 − 2×ATR14, 단 손절폭은 10% 이상 15% 이하로 자른다.
+#   MA20 이탈 = 2일 연속 확인. 고점 트레일링 15%, 진입가 대비 +10% 이후 활성.
+#   나머지 규칙(익절·목표·시간·만기)은 현행 엔진 그대로.
+PAPER_ALT_ATR_MULT = 2.0
+PAPER_ALT_STOP_MIN_PCT = 10.0
+PAPER_ALT_STOP_MAX_PCT = 15.0
+PAPER_ALT_MA_CONFIRM_DAYS = 2
+PAPER_ALT_TRAIL_PCT = 15.0
+PAPER_ALT_TRAIL_ARM_PCT = 10.0
+# (DF 구역 끝)
+
+# ── [E] 위험 정보 ──
+# (E 구역 시작)
+# 기록·표시 전용. 점수·등급·추천 선정에 들어가지 않는다 (stocknews/risk.py).
+# OFF = 지금과 같다: risk_metrics 기록 안 함 · 차트에 원뿔 없음 · 캡션에
+# 도달 확률 없음 · weekly 에 원뿔 적중률 없음 · 훅(sigma_on/stop_hit_prob)
+# 이 None 을 준다. 리밸런싱 리포트(--mode rebalance)는 사람이 직접 치는
+# 읽기 전용 명령이라 이 플래그와 무관하다.
+RISK_INFO = False
+
+# EWMA 일간 변동성 σ.
+#   σ²_t = λ·σ²_{t-1} + (1-λ)·r_t²     r_t = ln(C_t / C_{t-1}), 평균 0 가정
+# λ = 0.94 는 J.P. Morgan RiskMetrics(1996) 기술문서의 일간 권고값이다.
+# 반감기 ln(0.5)/ln(0.94) ≈ 11.2거래일 — 최근 두 주의 출렁임이 절반을
+# 차지한다. 20일 원뿔을 그리는 용도에 맞는 기억 길이다. 값을 바꾸면
+# RISK_CALC_VERSION 도 올린다 (같은 날짜에 다른 정의의 σ 가 섞이지 않게).
+RISK_EWMA_LAMBDA = 0.94
+# 그날까지 최근 이 수의 수익률만 쓴다(그날 이후 데이터는 쓰지 않는다).
+# 0.94^100 ≈ 0.2% — 창 밖 데이터의 가중치는 무시할 만하다.
+RISK_SIGMA_WINDOW = 120
+# 처음 이 수의 수익률은 r² 평균으로 시작값을 만든다(시드).
+RISK_SIGMA_SEED = 20
+# (재)시작 후 유효 수익률이 이만큼 쌓이기 전에는 σ = NULL.
+# 시드 가중치가 0.94^(60-20) ≈ 8% 아래로 떨어지는 지점이다.
+RISK_SIGMA_MIN_OBS = 60
+# 계산 정의 버전. risk_metrics PK 의 일부. 정의가 바뀌면 올린다.
+RISK_CALC_VERSION = 1
+# 예상 범위(원뿔)·손절선 도달 확률의 기간(거래일).
+RISK_HORIZON_DAYS = 20
+# 원뿔 적중률은 이 미만 표본이면 '표본 부족'.
+RISK_CONE_MIN_N = 20
+
+# ── 리밸런싱 리포트 (--mode rebalance, data/holdings.csv) ──
+# 한도는 '평가액 비중' 기준. 위반 판정 = 비중 > 한도 + 밴드.
+# 위반이면 '한도까지' 줄일 금액을 보인다(밴드 안쪽 경계가 아니라 한도).
+# 밴드는 매일 조금씩 넘나드는 것을 위반으로 세지 않기 위한 여유다.
+REBAL_MAX_STOCK_PCT = 10.0       # 개별 종목(ETF/ETN 포함 단일 코드)
+REBAL_MAX_SECTOR_PCT = 30.0      # 섹터
+REBAL_MAX_LEVERAGE_PCT = 10.0    # 레버리지·인버스 ETF/ETN 합계
+REBAL_BAND_PCT = 5.0             # 허용 밴드 ±%p
+REBAL_HOLDINGS_FILE = "data/holdings.csv"
+# ETF/ETN 섹터 수동 표. 코드 → 섹터 이름. 없는 ETF/ETN 은 "ETF(미분류)" /
+# "ETN(미분류)" 섹터로 묶인다. 주식 섹터(tickers.sector)와 같은 이름을
+# 쓰면 같은 섹터로 합산된다.
+ETF_SECTOR_OVERRIDE: dict = {
+    # "069500": "시장 대표(KOSPI200)",
+    # "091160": "반도체 제조업",
+}
+# 레버리지·인버스 판정. 이름에 이 단어가 있으면 레버리지로 센다.
+# 판정이 틀리면 아래 수동 표로 덮는다(코드 → True/False).
+REBAL_LEVERAGE_KEYWORDS = ("레버리지", "인버스", "2X", "3X", "곱버스",
+                           "-1X", "-2X", "-3X", "2배", "3배")
+REBAL_LEVERAGE_OVERRIDE: dict = {}
+# (E 구역 끝)
+
+# ── [G] 뉴스 ──
+# (G 구역 시작)
+# 뉴스 v2 (stocknews/news_v2.py). OFF 면 수집·브리핑 텍스트가 지금과 같다.
+# ON 이면 아침·저녁 브리핑에만 아래가 붙는다 — 수집·적재·중요도는 그대로다.
+#   · 추천·추적 종목 이름이 들어간 기사를 맨 위 섹션으로
+#   · 같은 사건 묶음은 대표 1건 + "외 n건"
+#   · 추천·추적 종목 당일 DART 공시 블록(제목·링크만, 뉴스 위)
+#   · 아침 브리핑 맨 앞 '밤사이 시장'(미국 3대 지수 마감 + 원/달러). 실패 시 생략
+NEWS_V2 = False
+# 기존 3층(토큰 Jaccard + 포함도) 묶음 **위에** 대표 제목끼리 한 번 더 묶는
+# 문자 2-gram Jaccard 임계. 2026-10-28~11-11 실측(DART 제외, 전수): 0.5 이상
+# 6쌍은 모두 같은 사건, 0.4~0.5 는 7쌍 중 2쌍이 다른 사건. DART 제목은 서식이
+# 같아('[공시] X 주요사항보고서(...)') 다른 회사끼리 0.6~0.86 이 나오므로
+# 이 단계에서 뺀다.
+NEWS_V2_TITLE_SIM = 0.5
+# 같은 종목 사건 병합(news_v2.refine_groups c단계). 1 = 켬, 0 = 끔.
+NEWS_V2_SAME_TICKER_MERGE = 1
+# '⭐ 추천·추적 종목' 섹션 상한(사건 수).
+NEWS_V2_FOCUS_MAX = 8
+# 공시 블록 상한(줄). 넘치면 "외 n건" 한 줄.
+NEWS_V2_DART_MAX_LINES = 12
+# 공시 블록에서 정기보고서는 종목별로 나열하지 않고 맨 아래 한 줄로 줄인다.
+# 보고서명 앞의 [기재정정]·[첨부추가] 같은 꼬리표는 무시하고 판정한다.
+NEWS_V2_DART_PERIODIC_RE = r"^(?:\[[^\]]*\]\s*)*(?:분기|반기|사업)보고서"
+# 공시 블록 조회: Open DART list.json 시장별 페이지 상한(100건/페이지).
+NEWS_V2_DART_MAX_PAGES = 30
+# 밤사이 시장 — (표시명, FinanceDataReader 심볼). 2026-11-12 실측 확인.
+NEWS_V2_US_INDICES: tuple[tuple[str, str], ...] = (
+    ("다우", "DJI"), ("S&P500", "US500"), ("나스닥", "IXIC"))
+NEWS_V2_FX: tuple[str, str] = ("원/달러", "USD/KRW")
+# 뉴욕 정규장 마감(16:00 ET) 후 이 분이 지나야 그날 봉을 '마감'으로 쓴다.
+# 그 전이면 그날 봉(장중 값)을 버리고 직전 봉을 쓴다.
+NEWS_V2_US_CLOSE_BUFFER_MIN = 15
+# 마감 봉이 이 달력일보다 오래됐으면 그 줄을 뺀다(소스가 멈춘 경우).
+NEWS_V2_MARKET_MAX_AGE_DAYS = 5
+# 네이버 증권 JSON API (news_sources.collect_naver). 2026-11-12 실측: pageSize=20
+# 에 20건, focus 는 date·enableFallback 없으면 빈 결과라 maxDays 와 함께 보낸다.
+NAVER_API_PAGE_SIZE = 20
+NAVER_FOCUS_MAX_DAYS = 7
+# 뉴스 소스 건강(stocknews/news_health.py). 평일 수집 회차(news 잡·nightly news
+# 단계·수집하는 브리핑)에서 한 소스가 이 횟수 연속 0건이면 관리자 채팅에 한 번
+# 알린다. 휴장일 회차와 그 소스를 끈 회차는 세지 않는다(연속도 끊지 않는다).
+# 평일 수집은 하루 3회(06:00 · 21:30 · 23:00)라 3 = 대략 하루.
+NEWS_SOURCE_ZERO_STREAK = 3
+# 연속 판정에 읽는 runs 이력 범위(일). 연휴(최장 5일)를 넘겨 이어 세려면 여유가 필요.
+NEWS_SOURCE_HISTORY_DAYS = 14
+# (G 구역 끝)
+
+# ── [H] 지표 기록 ──
+# (H 구역 시작)
+# 지표 기록(stocknews/indicator_log.py). **기록 전용 — 점수·추천·발송에 쓰지
+# 않는다.** OFF 면 daily 기록·차트 52주 고가선 전부 지금과 같다.
+INDICATOR_LOG = False
+# 지표별 계산버전. 계산식이나 파라미터를 바꾸면 그 지표의 숫자를 올린다.
+# 이전 버전 행은 덮어쓰지 않고 남는다(PK 에 calc_version 포함). docs/지표등록.md
+INDICATOR_VERSIONS = {
+    "rs20": 1, "rs60": 1, "rs20_pct": 1, "rs60_pct": 1,
+    "dist_52w_high": 1, "mfi14": 1, "atr14_pct": 1, "bb_width20": 1,
+    "kalman_slope": 1,
+}
+IND_RS_WINDOWS = (20, 60)        # 거래일. 종목 수익률 − 소속 시장 지수 수익률
+IND_HIGH52_BARS = 250            # 52주 = 250거래일. 상장(DB 첫 행) 250거래일 미만 NULL
+IND_MFI_WINDOW = 14
+IND_ATR_WINDOW = 14              # 단순평균 TR (exits.atr 와 같은 정의)
+IND_BB_WINDOW = 20
+IND_BB_K = 2.0                   # 모표준편차(ddof=0) × 2
+# 칼만 로컬 선형 추세 모형 (로그 종가). 잡음은 고정값 — 근거는 docs/지표등록.md
+IND_KALMAN_WINDOW = 60           # 매 날짜 직전 60거래일로 새로 돌린다(시작점 고정)
+IND_KALMAN_OBS_VAR = 2.5e-4      # 관측 잡음 R  (일 1.58%)
+IND_KALMAN_LEVEL_VAR = 1.0e-4    # 수준 잡음 Qμ (일 1.0%)
+IND_KALMAN_SLOPE_VAR = 4.0e-7    # 기울기 잡음 Qβ (일 0.063%p)
+IND_KALMAN_P0_SLOPE = 1.0e-4     # 초기 기울기 분산 (일 1%) · 초기 수준 분산 = R
+# 지표 소급 명령의 기본 범위(거래일). 전 기간은 --ind-all. 2026-11-12:
+# 전 기간 470일 = DB +약 560MB, 최근 250일 = +약 260MB (사본 실측).
+INDICATOR_BACKFILL_DAYS = 250
+# (H 구역 끝)
+
+# ── [I] 주간 분석 ──
+# (I 구역 시작)
+# weekly 모드에서만 도는 주간 분석(stocknews/weekly_v2.py). nightly 에 넣지
+# 않는다. 기본 OFF = 지금과 같은 weekly. `--weekly-v2` 로 1회 강제 실행 가능.
+# 기록 전용 — 점수·등급·추천 선정에 아무 값도 돌려주지 않는다.
+WEEKLY_ANALYSIS_V2 = False
+# 리포트를 텔레그램으로도 보낼지. False 면 파일(+ --dry-run 시 콘솔)만.
+WEEKLY_V2_SEND = False
+WEEKLY_V2_REPORT_DIR = "data/reports"
+# 채점 보유기간(거래일). [0] score_events 의 ex_med_20 을 쓴다.
+WEEKLY_V2_HORIZON = 20
+# 허스트(DFA-1): 최근 이 수의 일간 수익률. 미만이면 NULL 기록.
+WEEKLY_V2_HURST_WINDOW = 250
+WEEKLY_V2_HURST_CALC_VERSION = 1
+# 3요인: 시총·모멘텀 분위(상·하위 30%), 모멘텀 룩백 60거래일.
+WEEKLY_V2_FACTOR_QUANTILE = 0.3
+WEEKLY_V2_MOM_LOOKBACK = 60
+# 시장 요인 가중: "equal"(전 종목 동일가중) / "cap"(전일 시총가중).
+# 시총가중은 초대형 2~3종목이 지배해 일반 종목 β_시장 ≈ 0.1 (2026-11 실측).
+WEEKLY_V2_MKT_WEIGHT = "equal"
+# 팩터 노출(β) 추정: 이벤트일까지 직전 120거래일, 최소 60개 관측.
+WEEKLY_V2_BETA_WINDOW = 120
+WEEKLY_V2_BETA_MIN_OBS = 60
+# 상관 행렬: 최근 26개 주별 표본일. |ρ| 이 값 이상인 쌍을 표시.
+WEEKLY_V2_CORR_WEEKS = 26
+WEEKLY_V2_CORR_FLAG = 0.8
+# 5분위: 그날 값이 있는 종목이 이 수 미만이면 그날은 뺀다.
+WEEKLY_V2_QUINTILE_MIN_TICKERS = 50
+# GARCH vs EWMA: 원점 간격(겹치지 않는 20일 실현 구간) · 적합 창 · 최소 관측.
+WEEKLY_V2_GARCH_STEP = 20
+WEEKLY_V2_GARCH_WINDOW = 250
+WEEKLY_V2_GARCH_MIN_OBS = 250
+# '적중' = |예측 σ − 실현 σ| ≤ 실현 σ × 이 비율.
+WEEKLY_V2_VOL_HIT_TOL = 0.25
+# E 구역에 λ 가 없을 때만 쓰는 EWMA λ (RiskMetrics 0.94).
+WEEKLY_V2_EWMA_LAMBDA = 0.94
+# (I 구역 끝)
+
+# ── [J] 정리 ──
+# (J 구역 시작)
+# 회차 날짜 · 장중 catch-up (stocknews/catchup.py, nightly.py).
+# 장중 = 거래일 KST [시작, 끝). 이 사이에는 FDR 전종목 스냅샷이 오늘
+# 현재가라서 지난 날짜 스냅샷 경로를 쓰지 않는다(universe.fetch_day).
+INTRADAY_START_HM = (9, 0)
+INTRADAY_END_HM = (15, 40)
+# 브리핑 잡(brief-morning · brief-evening)이 예정 시각보다 이 시간을
+# 넘겨 늦게 뜨면 발송하지 않고 '건너뜀'으로 기록한다(exit 0).
+BRIEF_MAX_LATE_HOURS = 3
+# (J 구역 끝)
+
+# ── [K] 성능 ──
+# (K 구역 시작)
+# (K 구역 끝)
+
+# ── [L] 운영 플래그 .env 오버라이드 ──
+# (L 구역 시작)
+# 위 v2 플래그의 **기본값은 이 파일이 정본**이고 전부 OFF 다. 운영에서만
+# 켜려면 운영 저장소의 `.env` 에 같은 이름의 키를 적는다. 코드·브랜치를
+# 운영별로 갈라 쓰지 않으려는 것이다(개발 클론 .env 에는 없으므로 OFF).
+#   bool : 1/true/yes/on -> 켬, 0/false/no/off -> 끔 (대소문자 무시)
+#   int  : 0 이상의 정수
+# 그 밖의 값은 무시하고(기본값 유지) 보고에 남긴다 — 오타 하나로 플래그가
+# 엉뚱하게 켜지지 않게. `stocknews.env.load_env` 가 .env 적용 직후 부른다.
+# 끄려면 .env 에서 그 줄을 지우거나 0 으로 둔다.
+ENV_OVERRIDE_FLAGS: dict[str, type] = {
+    "RECO_COOLDOWN_DAYS": int,
+    "EXCLUDE_SEQ_FROM_SEND": bool,
+    "EXCLUDE_FILL_FROM_SEND": bool,
+    "REGIME_BANNER": bool,
+    "REGIME_TREND_CUT": bool,
+    "PAPER_TRACKING": bool,
+    "DAILY_LIST_V2": bool,
+    "RISK_INFO": bool,
+    "NEWS_V2": bool,
+    "INDICATOR_LOG": bool,
+}
+_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_ENV_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def apply_env_flags(environ=None) -> dict:
+    """환경변수에 있는 플래그만 이 모듈의 값을 덮는다.
+
+    없는 키는 건드리지 않는다(기본값 유지). 반환:
+    {"applied": {이름: 값}, "invalid": {이름: 원문}}
+    """
+    import os
+    import sys
+    env = os.environ if environ is None else environ
+    mod = sys.modules[__name__]
+    out: dict = {"applied": {}, "invalid": {}}
+    for name, typ in ENV_OVERRIDE_FLAGS.items():
+        raw = env.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        s = str(raw).strip()
+        if typ is bool:
+            low = s.lower()
+            if low in _ENV_TRUE:
+                val = True
+            elif low in _ENV_FALSE:
+                val = False
+            else:
+                out["invalid"][name] = s
+                continue
+        else:
+            try:
+                val = int(s)
+            except ValueError:
+                out["invalid"][name] = s
+                continue
+            if val < 0:
+                out["invalid"][name] = s
+                continue
+        setattr(mod, name, val)
+        out["applied"][name] = val
+    return out
+# (L 구역 끝)
+# ══════════════════════════ v2 끝 ══════════════════════════
+
+
 @dataclass(frozen=True)
 class Config:
     ma: MAConfig = MAConfig()
@@ -150,6 +1175,14 @@ class Config:
     credit: CreditConfig = CreditConfig()
     gate: GateConfig = GateConfig()
     exit: ExitConfig = ExitConfig()
+    audit: AuditConfig = AuditConfig()
+    sector: SectorConfig = SectorConfig()
+    news_freq: NewsFreqConfig = NewsFreqConfig()
+    news_dedup: NewsDedupConfig = NewsDedupConfig()
+    dividend: DividendConfig = DividendConfig()
+    chart: ChartConfig = ChartConfig()
+    obv: ObvConfig = ObvConfig()
+    reco_group: RecoGroupConfig = RecoGroupConfig()
 
 
 DEFAULT = Config()

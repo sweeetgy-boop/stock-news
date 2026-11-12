@@ -19,6 +19,19 @@
                       (3)이 가장 중요하다. 시장 대비 초과수익이 없으면
                       그건 전략이 아니라 그냥 하락장 베타다.
 
+v2-A (2026-11-12) — 측정 정의를 [0] 공통 기반으로 통일
+---------------------------------------------------
+  · 채점은 `events.score_events` 하나로 한다. 전략·무작위·RSI 대조군이
+    **같은 지표**(전종목 중위 대비 초과수익 = alpha_h = ex_med_h)를 갖는다.
+    예전 `summarize()` 는 전략의 alpha 평균을 무작위 대조군의 **순수익**
+    평균과 비교했다 — 단위가 다른 두 숫자의 비교라 판정이 무의미했다.
+  · 보유 h 의 정의도 [0] 을 따른다: 익일 시가 진입(1일째) → h일째 종가.
+    (예전 `_fwd` 는 h거래일 뒤 시가 청산. `_fwd` 는 참고용으로만 남긴다.)
+  · 같은 종목이 N(=EVENT_WINDOW_DAYS)거래일 안에 다시 잡히면 같은 이벤트다
+    (`events.assign_events`). 간격(step) 5 로 표본을 뽑으면 한 흐름이
+    4~5번 세어져 표본 수가 부풀고 서로 독립이 아니게 된다.
+  · 시장 중위는 풀(유동성 통과 종목)이 아니라 [0] 의 전종목 중위다.
+
 알려진 한계 (반드시 인지할 것)
 ---------------------------
   · 배제 플래그(관리종목·자본잠식)의 과거 시점 값이 없다. 현재 기준으로도
@@ -38,9 +51,11 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from .config import Config, DEFAULT
+from .config import Config, DEFAULT, EVENT_WINDOW_DAYS
 from .contracts import Position
-from .exits import evaluate_position
+from .events import (assign_events, events_only, PricePanel, score_events,
+                     stat_cell, ticker_markets, trading_calendar)
+from .exits import evaluate_position, stop_price_for
 from .indicators import moving_averages
 from .liquidation import liquidation_band
 from .screener import screen_one
@@ -48,7 +63,12 @@ from .screener import screen_one
 log = logging.getLogger(__name__)
 
 __all__ = ["BacktestConfig", "run_backtest", "summarize", "sweep_thresholds",
-           "simulate_exit_rules"]
+           "simulate_exit_rules", "score_context", "dedupe_events",
+           "score_rows", "attach_regime", "exits_vs_hold", "NO_REGIME",
+           "backtest_candidates", "finish_events"]
+
+# 국면 훅(C)이 값을 주지 않을 때 표에 쓰는 라벨
+NO_REGIME = "국면 없음"
 
 
 @dataclass(frozen=True)
@@ -62,11 +82,16 @@ class BacktestConfig:
     max_hold: int = 40                  # 청산 규칙 시뮬 최대 보유 거래일
     regime_window: int = 20             # 국면 판정용 시장 수익률 구간
     seed: int = 7
+    # [0] 이벤트 판정 N. 같은 종목이 이 거래일 수 안에 다시 잡히면 같은
+    # 이벤트다. 0 이하면 중복 제거를 하지 않는다(예전 동작 — 비교용).
+    event_window: int = EVENT_WINDOW_DAYS
+    # 청산 엔진과 나란히 놓을 '고정 보유' 거래일 (horizons 에 있어야 한다)
+    hold_compare: int = 20
 
 
 # ══════════════════════════ 보조 ══════════════════════════
 def _market_close_matrix(store, tickers: list[str]) -> pd.DataFrame:
-    """종가 피벗. 시장 중위 수익률(대조군)과 국면 판정에 쓴다."""
+    """종가 피벗. 구 국면 판정(`_regime`, regime 컬럼)에 쓴다."""
     pm = store.price_matrix(days=100000)
     if pm is None or pm.empty:
         return pd.DataFrame()
@@ -75,7 +100,9 @@ def _market_close_matrix(store, tickers: list[str]) -> pd.DataFrame:
 
 
 def _median_forward(pm: pd.DataFrame, i0: int, h: int) -> float:
-    """구간 [i0, i0+h] 의 전종목 중위 수익률(%). 시장 대조군."""
+    """구간 [i0, i0+h] 의 풀 중위 수익률(%). **v2-A 부터 쓰지 않는다** —
+    시장 대조는 [0] `PricePanel.universe_median`(전종목, 진입 시가 → h일째
+    종가)이다. 구 결과 재현·비교용으로만 남긴다."""
     if pm.empty or i0 + h >= len(pm):
         return float("nan")
     a, b = pm.iloc[i0], pm.iloc[i0 + h]
@@ -129,11 +156,146 @@ def _fwd(ohlcv: pd.DataFrame, i0: int, h: int, cost: float) -> dict:
             "ret": ret, "net": ret - cost, "mae": mae}
 
 
+def _mae_cols(ohlcv: pd.DataFrame, i0: int, horizons) -> dict:
+    """[0] 구간(진입 i0+1 시가 → h일째 = i0+h)의 최대 역행폭(%). 항상 <= 0.
+
+    채점(`score_events`)은 시가·종가만 보므로 저가가 필요한 MAE 는
+    백테스트가 따로 잰다. 구간 정의는 채점과 같다.
+    """
+    o = ohlcv["시가"].to_numpy(dtype="float64")
+    lo = ohlcv["저가"].to_numpy(dtype="float64")
+    e = i0 + 1
+    out = {}
+    if e >= len(o) or not (np.isfinite(o[e]) and o[e] > 0):
+        return out
+    for h in horizons:
+        x = e + int(h) - 1
+        if x >= len(o):
+            continue
+        seg = lo[e:x + 1]
+        seg = seg[np.isfinite(seg) & (seg > 0)]
+        trough = min(float(seg.min()), o[e]) if len(seg) else o[e]
+        out[f"mae_{h}"] = (trough / o[e] - 1.0) * 100.0
+    return out
+
+
+def score_context(store, index: dict | None = None) -> dict:
+    """채점 재료(거래일 달력·가격 패널·시장 구분·지수). 한 번만 만든다.
+
+    전략·대조군이 **같은 재료**로 채점돼야 같은 지표가 된다.
+    index 가 None 이면 지수 대비(ex_idx)는 NaN 이다 — 0 으로 채우지 않는다.
+    """
+    cal = trading_calendar(store)
+    panel = PricePanel.from_store(store, calendar=cal)
+    return {"calendar": cal, "panel": panel,
+            "markets": ticker_markets(store), "index": index or {}}
+
+
+def dedupe_events(rows: pd.DataFrame, calendar: list[str],
+                  window: int = EVENT_WINDOW_DAYS) -> tuple[pd.DataFrame, dict]:
+    """(판정일, 종목) 후보를 [0] 이벤트 판정으로 줄인다. is_event 행만 남긴다.
+
+    반환 (이벤트 표, {"before": n, "after": m}). window <= 0 이면 그대로.
+    """
+    n0 = 0 if rows is None else int(len(rows))
+    if rows is None or rows.empty or window <= 0:
+        return rows, {"before": n0, "after": n0}
+    a = assign_events(rows.assign(d=rows["date"]), calendar, window=window)
+    ev = events_only(a).drop(columns=["d"], errors="ignore")
+    return ev, {"before": n0, "after": int(len(ev))}
+
+
+def score_rows(rows: pd.DataFrame, ctx: dict,
+               bt: "BacktestConfig") -> pd.DataFrame:
+    """후보 행을 [0] `score_events` 로 채점하고 백테스트 컬럼으로 옮긴다.
+
+      net_h   = 비용 차감 순수익            (score_events 의 net_h)
+      mkt_h   = 같은 구간 전종목 중위 수익률 (med_h)
+      alpha_h = 시장 중위 대비 초과수익      (ex_med_h)  ← 비교 기준 지표
+      ex_idx_h= 소속 지수 대비 초과수익      (score_events 그대로)
+    채점이 불가능한 구간(상한가 시가·수정주가 불연속·미도래)은 NaN 이다.
+    """
+    if rows is None or rows.empty:
+        return pd.DataFrame() if rows is None else rows
+    ev = rows.copy()
+    ev["event_date"] = ev["date"]
+    sc = score_events(ev, ctx["panel"], ctx.get("index"), ctx.get("markets"),
+                      horizons=bt.horizons, cost_pct=bt.cost_pct)
+    for h in bt.horizons:
+        sc[f"mkt_{h}"] = sc[f"med_{h}"]
+        sc[f"alpha_{h}"] = sc[f"ex_med_{h}"]
+        mc = f"mae_{h}"
+        if mc in sc:
+            sc[mc] = sc[mc].where(sc[f"net_{h}"].notna())
+    return sc
+
+
+def attach_regime(df: pd.DataFrame, store, col: str = "date",
+                  out: str = "regime_v2") -> pd.DataFrame:
+    """그 날짜의 국면 라벨(C 의 `v2_hooks.regime_on`)을 붙인다.
+
+    훅이 None 을 주면(기록 없음·지수 신선하지 않음) "국면 없음".
+    """
+    from . import v2_hooks
+    if df is None or df.empty:
+        return df
+    cache: dict[str, str] = {}
+
+    def _lab(d):
+        k = str(d)[:10]
+        if k not in cache:
+            try:
+                v = v2_hooks.regime_on(store, k)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("국면 조회 실패 %s: %s", k, exc)
+                v = None
+            cache[k] = v or NO_REGIME
+        return cache[k]
+
+    df = df.copy()
+    df[out] = df[col].map(_lab)
+    return df
+
+
 # ══════════════════════════ 본체 ══════════════════════════
 def run_backtest(store, tickers: dict, cfg: Config = DEFAULT,
                  bt: BacktestConfig = BacktestConfig(),
-                 progress_every: int = 50) -> pd.DataFrame:
-    """이벤트 표를 만든다. 한 행 = (종목, 판정일, 등급) 1건."""
+                 progress_every: int = 50,
+                 ctx: dict | None = None) -> pd.DataFrame:
+    """이벤트 표를 만든다. 한 행 = (종목, 이벤트 날짜, 등급) 1건.
+
+    판정일 후보(`backtest_candidates`)를 모은 뒤 [0] 이벤트 판정
+    (N=bt.event_window)으로 중복을 지우고 [0] 채점으로 성적을 매긴다.
+    전후 건수는 `df.attrs` 의 raw_events / events 에 남는다.
+    """
+    raw = backtest_candidates(store, tickers, cfg, bt, progress_every)
+    return finish_events(store, raw, bt, ctx)
+
+
+def finish_events(store, raw: pd.DataFrame, bt: BacktestConfig,
+                  ctx: dict | None = None) -> pd.DataFrame:
+    """후보 → 중복 제거 → [0] 채점."""
+    if raw is None or raw.empty:
+        log.info("백테스트 이벤트 0건")
+        raw = pd.DataFrame() if raw is None else raw
+        raw.attrs.update({"raw_events": 0, "events": 0})
+        return raw
+    ctx = ctx or score_context(store)
+    ev, st = dedupe_events(raw, ctx["calendar"], bt.event_window)
+    df = score_rows(ev, ctx, bt)
+    df.attrs.update({"raw_events": st["before"], "events": st["after"]})
+    log.info("백테스트 판정 후보 %d건 → 중복 제거(N=%d) 후 이벤트 %d건",
+             st["before"], bt.event_window, st["after"])
+    return df
+
+
+def backtest_candidates(store, tickers: dict, cfg: Config = DEFAULT,
+                        bt: BacktestConfig = BacktestConfig(),
+                        progress_every: int = 50) -> pd.DataFrame:
+    """판정일 후보. 한 행 = (종목, 판정일) 에서 등급이 bt.grades 인 것.
+
+    아직 채점·중복 제거 전이다(같은 흐름이 step 간격으로 여러 번 잡힌다).
+    """
     rng = random.Random(bt.seed)
     codes = list(tickers)
     pm = _market_close_matrix(store, codes)
@@ -174,32 +336,27 @@ def run_backtest(store, tickers: dict, cfg: Config = DEFAULT,
             mi = pm_pos.get(dates[i])
             base["regime"] = (_regime(pm, mi, bt.regime_window)
                               if mi is not None else "UNKNOWN")
-
-            for h in bt.horizons:
-                f = _fwd(ohlcv, i, h, bt.cost_pct)
-                if not f:
-                    continue
-                base[f"ret_{h}"] = f["ret"]
-                base[f"net_{h}"] = f["net"]
-                base[f"mae_{h}"] = f["mae"]
-                base[f"mkt_{h}"] = (_median_forward(pm, mi, h)
-                                    if mi is not None else np.nan)
-                base[f"alpha_{h}"] = base[f"net_{h}"] - base[f"mkt_{h}"]
+            base.update(_mae_cols(ohlcv, i, bt.horizons))
             rows.append(base)
 
-    df = pd.DataFrame(rows)
-    log.info("백테스트 이벤트 %d건 (종목 %d, 간격 %d거래일)",
-             len(df), len(tickers), bt.step)
-    return df
+    raw = pd.DataFrame(rows)
+    log.info("백테스트 판정 후보 %d건 (종목 %d, 간격 %d거래일)",
+             len(raw), len(tickers), bt.step)
+    return raw
 
 
 def control_random(store, tickers: dict, n_events: int,
-                   bt: BacktestConfig = BacktestConfig()) -> pd.DataFrame:
-    """무작위 진입 대조군. 같은 종목 풀, 무작위 날짜, 같은 표본 크기."""
+                   bt: BacktestConfig = BacktestConfig(),
+                   ctx: dict | None = None) -> pd.DataFrame:
+    """무작위 진입 대조군. 같은 종목 풀, 무작위 날짜, 같은 표본 크기.
+
+    전략과 같은 [0] 채점·같은 중복 제거를 거친다 → alpha_h 끼리 비교한다.
+    """
     rng = random.Random(bt.seed + 1)
     codes = [c for c in tickers]
     rng.shuffle(codes)
     rows: list[dict] = []
+    picked: dict[str, list[int]] = {}
     guard = 0
     while len(rows) < n_events and guard < n_events * 20 and codes:
         guard += 1
@@ -211,22 +368,38 @@ def control_random(store, tickers: dict, n_events: int,
         if last_i <= bt.warmup:
             continue
         i = rng.randrange(bt.warmup, last_i + 1)
+        # 같은 종목의 N거래일 안 재추첨은 중복 제거에서 사라진다. 표본
+        # 크기를 전략과 맞추려고 뽑을 때 미리 피한다.
+        if any(abs(i - j) < max(bt.event_window, 1)
+               for j in picked.get(code, ())):
+            continue
+        picked.setdefault(code, []).append(i)
         row = {"ticker": code, "date": ohlcv.index[i].strftime("%Y-%m-%d")}
-        ok = False
-        for h in bt.horizons:
-            f = _fwd(ohlcv, i, h, bt.cost_pct)
-            if f:
-                row[f"net_{h}"] = f["net"]
-                row[f"mae_{h}"] = f["mae"]
-                ok = True
-        if ok:
-            rows.append(row)
-    return pd.DataFrame(rows)
+        row.update(_mae_cols(ohlcv, i, bt.horizons))
+        rows.append(row)
+    return _score_control(store, rows, bt, ctx)
+
+
+def _score_control(store, rows: list[dict], bt: BacktestConfig,
+                   ctx: dict | None) -> pd.DataFrame:
+    """대조군 후보 → 중복 제거 → [0] 채점. 전략과 같은 경로."""
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        return raw
+    ctx = ctx or score_context(store)
+    ev, st = dedupe_events(raw, ctx["calendar"], bt.event_window)
+    df = score_rows(ev, ctx, bt)
+    df.attrs.update({"raw_events": st["before"], "events": st["after"]})
+    return df
 
 
 def control_rsi(store, tickers: dict, threshold: float = 30.0,
-                bt: BacktestConfig = BacktestConfig()) -> pd.DataFrame:
-    """단순 RSI<30 대조군. 우리 로직이 이보다 나은지 본다."""
+                bt: BacktestConfig = BacktestConfig(),
+                ctx: dict | None = None) -> pd.DataFrame:
+    """단순 RSI<30 대조군. 우리 로직이 이보다 나은지 본다.
+
+    전략과 같은 [0] 채점·같은 중복 제거를 거친다 → alpha_h 끼리 비교한다.
+    """
     rows: list[dict] = []
     for code in tickers:
         ohlcv = store.load_ohlcv(code, days=100000)
@@ -238,16 +411,9 @@ def control_rsi(store, tickers: dict, threshold: float = 30.0,
             if _rsi_last(close.iloc[: i + 1]) > threshold:
                 continue
             row = {"ticker": code, "date": ohlcv.index[i].strftime("%Y-%m-%d")}
-            ok = False
-            for h in bt.horizons:
-                f = _fwd(ohlcv, i, h, bt.cost_pct)
-                if f:
-                    row[f"net_{h}"] = f["net"]
-                    row[f"mae_{h}"] = f["mae"]
-                    ok = True
-            if ok:
-                rows.append(row)
-    return pd.DataFrame(rows)
+            row.update(_mae_cols(ohlcv, i, bt.horizons))
+            rows.append(row)
+    return _score_control(store, rows, bt, ctx)
 
 
 # ══════════════════════════ 청산 규칙 시뮬레이션 ══════════════════════════
@@ -258,13 +424,19 @@ def simulate_exit_rules(store, events: pd.DataFrame, cfg: Config = DEFAULT,
     이게 청산 파라미터(익절폭·트레일링폭·시간스톱·밴드 이탈 확인일수)를
     검증하는 유일한 방법이다. 고정 5일 보유 측정은 실제 운용과 대응되지
     않는다.
+
+    같은 이벤트의 고정 보유 성적(`hold_*`, [0] 채점의 hold_compare일
+    순수익·초과수익)을 행에 같이 남긴다 — 엔진 vs 고정 보유 비교용.
     """
     if events is None or events.empty:
         return pd.DataFrame()
 
     out: list[dict] = []
     cache: dict[str, pd.DataFrame] = {}
-    for _, ev in events.iterrows():
+    hh = int(bt.hold_compare)
+    for k, (_, ev) in enumerate(events.iterrows(), 1):
+        if k % 500 == 0:
+            log.info("  청산 시뮬 진행 %d/%d", k, len(events))
         code = str(ev["ticker"])
         ohlcv = cache.get(code)
         if ohlcv is None:
@@ -306,6 +478,10 @@ def simulate_exit_rules(store, events: pd.DataFrame, cfg: Config = DEFAULT,
             id=0, ticker=code, name=str(ev.get("name") or code), track=track,
             entry_date=ohlcv.index[i0 + 1].strftime("%Y-%m-%d"),
             entry_price=entry, qty=100, remaining=100,
+            # 실거래와 같은 규칙으로 손절선을 진입 시 고정한다. 이걸 빼면
+            # 백테스트에서만 계층 1 고정 손절이 발동하지 않아 성과가
+            # 실제보다 좋게 나온다.
+            stop_price=stop_price_for(entry, cfg),
             entry_p0=snap.liq.cost_basis if snap.liq else None,
             entry_band_hi=band.get("hi"), entry_band_mid=band.get("mid"),
             entry_band_lo=band.get("lo"),
@@ -341,10 +517,16 @@ def simulate_exit_rules(store, events: pd.DataFrame, cfg: Config = DEFAULT,
         out.append({
             "ticker": code, "date": ds, "grade": ev.get("grade"),
             "track": track, "regime": ev.get("regime"),
+            "ev_track": ev.get("track"),
+            "regime_v2": ev.get("regime_v2"),
             "entry": entry, "exit": exit_px, "held_days": held,
             "layer": layer, "rule": rule,
             "ret": ret, "net": ret - bt.cost_pct,
             "mae": (seg_low / entry - 1.0) * 100.0,
+            "hold_h": hh,
+            "hold_net": ev.get(f"net_{hh}", np.nan),
+            "hold_alpha": ev.get(f"alpha_{hh}", np.nan),
+            "hold_status": ev.get(f"status_{hh}"),
         })
 
     df = pd.DataFrame(out)
@@ -376,6 +558,13 @@ def summarize(events: pd.DataFrame, bt: BacktestConfig = BacktestConfig(),
                             str(events["date"].max())],
                  "tickers": int(events["ticker"].nunique())}
 
+    if "raw_events" in events.attrs:
+        res["raw_events"] = int(events.attrs["raw_events"])
+    res["event_window"] = int(bt.event_window)
+    # 비교 지표: 전종목 중위 대비 초과수익(alpha_h = [0] ex_med_h).
+    # 전략·대조군 모두 이 컬럼끼리 비교한다.
+    res["metric"] = "alpha = net - 전종목 중위 (ex_med)"
+
     by_h = {}
     for h in bt.horizons:
         col, ac, mc = f"net_{h}", f"alpha_{h}", f"mae_{h}"
@@ -384,6 +573,8 @@ def summarize(events: pd.DataFrame, bt: BacktestConfig = BacktestConfig(),
         item = {"net": _stats(events[col])}
         if ac in events:
             item["alpha"] = _stats(events[ac])
+        if f"ex_idx_{h}" in events:
+            item["ex_idx"] = _stats(events[f"ex_idx_{h}"])
         if mc in events:
             item["mae"] = _stats(events[mc])
         by_h[h] = item
@@ -394,20 +585,29 @@ def summarize(events: pd.DataFrame, bt: BacktestConfig = BacktestConfig(),
     ac = f"alpha_{ref}"
     res["ref_horizon"] = ref
     for key, col in (("by_grade", "grade"), ("by_track", "track"),
-                     ("by_regime", "regime")):
+                     ("by_regime", "regime"), ("by_regime_v2", "regime_v2")):
         if col in events and ac in events:
             res[key] = {str(k): _stats(g[ac])
                         for k, g in events.groupby(col)}
 
-    # 대조군
+    # 대조군 — **같은 지표**(alpha_ref)끼리 비교한다. 예전에는 전략 alpha 를
+    # 대조군 net 과 비교했다(단위가 다른 두 숫자). 순수익은 참고로만 남긴다.
     ctrl = {}
-    if rnd is not None and not rnd.empty and f"net_{ref}" in rnd:
-        ctrl["random"] = _stats(rnd[f"net_{ref}"])
-    if rsi is not None and not rsi.empty and f"net_{ref}" in rsi:
-        ctrl["rsi30"] = _stats(rsi[f"net_{ref}"])
-    if f"mkt_{ref}" in events:
-        ctrl["market"] = _stats(events[f"mkt_{ref}"])
+    ctrl_net = {"strategy": _stats(events[f"net_{ref}"])
+                if f"net_{ref}" in events else {}}
+    for key, frame in (("random", rnd), ("rsi30", rsi)):
+        if frame is None or frame.empty:
+            continue
+        if f"alpha_{ref}" in frame:
+            ctrl[key] = _stats(frame[f"alpha_{ref}"])
+        if f"net_{ref}" in frame:
+            ctrl_net[key] = _stats(frame[f"net_{ref}"])
     res["controls"] = ctrl
+    res["controls_net"] = ctrl_net
+    # 시장 중위 자체의 초과수익은 정의상 0 이다. 그 구간 시장 중위의
+    # **수익률**은 참고값으로 따로 둔다(대조군 비교에 쓰지 않는다).
+    if f"mkt_{ref}" in events:
+        res["market_ret"] = _stats(events[f"mkt_{ref}"])
 
     # 판정
     a = res.get("by_horizon", {}).get(ref, {}).get("alpha", {})
@@ -469,4 +669,32 @@ def summarize_exits(sim: pd.DataFrame) -> dict:
                             "held_mean": round(float(g["held_days"].mean()), 1)}
     out["by_layer"] = by_layer
     out["by_rule"] = {str(k): int(len(g)) for k, g in sim.groupby("rule")}
+    return out
+
+
+def exits_vs_hold(sim: pd.DataFrame, by: str | None = "regime_v2") -> dict:
+    """청산 엔진 vs 같은 이벤트 고정 보유(hold_compare일), 그룹별.
+
+    두 값이 모두 있는 이벤트만 쓴다(같은 표본). 칸은 `events.stat_cell`
+    (20건 미만 enough=False → "표본 부족").
+    반환 {그룹: {"engine": cell, "hold": cell, "engine_all": cell}}.
+    그룹 "전체" 는 항상 있다.
+    """
+    if sim is None or sim.empty:
+        return {}
+    df = sim.copy()
+    if "hold_net" not in df:
+        df["hold_net"] = np.nan
+    both = df[df["net"].notna() & df["hold_net"].notna()]
+    out = {"전체": {"engine": stat_cell(both["net"]),
+                    "hold": stat_cell(both["hold_net"]),
+                    "engine_all": stat_cell(df["net"])}}
+    if by and by in df:
+        keys = df[by].fillna(NO_REGIME)
+        bkeys = both[by].fillna(NO_REGIME)
+        for k in sorted(keys.unique(), key=str):
+            g, gb = df[keys == k], both[bkeys == k]
+            out[str(k)] = {"engine": stat_cell(gb["net"]),
+                           "hold": stat_cell(gb["hold_net"]),
+                           "engine_all": stat_cell(g["net"])}
     return out
