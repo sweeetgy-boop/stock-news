@@ -1,0 +1,9 @@
+# 보유 파일 템플릿. data/holdings.csv 로 복사해 채운다 (holdings.csv 는 커밋 금지).
+# --mode rebalance 가 읽는다. 위반 항목과 한도까지 줄일 금액만 보인다.
+# code      종목코드 6자리 (ETF/ETN 포함). 현금은 CASH, 수량 칸에 금액(원)
+# qty       수량
+# avg_price 평단. 시세를 못 구한 종목의 대체 평가에만 쓴다(표시하지 않는다)
+code,qty,avg_price
+005930,10,70000
+069500,5,35000
+CASH,1000000,

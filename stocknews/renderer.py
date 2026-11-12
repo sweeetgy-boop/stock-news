@@ -739,6 +739,11 @@ def render_weekly(rep: dict, asof, cfg: Config = DEFAULT) -> str:
         out.append("")
         out += _monthly_block(mon)
 
+    if rep.get("cone"):              # [E] RISK_INFO ON 일 때만 키가 있다
+        from .risk import render_cone_block
+        out.append("")
+        out += render_cone_block(rep["cone"])
+
     out.append("")
     out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
     return "\n".join(out)

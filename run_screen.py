@@ -209,7 +209,7 @@ _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
                 "flash", "pos-open", "fill", "pos-close", "holidays",
                 "reconcile", "reco-events-backfill", "regime-backfill",
-                "paper"}
+                "paper", "risk-backfill"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -920,6 +920,8 @@ def mode_daily(store: Store, args) -> int:
                              "grade": r.grade, "slot": slot,
                              "value": r.value_score, "trend": r.trend_score}
                             for i, (slot, r) in enumerate(res["picks"], 1)]})
+    if res.get("risk_metrics") is not None:      # [E] RISK_INFO ON 일 때만
+        SUMMARY["risk_metrics"] = res["risk_metrics"]
     if failed:
         log.warning("스캔 실패 %d종목, 예시: %s", failed, res["errors"][:3])
     if not ok:
@@ -947,6 +949,10 @@ def mode_weekly(store: Store, args) -> int:
             "reentry_violations": c.get("reentry_violations", 0),
             "compliance_pct": c.get("compliance_pct"),
         }
+    if rep.get("cone"):                          # [E] RISK_INFO ON 일 때만
+        SUMMARY["cone"] = {k: rep["cone"].get(k) for k in
+                           ("days", "reco", "all", "first_origin",
+                            "last_origin")}
     text = render_weekly(rep, now_kst(), DEFAULT)
     # [B] 발송된 추천 vs 사유별 제외 종목 20일 초과수익. 플래그 ON 일 때만.
     from stocknews import send_filter as sf
@@ -2329,6 +2335,9 @@ def mode_reco_events_backfill(store: Store, args) -> int:
              out["elapsed_sec"])
     _say(f"reco_events 소급 완료: 창 {out['window']}거래일 · recos "
          f"{out['recos']}행 · 이벤트 {out['events']}건 · {out['elapsed_sec']}초")
+    return EXIT_OK
+
+
 def mode_regime_backfill(store: Store, args) -> int:
     """[C] 국면 소급 — 달력 전 기간. 1회성, nightly 밖.
 
@@ -2353,6 +2362,59 @@ def mode_regime_backfill(store: Store, args) -> int:
     _say(f"국면별 거래일 {res['counts']}")
     for t in tr:
         _say(f"  {t['d']}  {t['from'] or '-'} -> {t['to']}")
+    return EXIT_OK
+
+
+def mode_risk_backfill(store: Store, args) -> int:
+    """[E] 과거 거래일 EWMA σ 를 risk_metrics 에 '소급' 으로 채운다 (1회성).
+
+    nightly 와 분리된 명령이다. 그날까지의 데이터만 쓰는 정의라 실시간
+    기록과 값이 같고, 이미 있는 행은 건드리지 않는다(재실행 = 빈 날짜만).
+    RISK_INFO 플래그와 무관하게 사람이 직접 칠 때만 돈다.
+    """
+    from stocknews import risk
+    if not store.last_price_date():
+        log.error("시세 데이터가 없습니다. backfill/update 를 먼저 실행하십시오.")
+        return EXIT_PRECOND
+    if not risk.enabled():
+        log.info("RISK_INFO 가 꺼져 있습니다 — 기록만 하고 표시는 하지 않습니다")
+    rep = risk.backfill(store, start=args.risk_start, end=args.risk_end)
+    SUMMARY.update({"risk_backfill": rep})
+    _say(f"σ 소급: {rep.get('first')} ~ {rep.get('last')} · "
+         f"{rep['dates']}거래일 · {rep['written']:,}행 기록 · "
+         f"{rep['elapsed_sec']}초")
+    return EXIT_OK
+
+
+def mode_rebalance(store: Store, args) -> int:
+    """[E] 보유 파일 비중 한도 점검. 읽기 전용 · 발송 없음 (콘솔 + --json).
+
+    위반 항목과 '한도까지 줄일 금액'만 보인다. 매수 제안·추천 연결·손익
+    금액은 없다. 보유 내역은 개인 정보라 텔레그램으로 보내지 않는다.
+    """
+    from stocknews import config as _cfg
+    from stocknews import rebalance as rb
+    path = args.holdings or _cfg.REBAL_HOLDINGS_FILE
+    try:
+        holdings = rb.read_holdings(path)
+    except FileNotFoundError:
+        log.error("보유 파일이 없습니다: %s (템플릿 data/holdings.csv.example "
+                  "을 복사해 채우십시오)", path)
+        SUMMARY["reason"] = "no_holdings_file"
+        return EXIT_PRECOND
+    except ValueError as exc:
+        log.error("%s", exc)
+        SUMMARY["reason"] = "bad_holdings_file"
+        return EXIT_PRECOND
+    if not holdings:
+        log.error("보유 파일이 비어 있습니다: %s", path)
+        SUMMARY["reason"] = "empty_holdings_file"
+        return EXIT_PRECOND
+    val = rb.value_holdings(store, holdings,
+                            asof=args.date or store.last_price_date())
+    chk = rb.check_limits(val["holdings"])
+    SUMMARY["rebalance"] = rb.summary(val, chk)
+    _say(rb.render_rebalance(val, chk))
     return EXIT_OK
 
 
@@ -2388,6 +2450,8 @@ MODES = {
     "reco-events-backfill": mode_reco_events_backfill,
     "regime-backfill": mode_regime_backfill,
     "paper": mode_paper,
+    "risk-backfill": mode_risk_backfill,
+    "rebalance": mode_rebalance,
 }
 
 
@@ -2540,6 +2604,13 @@ def main(argv=None) -> int:
     ap.add_argument("--runs-days", type=int, default=14,
                     help="runs: 조회 일수 (기본 14)")
     ap.add_argument("--runs-mode", help="runs: 특정 모드만 조회")
+    # ── [E] 위험 정보 ──
+    ap.add_argument("--risk-start", help="risk-backfill: 시작일 YYYY-MM-DD "
+                                         "(기본: 시세 첫날)")
+    ap.add_argument("--risk-end", help="risk-backfill: 끝일 YYYY-MM-DD "
+                                       "(기본: 최신 거래일)")
+    ap.add_argument("--holdings", help="rebalance: 보유 파일 경로 "
+                                       "(기본 config.REBAL_HOLDINGS_FILE)")
     ap.add_argument("--runs-limit", type=int, default=200,
                     help="runs: 최대 행 수 (기본 200)")
     # ── 백테스트 ──

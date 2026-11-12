@@ -385,9 +385,30 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     reg = record_daily(store, trade_date,
                        fetch=lambda name, bars: load_index(name, bars=bars))
 
+    # [E] 종목별 EWMA σ. 기록 전용(점수에 들어가지 않는다) · 플래그 OFF 면
+    # 아무것도 하지 않는다. 실패해도 스캔·추천 기록은 이미 커밋돼 있다.
+    risk_rep = _record_risk(store, trade_date)
+
     store.log_run("daily", started, len(results), len(errors),
                   note=f"snapshot={saved}, picks={len(picks)}")
 
-    return {"trade_date": trade_date, "results": results, "errors": errors,
-            "picks": picks, "snapshot_rows": saved,
-            "market_context": mkt, "sector_metrics": sec, "regime": reg}
+    out = {"trade_date": trade_date, "results": results, "errors": errors,
+           "picks": picks, "snapshot_rows": saved,
+           "market_context": mkt, "sector_metrics": sec,
+           "regime": reg}
+    if risk_rep is not None:
+        out["risk_metrics"] = risk_rep
+    return out
+
+
+def _record_risk(store, trade_date: str) -> dict | None:
+    """RISK_INFO 가 켜져 있으면 그 거래일 σ 를 risk_metrics 에 기록한다."""
+    from . import risk
+    if not risk.enabled():
+        return None
+    try:
+        return risk.record_daily(store, trade_date)
+    except Exception as exc:  # noqa: BLE001 - 기록 전용
+        log.warning("risk_metrics 기록 실패 (스캔·추천은 기록됨): %s", exc)
+        return {"d": trade_date, "written": 0,
+                "error": f"{type(exc).__name__}: {exc}"[:200]}

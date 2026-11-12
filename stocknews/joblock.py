@@ -73,6 +73,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "regime-backfill": 900,
     # [v2 D] 추천 추적 갱신 / 소급 편입(--backfill). nightly 밖 1회성.
     "paper": 1800,
+    # [E] σ 소급 (1회성). 전 거래일 × 전종목, 실측 수 분.
+    "risk-backfill": 1800,
 }
 DEFAULT_TIMEOUT = 900
 

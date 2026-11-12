@@ -63,6 +63,8 @@ MA_COLORS = ("#eb6834", "#1baf7a", "#4a3aa7")   # MA 단·중·장
 BAND = "#d55181"
 FIB = "#008300"
 VP = "#9c9a92"
+CONE = "#138d90"     # [E] 20일 예상 범위 (RISK_INFO)
+STOP = "#b42318"     # [E] 가정 손절선 (원뿔 구간에만)
 
 TRACK_KR = {"VALUE": "매집", "TREND": "추세", "BOTH": "시퀀스"}
 OBV_NULL_KR = {"split": "분할 흔적", "price_gap": "가격 단절",
@@ -320,8 +322,14 @@ def draw_obv_panel(axo, res: ScreenResult, df: pd.DataFrame,
 
 
 def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
-                 cfg: Config = DEFAULT, trade_date: str | None = None) -> Path:
-    """최근 N봉 캔들 + MA + 청산밴드 + 피보 + P0 + 매물대(상위 3) + OBV 띠 PNG."""
+                 cfg: Config = DEFAULT, trade_date: str | None = None,
+                 risk: dict | None = None) -> Path:
+    """최근 N봉 캔들 + MA + 청산밴드 + 피보 + P0 + 매물대(상위 3) + OBV 띠 PNG.
+
+    risk : [E] `risk.chart_risk()` 결과. 있으면 마지막 봉 오른쪽에 20일
+           예상 범위(±1σ·±2σ 원뿔)와 가정 손절선을 그린다. None 이면
+           지금과 같은 그림이다(RISK_INFO OFF).
+    """
     from matplotlib import rc_context
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
@@ -343,6 +351,13 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
     mas = moving_averages(ohlcv["종가"].astype("float64"), cfg.ma).loc[df.index]
 
     levels = line_levels(res, cfg)
+    if risk and risk.get("sigma") is None:
+        risk = None                   # σ 없음 → 원뿔 없이 지금 그림 그대로
+    cone_n = int(risk["days"]) if risk else 0
+    cone = None
+    if risk:
+        from .risk import cone_bounds
+        cone = cone_bounds(risk["price"], risk["sigma"], cone_n)
     pmin, pmax = float(np.nanmin(lo)), float(np.nanmax(h))
     span = max(pmax - pmin, pmax * 0.02)
     reach_lo = pmin - max(0.5 * span, 0.10 * pmin)
@@ -351,6 +366,10 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
     hidden = [lv for lv in levels if lv not in shown]
     ymin = min([pmin] + [lv["price"] for lv in shown])
     ymax = max([pmax] + [lv["price"] for lv in shown])
+    if cone is not None:
+        # ±1σ 끝과 손절선은 항상 보이게. ±2σ 는 축 밖이면 잘린다.
+        ymin = min(ymin, float(cone[1][0][-1]), float(risk["stop"]))
+        ymax = max(ymax, float(cone[1][1][-1]))
     pad = (ymax - ymin) * 0.04
     ylim = (ymin - pad, ymax + pad)
 
@@ -405,16 +424,39 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
 
         # ── 청산 밴드 영역 ──
         band = {lv["key"]: lv["price"] for lv in levels if lv["kind"] == "band"}
+        line_end = n - 0.5 + cone_n      # 원뿔이 있으면 수평선을 그 끝까지
         if "hi" in band and "lo" in band:
-            ax.fill_between([-0.5, n - 0.5], band["lo"], band["hi"],
+            ax.fill_between([-0.5, line_end], band["lo"], band["hi"],
                             color=BAND, alpha=0.07, linewidth=0, zorder=1)
+
+        # ── [E] 20일 예상 범위 (기록·표시 전용) ──
+        if cone is not None:
+            xs = (n - 1) + cone["t"]
+            ax.fill_between(xs, cone[2][0], cone[2][1], color=CONE,
+                            alpha=0.08, linewidth=0, zorder=1)
+            ax.fill_between(xs, cone[1][0], cone[1][1], color=CONE,
+                            alpha=0.16, linewidth=0, zorder=1)
+            for k, ls in ((1, "-"), (2, ":")):
+                for edge in cone[k]:
+                    ax.plot(xs, edge, color=CONE, linewidth=0.9, ls=ls,
+                            zorder=2)
+                for edge, va, sign in ((cone[k][1], "bottom", "+"),
+                                       (cone[k][0], "top", "-")):
+                    ax.text(xs[-1] - 0.2, float(edge[-1]),
+                            f"{sign}{k}σ {float(edge[-1]):,.0f}", ha="right",
+                            va=va, fontsize=7, color=CONE, zorder=6,
+                            clip_on=True)
+            ax.hlines(risk["stop"], n - 0.5, line_end, colors=STOP,
+                      linestyles="--", linewidth=1.1, zorder=5)
+            ax.text(n - 0.3, risk["stop"], f"가정 손절선 {risk['stop']:,.0f}",
+                    ha="left", va="top", fontsize=7, color=STOP, zorder=6)
 
         style = {
             "band": {"hi": ("--", 1.1), "mid": ("-", 1.7), "lo": ("--", 1.1)},
             "fib": ("dotted", 1.3),
             "p0": ("-.", 1.6),
         }
-        right = n + 0.8
+        right = n + cone_n + 0.8
         lab_ys = _spread([lv["price"] for lv in shown] + [cl[-1]],
                          (ylim[1] - ylim[0]) * 0.036)
         for lv, ly in zip(shown, lab_ys):
@@ -425,10 +467,10 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
                 (ls, lw), color = style["fib"], FIB
             else:
                 (ls, lw), color = style["p0"], INK
-            ax.hlines(lv["price"], -0.5, n - 0.5, colors=color, linestyles=ls,
+            ax.hlines(lv["price"], -0.5, line_end, colors=color, linestyles=ls,
                       linewidth=lw, zorder=5)
             # 라벨이 밀려났으면 선 끝에서 라벨까지 가는 짧은 연결선
-            ax.plot([n - 0.5, right - 0.3], [lv["price"], ly], color=color,
+            ax.plot([line_end, right - 0.3], [lv["price"], ly], color=color,
                     linewidth=0.8, zorder=5)
             ax.text(right, ly, f"{lv['label']} {lv['price']:,.0f}",
                     va="center", ha="left", fontsize=8, color=INK2, zorder=6)
@@ -453,7 +495,7 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
                     bbox={"facecolor": SURFACE, "edgecolor": GRID,
                           "boxstyle": "round,pad=0.3", "alpha": 0.9})
 
-        ax.set_xlim(-1, n + gutter)
+        ax.set_xlim(-1, n + cone_n + gutter)
         ax.set_ylim(*ylim)
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:,.0f}"))
         ax.tick_params(labelbottom=False)
@@ -512,6 +554,8 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
             sub.append(f"피보 진행률 {res.fib.ratio:.3f}")
         if res.liq is not None and np.isfinite(res.liq.band_pos):
             sub.append(f"밴드 위치 {res.liq.band_pos * 100:.0f}%")
+        if risk:
+            sub.append(f"σ {risk['sigma'] * 100:.1f}%/일 (EWMA λ{risk['lam']:g})")
         fig.text(0.075, top_y(0.58), " · ".join(sub), fontsize=9.5, color=INK2, ha="left")
 
         from matplotlib.lines import Line2D
@@ -520,8 +564,12 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
         handles += [Line2D([], [], color=BAND, lw=1.4, ls="--", label="청산밴드 -16/-30/-44%"),
                     Line2D([], [], color=FIB, lw=1.3, ls="dotted", label="피보 되돌림"),
                     Line2D([], [], color=INK, lw=1.4, ls="-.", label="P0 신용 평균단가(추정)")]
+        if risk:
+            from matplotlib.patches import Patch
+            handles.append(Patch(facecolor=CONE, alpha=0.3, edgecolor=CONE,
+                                 label=f"{cone_n}일 예상 범위 ±1σ·±2σ"))
         fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.07, top_y(0.68)),
-                   ncol=6, frameon=False, fontsize=8.5, handlelength=2.2,
+                   ncol=len(handles), frameon=False, fontsize=8.5, handlelength=2.2,
                    columnspacing=1.4, labelcolor=INK2)
 
         fig.savefig(path, facecolor=SURFACE)
@@ -563,7 +611,8 @@ def chart_caption(res: ScreenResult, rank: int | None = None,
                   flags: dict | None = None, exclusion: str | None = None,
                   recorded: tuple[float, float] | None = None,
                   trade_date: str | None = None, cfg: Config = DEFAULT,
-                  limit: int = TELEGRAM_CAPTION_MAX) -> str:
+                  limit: int = TELEGRAM_CAPTION_MAX,
+                  risk: dict | None = None) -> str:
     """사진 1장의 캡션: 등급 · 점수 · 밴드 위치 · 피보 위치 · OBV.
 
     앨범에서 사진을 넘길 때마다 보이는 글이라 5줄로 줄였다. OBV 는 기록
@@ -609,6 +658,14 @@ def chart_caption(res: ScreenResult, rank: int | None = None,
             + (" · ⚠️ 파동 붕괴" if f.wave_broken else ""))
     else:
         lines.append("피보 - (데이터 부족)")
+
+    # [E] 20일 내 손절선 도달 확률 (RISK_INFO ON 일 때만 risk 가 온다).
+    # OBV 앞에 둔다 — 캡션이 넘치면 뒷줄(OBV)부터 빠진다.
+    if risk:
+        from .risk import caption_line
+        rl = caption_line(risk)
+        if rl:
+            lines.append(rl)
 
     lines.append(obv_line(res.obv))
 
@@ -703,15 +760,18 @@ def build_charts(store, jobs: list[ChartJob], trade_date: str,
                 raise ValueError(f"시세 부족 ({0 if ohlcv is None else len(ohlcv)}봉)")
             if job.result is not None and not job.result.excluded:
                 res = job.result          # 방금 채점한 그 객체를 그린다
+            # [E] RISK_INFO OFF 면 None → 지금과 같은 그림·캡션
+            from .risk import chart_risk
+            risk = chart_risk(store, trade_date, job.ticker, res.price, cfg)
             path = render_chart(res, ohlcv,
                                 chart_path(trade_date, job.rank, job.ticker, cfg,
                                            root, prefix),
-                                cfg, trade_date=trade_date)
+                                cfg, trade_date=trade_date, risk=risk)
             cap = chart_caption(res, rank=job.rank,
                                 flags=ctx["flags"].get(job.ticker),
                                 exclusion=exclusion_of(job.ticker, ohlcv, ctx),
                                 recorded=job.recorded, trade_date=trade_date,
-                                cfg=cfg)
+                                cfg=cfg, risk=risk)
             out.append(ChartOut(job.rank, job.ticker, job.name, path, cap))
             log.info("차트 생성 %d. %s(%s) -> %s", job.rank, job.name,
                      job.ticker, path)
