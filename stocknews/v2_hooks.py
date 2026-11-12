@@ -25,8 +25,11 @@ def regime_on(store, d) -> str | None:
 
     None = 기록 없음 또는 지수 신선하지 않음. 호출부는 None 이면 국면
     분리를 하지 않고(= 지금과 같은 동작) 표에는 "국면 없음" 으로 적는다.
+    과거 날짜도 조회된다(`--mode regime-backfill` 이후). 여러 날을 볼 때는
+    `stocknews.regime.labels_map(store)` 가 한 번에 준다.
     """
-    return None
+    from .regime import get_label
+    return get_label(store, d)
 
 
 def regime_row(store, d) -> dict | None:
@@ -34,8 +37,11 @@ def regime_row(store, d) -> dict | None:
 
     키: d, label, kospi_close, kospi_ma200, ma200_gap_pct, kospi_ret_20d,
         above_ma60_pct, fresh(bool). 없으면 None.
+        (추가 키: raw_label, pending_label, pending_days, n_ma60_universe,
+         null_reason, kind, calc_version, created)
     """
-    return None
+    from .regime import get_row
+    return get_row(store, d)
 
 
 # ════════════════ [B] 추천 필터 — 주인: B ════════════════

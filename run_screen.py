@@ -103,6 +103,7 @@ from stocknews.renderer import (render_daily_holdings, render_detail,
                                 render_reco_stored,
                                 render_reconcile, render_top10,
                                 render_weekly)
+from stocknews.regime import with_banner as with_regime_banner
 from stocknews.screener import screen_one
 from stocknews.store import Store
 from stocknews.universe import (avg_trading_value, backfill_one, fetch_day,
@@ -206,7 +207,7 @@ _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "credit-kiwoom", "collect-dividends", "dividend-report",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
                 "flash", "pos-open", "fill", "pos-close", "holidays",
-                "reconcile", "reco-events-backfill"}
+                "reconcile", "reco-events-backfill", "regime-backfill"}
 # backtest 는 읽기 전용이지만 오래 걸린다. 락을 잡으면 그동안 daily 가
 # 막히므로 제외한다. credit-probe 도 조회만 한다.
 
@@ -896,6 +897,9 @@ def mode_daily(store: Store, args) -> int:
         _emit(render_fib_list(picked[:30], asof, DEFAULT), args.dry_run)
 
     ok, failed = len(res["results"]), len(res["errors"])
+    reg = res.get("regime") or {}
+    SUMMARY["regime"] = {k: reg.get(k) for k in
+                         ("label", "raw_label", "fresh", "above_ma60_pct")}
     SUMMARY.update({"trade_date": res["trade_date"], "scanned": ok,
                     "failed": failed, "picks": len(res["picks"]),
                     "top": [{"rank": i, "ticker": r.ticker, "name": r.name,
@@ -1048,7 +1052,9 @@ def mode_brief_morning(store: Store, args) -> int:
             log.info("뉴스 창 확장 %d → %d시간 (마지막 거래일 %s)",
                      args.news_hours, hours, store.last_price_date())
     SUMMARY["news_hours"] = hours
-    _emit(render_morning_brief(store, now_kst(), hours=hours), args.dry_run)
+    _emit(with_regime_banner(store, render_morning_brief(store, now_kst(),
+                                                         hours=hours)),
+          args.dry_run)
     return EXIT_OK
 
 
@@ -1080,9 +1086,9 @@ def mode_brief_evening(store: Store, args) -> int:
             SUMMARY["send_filter"] = {"d": d0, "targets": len(picks),
                                       "line": line}
 
-    _emit(render_evening_brief(store, now_kst(), picks=picks,
-                               hours=args.news_hours, foot_lines=foot),
-          args.dry_run)
+    _emit(with_regime_banner(store, render_evening_brief(
+        store, now_kst(), picks=picks, hours=args.news_hours,
+        foot_lines=foot)), args.dry_run)
     SUMMARY.update({"news_hours": args.news_hours,
                     "picks": 0 if picks is None else len(picks)})
     # 텍스트 **뒤에** 관심종목 차트 앨범 1개. 텍스트는 이미 나갔으므로
@@ -2151,6 +2157,30 @@ def mode_reco_events_backfill(store: Store, args) -> int:
              out["elapsed_sec"])
     _say(f"reco_events 소급 완료: 창 {out['window']}거래일 · recos "
          f"{out['recos']}행 · 이벤트 {out['events']}건 · {out['elapsed_sec']}초")
+def mode_regime_backfill(store: Store, args) -> int:
+    """[C] 국면 소급 — 달력 전 기간. 1회성, nightly 밖.
+
+    '실시간' 행(daily 단계가 그날 밤 기록한 것)은 관측값을 유지하고 확정
+    국면(label·pending)만 전 기간 기준으로 다시 쓴다. 다시 돌려도 같은
+    결과다(멱등).
+    """
+    from stocknews.regime import backfill, periods, regime_rows, transitions
+    res = backfill(store, start=args.regime_index_start,
+                   cache_dir=args.regime_index_cache)
+    if not res.get("ok"):
+        log.error("국면 소급 불가: %s", res.get("reason"))
+        SUMMARY.update(res)
+        return EXIT_PRECOND
+    df = regime_rows(store)
+    tr = transitions(df)
+    SUMMARY.update({k: v for k, v in res.items()})
+    SUMMARY["transitions"] = tr
+    SUMMARY["periods"] = periods(df)
+    _say(f"국면 소급 {res['rows']}행 · 실시간 유지 {res['kept_live']}행 · "
+         f"추천 스냅샷 {res['reco_rows']}행 · {res['elapsed_sec']}초")
+    _say(f"국면별 거래일 {res['counts']}")
+    for t in tr:
+        _say(f"  {t['d']}  {t['from'] or '-'} -> {t['to']}")
     return EXIT_OK
 
 
@@ -2184,6 +2214,7 @@ MODES = {
     "fill": mode_fill,
     "pos-close": mode_pos_close,
     "reco-events-backfill": mode_reco_events_backfill,
+    "regime-backfill": mode_regime_backfill,
 }
 
 
@@ -2298,6 +2329,11 @@ def main(argv=None) -> int:
                     help="휴장일 가드와 중복 실행 가드를 무시하고 실행")
     ap.add_argument("--no-auto-window", action="store_true",
                     help="brief-morning 의 뉴스 창 자동 확장을 끔")
+    # ── [C] 국면 소급 ──
+    ap.add_argument("--regime-index-start", default="2024-01-01",
+                    help="regime-backfill: 지수 히스토리 시작일 (MA200 에 200봉 필요)")
+    ap.add_argument("--regime-index-cache", default="data/index_cache",
+                    help="regime-backfill: 지수 히스토리 CSV 캐시 폴더")
     # ── KRX 신용잔고 자동 수집 ──
     ap.add_argument("--bld", help="credit/credit-probe: KRX bld 코드 직접 지정")
     ap.add_argument("--no-krx", action="store_true",

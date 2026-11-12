@@ -387,6 +387,7 @@ DB 를 쓰는 모드는 파일 락으로 직렬화됩니다. 겹치면 `exit 3` 
            holidays (분기 1회 수동 · nightly 밖)
            reco-events-backfill (1회성 · nightly 밖 · RECO_COOLDOWN_DAYS 켜기 전,
                                  지시가 있을 때만. recos 는 읽기만 한다)
+           regime-backfill (국면 소급 · 1회성 수동 · nightly 밖)
 읽기 모드: weekly fib export pos-list brief-weekly runs
            backtest credit-probe kiwoom-plan          (락 없음)
 ```

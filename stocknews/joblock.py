@@ -69,6 +69,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "pos-close": 120,
     # [B] reco_events 소급 구성 (1회성). recos 수백 행 — 수 초.
     "reco-events-backfill": 300,
+    # [C] 국면 소급. 1회성. 지수 조회 + 전 기간 시세 1회 읽기.
+    "regime-backfill": 900,
 }
 DEFAULT_TIMEOUT = 900
 

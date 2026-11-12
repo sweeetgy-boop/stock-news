@@ -72,6 +72,46 @@ CREATE INDEX IF NOT EXISTS ix_reco_filter_log_reason ON reco_filter_log(reason);
 
 # ── [C] 국면 라벨 ──
 # (C 구역 시작)
+# market_regime : 거래일별 국면. 정의·전환 규칙은 stocknews/regime.py.
+#   label      확정 국면(상승/중립/하락). NULL = 판정 불가(null_reason) 또는
+#              확정 전(첫 5거래일 연속 충족 전).
+#   raw_label  그날 조건만으로 본 국면(5일 확인 전). NULL = 판정 불가.
+#   pending_*  전환 대기 중인 새 조건과 연속 일수.
+#   fresh      지수 마지막 날짜 = 기준일. 0 이면 지수 칸·label 은 NULL.
+#   kind       '소급'(regime-backfill) / '실시간'(daily 단계).
+# reco_regime : 추천 시점 국면 스냅샷. recos 테이블은 컬럼 하나도 건드리지
+#   않는다(기존 smoke 'recos 스키마 불변' 이 정확한 컬럼 목록을 강제한다).
+#   (d, rank) 로 recos 와 1:1 조인.
+DDL_C = """
+CREATE TABLE IF NOT EXISTS market_regime (
+  d               TEXT PRIMARY KEY,
+  label           TEXT,
+  raw_label       TEXT,
+  pending_label   TEXT,
+  pending_days    INTEGER,
+  kospi_close     REAL,
+  kospi_ma200     REAL,
+  ma200_gap_pct   REAL,
+  kospi_ret_20d   REAL,
+  above_ma60_pct  REAL,
+  n_ma60_universe INTEGER,
+  fresh           INTEGER NOT NULL DEFAULT 0,
+  null_reason     TEXT,
+  kind            TEXT,
+  calc_version    INTEGER,
+  created         TEXT
+);
+CREATE TABLE IF NOT EXISTS reco_regime (
+  d       TEXT NOT NULL,
+  rank    INTEGER NOT NULL,
+  ticker  TEXT,
+  regime  TEXT,
+  kind    TEXT,
+  created TEXT,
+  PRIMARY KEY (d, rank)
+);
+"""
+MIGRATIONS_C = ()
 # (C 구역 끝)
 
 

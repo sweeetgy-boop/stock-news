@@ -377,10 +377,17 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     # 섹터 지표는 market_context 뒤에 둔다. 코스피 수익률을 그 기록에서
     # 가져다 쓰므로, 순서가 바뀌면 같은 날 지수를 두 번 조회한다.
     sec = collect_sector_metrics(store, trade_date, cfg=cfg)
+    # [C] 국면 기록 — 플래그와 무관하게 항상. 추천 저장 뒤라 그날 recos 의
+    # 국면 스냅샷(reco_regime)도 같이 남긴다. 실패를 삼킨다(기록 전용).
+    # 지수는 market_context 와 별개로 다시 받는다 — 신선도는 regime 이
+    # 그날 행 유무로 독립 판정한다.
+    from .regime import record_daily
+    reg = record_daily(store, trade_date,
+                       fetch=lambda name, bars: load_index(name, bars=bars))
 
     store.log_run("daily", started, len(results), len(errors),
                   note=f"snapshot={saved}, picks={len(picks)}")
 
     return {"trade_date": trade_date, "results": results, "errors": errors,
             "picks": picks, "snapshot_rows": saved,
-            "market_context": mkt, "sector_metrics": sec}
+            "market_context": mkt, "sector_metrics": sec, "regime": reg}
