@@ -320,6 +320,11 @@ def _run_note(rc: int) -> str:
         v = SUMMARY.get(k)
         if v not in (None, "", False):
             bits.append(f"{k}={str(v)[:80]}")
+    # [G] 수집 회차면 소스별 건수 (news_health 가 이 칸으로 연속 0건을 센다)
+    ns = SUMMARY.get("news_sources")
+    if isinstance(ns, dict):
+        from stocknews.news_health import NOTE_KEY, format_counts
+        bits.append(f"{NOTE_KEY}={format_counts(ns)}")
     return " ".join(bits)
 
 
@@ -1088,17 +1093,55 @@ def mode_flash(store: Store, args) -> int:
     return EXIT_OK
 
 
+def _collect_news(store: Store, args) -> dict:
+    """[G] 수집 + 정리. 소스별 건수를 SUMMARY["news_sources"] 에 남긴다.
+
+    runs 기록은 main() 이 `_run_note` 로 싣는다(모드 안에서 log_run 금지).
+    이어서 평일 연속 0건 판정 — 상태가 바뀐 소스만 관리자 채팅에 한 번.
+    """
+    from stocknews import news_health
+    from stocknews import news_sources as _ns
+    counts: dict = {}
+    raw = collect_all(use_naver=not args.no_naver,
+                      use_google=not args.no_google,
+                      use_yahoo=not args.no_yahoo,
+                      use_dart=not args.no_dart,
+                      counts=counts)
+    res = process_and_store(store, raw)
+    SUMMARY["news_sources"] = dict(counts)
+    if _ns.LAST_WARN:
+        SUMMARY["news_source_warn"] = dict(_ns.LAST_WARN)
+    alert = news_health.check_and_alert(store, counts,
+                                        dry_run=bool(args.dry_run),
+                                        now=now_kst(),
+                                        warns=dict(_ns.LAST_WARN))
+    if alert:
+        SUMMARY["news_source_alert"] = alert
+    return res
+
+
+def _news_source_line(store: Store, args, hours) -> str:
+    """[G] 브리핑 맨 아래 '뉴스 소스 n개 중 m개 수집' (정의: news_health.source_line)."""
+    from stocknews import news_health
+    from stocknews import news_sources as _ns
+    enabled = _ns.enabled_sources(not getattr(args, "no_naver", False),
+                                  not getattr(args, "no_google", False),
+                                  not getattr(args, "no_yahoo", False),
+                                  not getattr(args, "no_dart", False))
+    line, info = news_health.source_line(store, enabled, hours,
+                                         current=SUMMARY.get("news_sources"),
+                                         now=now_kst())
+    SUMMARY["news_source_line"] = {**info, "line": line}
+    return line
+
+
 def mode_news(store: Store, args) -> int:
     """뉴스 수집 + 정리만 수행 (발송 없음).
 
     브리핑 전에 먼저 돌려두는 배치다. 수집과 발송을 분리한 이유는
     한 소스가 느려도 브리핑 시각이 밀리지 않게 하기 위함이다.
     """
-    raw = collect_all(use_naver=not args.no_naver,
-                      use_google=not args.no_google,
-                      use_yahoo=not args.no_yahoo,
-                      use_dart=not args.no_dart)
-    res = process_and_store(store, raw)
+    res = _collect_news(store, args)
     log.info("뉴스 정리 완료: 수집 %d → 저장 %d · 종목링크 %d",
              res["collected"], res["stored"], res["links"])
     SUMMARY.update({"collected": res["collected"], "stored": res["stored"],
@@ -1113,11 +1156,7 @@ def mode_news(store: Store, args) -> int:
 def mode_brief_morning(store: Store, args) -> int:
     """아침 브리핑. 개장 전 밤사이 해외 + 매크로 + 내 종목."""
     if not args.no_collect:
-        raw = collect_all(use_naver=not args.no_naver,
-                          use_google=not args.no_google,
-                          use_yahoo=not args.no_yahoo,
-                          use_dart=not args.no_dart)
-        process_and_store(store, raw)
+        _collect_news(store, args)
     # 월요일이나 연휴 뒤에는 '최근 16시간'만 보면 주말 뉴스를 통째로
     # 놓친다. 마지막 거래일 마감 이후 전부를 덮도록 자동 확장한다.
     hours = args.news_hours
@@ -1127,9 +1166,10 @@ def mode_brief_morning(store: Store, args) -> int:
             log.info("뉴스 창 확장 %d → %d시간 (마지막 거래일 %s)",
                      args.news_hours, hours, store.last_price_date())
     SUMMARY["news_hours"] = hours
-    _emit(with_regime_banner(store, render_morning_brief(store, now_kst(),
-                                                         hours=hours)),
-          args.dry_run)
+    from stocknews.news_health import append_line
+    text = append_line(render_morning_brief(store, now_kst(), hours=hours),
+                       _news_source_line(store, args, hours))
+    _emit(with_regime_banner(store, text), args.dry_run)
     _news_v2_summary()
     return EXIT_OK
 
@@ -1144,11 +1184,7 @@ def _news_v2_summary() -> None:
 def mode_brief_evening(store: Store, args) -> int:
     """저녁 뉴스 정리. 오늘 추천 10선과 교차해서 보여준다."""
     if not args.no_collect:
-        raw = collect_all(use_naver=not args.no_naver,
-                          use_google=not args.no_google,
-                          use_yahoo=not args.no_yahoo,
-                          use_dart=not args.no_dart)
-        process_and_store(store, raw)
+        _collect_news(store, args)
 
     if _cfg.PAPER_TRACKING or _cfg.DAILY_LIST_V2:
         return _brief_evening_v2(store, args)
@@ -1172,9 +1208,11 @@ def mode_brief_evening(store: Store, args) -> int:
             SUMMARY["send_filter"] = {"d": d0, "targets": len(picks),
                                       "line": line}
 
-    _emit(with_regime_banner(store, render_evening_brief(
+    from stocknews.news_health import append_line
+    text = append_line(render_evening_brief(
         store, now_kst(), picks=picks, hours=args.news_hours,
-        foot_lines=foot)), args.dry_run)
+        foot_lines=foot), _news_source_line(store, args, args.news_hours))
+    _emit(with_regime_banner(store, text), args.dry_run)
     SUMMARY.update({"news_hours": args.news_hours,
                     "picks": 0 if picks is None else len(picks)})
     _news_v2_summary()
@@ -1266,6 +1304,10 @@ def _brief_evening_v2(store, args) -> int:
         text = render_evening_brief(store, asof, picks=None,
                                     hours=args.news_hours, stock_block=block,
                                     watchlist=show_watch)
+    # [G] 맨 아래 '뉴스 소스 n개 중 m개 수집' 한 줄(사용자 지시 추가). ③ 축소
+    # 예산에는 넣지 않는다 — 넣으면 경계 근처에서 ③ 내용이 바뀐다.
+    from stocknews.news_health import append_line
+    text = append_line(text, _news_source_line(store, args, args.news_hours))
     SUMMARY.update({"picks": info.get("rows", 0),
                     "new_recos": info.get("new_tickers", []),
                     "stale_recos": info.get("stale"),
