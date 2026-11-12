@@ -1091,6 +1091,71 @@ BRIEF_MAX_LATE_HOURS = 3
 # ── [K] 성능 ──
 # (K 구역 시작)
 # (K 구역 끝)
+
+# ── [L] 운영 플래그 .env 오버라이드 ──
+# (L 구역 시작)
+# 위 v2 플래그의 **기본값은 이 파일이 정본**이고 전부 OFF 다. 운영에서만
+# 켜려면 운영 저장소의 `.env` 에 같은 이름의 키를 적는다. 코드·브랜치를
+# 운영별로 갈라 쓰지 않으려는 것이다(개발 클론 .env 에는 없으므로 OFF).
+#   bool : 1/true/yes/on -> 켬, 0/false/no/off -> 끔 (대소문자 무시)
+#   int  : 0 이상의 정수
+# 그 밖의 값은 무시하고(기본값 유지) 보고에 남긴다 — 오타 하나로 플래그가
+# 엉뚱하게 켜지지 않게. `stocknews.env.load_env` 가 .env 적용 직후 부른다.
+# 끄려면 .env 에서 그 줄을 지우거나 0 으로 둔다.
+ENV_OVERRIDE_FLAGS: dict[str, type] = {
+    "RECO_COOLDOWN_DAYS": int,
+    "EXCLUDE_SEQ_FROM_SEND": bool,
+    "EXCLUDE_FILL_FROM_SEND": bool,
+    "REGIME_BANNER": bool,
+    "REGIME_TREND_CUT": bool,
+    "PAPER_TRACKING": bool,
+    "DAILY_LIST_V2": bool,
+    "RISK_INFO": bool,
+    "NEWS_V2": bool,
+    "INDICATOR_LOG": bool,
+}
+_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_ENV_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def apply_env_flags(environ=None) -> dict:
+    """환경변수에 있는 플래그만 이 모듈의 값을 덮는다.
+
+    없는 키는 건드리지 않는다(기본값 유지). 반환:
+    {"applied": {이름: 값}, "invalid": {이름: 원문}}
+    """
+    import os
+    import sys
+    env = os.environ if environ is None else environ
+    mod = sys.modules[__name__]
+    out: dict = {"applied": {}, "invalid": {}}
+    for name, typ in ENV_OVERRIDE_FLAGS.items():
+        raw = env.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        s = str(raw).strip()
+        if typ is bool:
+            low = s.lower()
+            if low in _ENV_TRUE:
+                val = True
+            elif low in _ENV_FALSE:
+                val = False
+            else:
+                out["invalid"][name] = s
+                continue
+        else:
+            try:
+                val = int(s)
+            except ValueError:
+                out["invalid"][name] = s
+                continue
+            if val < 0:
+                out["invalid"][name] = s
+                continue
+        setattr(mod, name, val)
+        out["applied"][name] = val
+    return out
+# (L 구역 끝)
 # ══════════════════════════ v2 끝 ══════════════════════════
 
 

@@ -57,6 +57,17 @@ KNOWN_KEYS: tuple[str, ...] = (
     "KIWOOM_REST_PER_HOUR",
     "KIWOOM_OPENAPI_DIR",
     "TZ",
+    # v2 운영 플래그 (config.py [L] 구역 ENV_OVERRIDE_FLAGS 와 같은 목록)
+    "RECO_COOLDOWN_DAYS",
+    "EXCLUDE_SEQ_FROM_SEND",
+    "EXCLUDE_FILL_FROM_SEND",
+    "REGIME_BANNER",
+    "REGIME_TREND_CUT",
+    "PAPER_TRACKING",
+    "DAILY_LIST_V2",
+    "RISK_INFO",
+    "NEWS_V2",
+    "INDICATOR_LOG",
 )
 
 # 값을 절대 출력하면 안 되는 키. 부분 마스킹조차 하지 않는다.
@@ -162,6 +173,15 @@ def load_env(path: str | Path | None = None, override: bool = False) -> dict:
     if rep["applied"]:
         log.debug(".env 적용 %d키: %s", len(rep["applied"]),
                   ", ".join(sorted(rep["applied"])))
+    # v2 플래그 오버라이드 (config.py [L] 구역). 플래그 값은 비밀이 아니므로
+    # 보고에 그대로 싣는다 — 운영 로그에서 '지금 무엇이 켜져 있나'가 보이게.
+    from . import config as _cfg
+    fl = _cfg.apply_env_flags(os.environ)
+    rep["flags"] = fl["applied"]
+    if fl["invalid"]:
+        rep["flags_invalid"] = sorted(fl["invalid"])
+        log.warning(".env 플래그 값 무시(형식 오류, 기본값 유지): %s",
+                    ", ".join(sorted(fl["invalid"])))
     return rep
 
 
