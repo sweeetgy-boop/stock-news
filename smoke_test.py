@@ -3216,6 +3216,10 @@ def test_market_source(tmp: Path):
             spec.loader.exec_module(mod)
         finally:
             sys.modules.pop(spec.name, None)
+        # 보충 실행 관리자 알림은 실제 시계로 catch-up 이 되면 나간다.
+        # 여기 검사들은 _notify 만 갈아 끼우므로 네트워크를 막아 둔다
+        # (관리자 알림 자체는 smoke_ext/s91_catchup.py 가 검사한다).
+        mod._notify_admin = lambda *a, **k: None
         return mod
 
     def t_nightly_counts_outage_as_failure():
@@ -3490,8 +3494,13 @@ def test_market_source(tmp: Path):
         """스냅샷이 검증되면 요청 1회로 적재된다."""
         s_snap, s_close = uni.market_snapshot, uni.close_on
         import stocknews.data as d
+        import datetime as _dt
         d_saved = d.close_on
+        s_now = uni._now_kst
         try:
+            # 장중(09:00~15:40)에는 지난 날짜 스냅샷 경로를 쓰지 않는다.
+            # 실제 시계면 smoke 를 장중에 돌릴 때 결과가 바뀐다.
+            uni._now_kst = lambda: _dt.datetime(2026, 8, 19, 21, 30)
             uni.market_snapshot = lambda: (_snap(1000.0), _pd.DataFrame())
             uni.close_on = lambda t, td: 1000.0
             d.close_on = lambda t, td: 1000.0
@@ -3502,6 +3511,7 @@ def test_market_source(tmp: Path):
         finally:
             uni.market_snapshot, uni.close_on = s_snap, s_close
             d.close_on = d_saved
+            uni._now_kst = s_now
 
     def t_weekend_short_circuits():
         """주말은 네트워크를 쓰지 않고 생략한다."""
