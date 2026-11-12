@@ -400,7 +400,7 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     out = {"trade_date": trade_date, "results": results, "errors": errors,
            "picks": picks, "snapshot_rows": saved,
            "market_context": mkt, "sector_metrics": sec,
-           "regime": reg}
+           "regime": reg, "indicator_log": ind}
     if risk_rep is not None:
         out["risk_metrics"] = risk_rep
     return out
@@ -417,8 +417,3 @@ def _record_risk(store, trade_date: str) -> dict | None:
         log.warning("risk_metrics 기록 실패 (스캔·추천은 기록됨): %s", exc)
         return {"d": trade_date, "written": 0,
                 "error": f"{type(exc).__name__}: {exc}"[:200]}
-
-    return {"trade_date": trade_date, "results": results, "errors": errors,
-            "picks": picks, "snapshot_rows": saved,
-            "market_context": mkt, "sector_metrics": sec,
-            "indicator_log": ind}

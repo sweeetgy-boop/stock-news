@@ -75,3 +75,19 @@ def run(check, near, tmp):
             r = P.backfill(st, sent_dates={}, allow_network=False)
             assert r.get("window") == 20 and "warning" not in r, r
     check(S, "[D] paper --backfill: 창 0 이면 경고 · 창 20 이면 경고 없음", backfill_warn)
+
+
+    def run_daily_keys():
+        # H 병합에서 run_daily 반환의 indicator_log 키가 빠지고 H 의 return 이
+        # _record_risk 아래 죽은 코드로 남았다. 반환 키와 죽은 코드를 고정한다.
+        import ast
+        import inspect
+        from stocknews import daily as D
+        src = inspect.getsource(D.run_daily)
+        for k in ('"regime": reg', '"indicator_log": ind', 'out["risk_metrics"]'):
+            assert k in src, f"run_daily 반환에 {k} 없음"
+        tree = ast.parse(inspect.getsource(D._record_risk))
+        body = tree.body[0].body
+        assert isinstance(body[-1], ast.Try), "_record_risk 끝에 죽은 코드"
+    check(S, "[C+E+H] run_daily 반환 = regime·indicator_log·risk_metrics · 죽은 코드 없음",
+          run_daily_keys)
