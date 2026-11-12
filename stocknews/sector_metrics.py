@@ -397,7 +397,9 @@ def _kospi_returns(store, trade_date: str) -> tuple[float | None, float | None]:
 
     from .daily import market_context as _mc
     from .data import load_index
-    ks = load_index("KOSPI", bars=60)
+    # 기준일 값이 없는 지수(신선하지 않음)는 None 을 받는다 — 지난 날의
+    # 값으로 RS 를 계산하지 않는다 (v2-A).
+    ks = load_index("KOSPI", bars=60, asof=trade_date)
     ctx = _mc(ks, None, trade_date)
     if ctx is None:
         return None, None

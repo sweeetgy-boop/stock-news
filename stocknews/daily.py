@@ -29,7 +29,7 @@ import pandas as pd
 
 from .config import Config, DEFAULT
 from .contracts import ScreenResult
-from .data import load_index
+from .data import index_is_fresh, index_last_date, load_index
 from .indicators import evaluate_obv
 from .screener import check_exclusion, rank_results, screen_one
 from .sector_metrics import collect_sector_metrics
@@ -317,6 +317,21 @@ def collect_market_context(store, trade_date: str, bars: int = 300,
         get = fetch or (lambda name, n: load_index(name, bars=n))
         kospi = get("KOSPI", bars)
         kosdaq = get("KOSDAQ", bars)
+        # 신선도 가드(v2-A): 기준일 값이 없는 지수로 기록하지 않는다.
+        # 기준일 이하로 자른 '마지막 값'은 지난 날의 값일 수 있다 —
+        # 2026-09-17~10-13 에 KOSPI 6,724.34 가 15거래일 고정 기록됐다.
+        if kospi is not None and len(kospi) and \
+                not index_is_fresh(kospi, trade_date):
+            log.warning("지수가 기준일과 다릅니다 KOSPI: 마지막 %s ≠ 기준일 %s "
+                        "— 시장 상태 미기록",
+                        index_last_date(kospi, trade_date), trade_date)
+            return None
+        if kosdaq is not None and len(kosdaq) and \
+                not index_is_fresh(kosdaq, trade_date):
+            log.warning("지수가 기준일과 다릅니다 KOSDAQ: 마지막 %s ≠ 기준일 %s "
+                        "— 코스닥 칸만 비우고 기록",
+                        index_last_date(kosdaq, trade_date), trade_date)
+            kosdaq = None
         row = market_context(kospi, kosdaq, trade_date)
         if row is None:
             log.warning("시장 상태 계산 불가 (KOSPI 종가 없음) — %s 생략",
