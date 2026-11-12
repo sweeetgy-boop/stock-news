@@ -23,7 +23,7 @@
 
 종료 코드
 --------
-  0   정상 (휴장일 스킵, '오늘 이미 실행' 스킵도 0)
+  0   정상 (휴장일 스킵, '이미 실행' 스킵, 브리핑 지연 건너뜀도 0)
   1   파이프라인 자체 실패 (락 획득 실패는 0 이 아니라 3)
   2   부분 실패 — 한 단계 이상 실패했으나 완주함, 또는 이 드라이버의
       완료·스킵 알림 발송이 실패함 (마커 reason 에 '알림 실패')
@@ -55,6 +55,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
+from stocknews.catchup import brief_max_late_sec, is_intraday  # noqa: E402
 from stocknews.config import DEFAULT                       # noqa: E402
 from stocknews.env import load_env                          # noqa: E402
 from stocknews.joblock import JobLock                      # noqa: E402
@@ -121,6 +122,8 @@ FLASH_EXTRA_ARGS: tuple[str, ...] = ()
 # 없어서 부분 적재를 남긴다(그날 09-02/03/04 가 이렇게 망가졌다). 그래서
 # '오늘 완주했다'를 파일로 남기고 다음 기동을 스킵한다. 다시 돌리려면
 # --force 를 준다.
+#
+# 날짜는 실행일이 아니라 회차(cron 슬롯) 날짜다 — run_slot() 참조.
 DONE_MARKER = "data/nightly_done.json"
 
 # 완주 마커 reason 꼬리표. 이 드라이버의 완료·스킵 알림이 실패하면 붙는다.
@@ -140,6 +143,11 @@ CATCH_UP_SLACK_SEC = 300
 NET_PROBE_URL = "https://api.telegram.org"
 NET_WAIT_SEC = 10
 NET_WAIT_TRIES = 6
+
+# 밀린 회차를 날짜가 바뀐 뒤 돌릴 때 `--asof <회차 날짜>` 를 받는 단계.
+# 둘 다 '오늘'로 휴장을 판정한다(run_screen._closed_guard). 금요일 회차를
+# 토요일에 돌리면 오늘 기준으로는 휴장이라 스캔·청산 판정이 통째로 빠진다.
+ASOF_STEPS = frozenset({"daily", "exits"})
 
 
 @dataclass
@@ -234,6 +242,9 @@ class Job:
     cron: str = ""
     # 휴장인 발송 요일에 전체 스킵 대신 돌 단계. 비어 있으면 휴장 = 스킵.
     send_day_steps: tuple[Step, ...] = ()
+    # 예정 시각보다 이만큼(초) 넘게 늦으면 돌지 않고 '건너뜀'. 0 = 제한 없음.
+    # 브리핑 전용이다 — 새벽 2시 반에 '저녁 브리핑'이 나가면 안 된다.
+    max_late_sec: float = 0.0
 
     @property
     def marker_path(self) -> str:
@@ -257,13 +268,15 @@ JOBS: dict[str, Job] = {
     "brief-morning": Job("brief-morning", "아침 브리핑", "\U0001f305",
                          _one("brief-morning",
                               ["--mode", "brief-morning", "--no-collect"]),
-                         cron="20 6 * * 1-5"),
+                         cron="20 6 * * 1-5",
+                         max_late_sec=brief_max_late_sec()),
     # 23:00. 2026-09-16 에 22:30 에서 옮겼다. nightly(21:30)의 최악 경로
     # — 이틀치 재적재 + 종목별 폴백 — 가 한 시간을 넘기면 22:30 의 저녁
     # 브리핑이 daily 가 쥔 DB 락에 막혀 rc=3 으로 비킨다. 30분을 더 준다.
     "brief-evening": Job("brief-evening", "저녁 브리핑", "\U0001f303",
                          _one("brief-evening", ["--mode", "brief-evening"]),
-                         cron="0 23 * * 1-5"),
+                         cron="0 23 * * 1-5",
+                         max_late_sec=brief_max_late_sec()),
     "weekly": Job("weekly", "주간 리포트", "\U0001f4c8",
                   _one("weekly", ["--mode", "weekly"]), cron="45 22 * * 5"),
     # 장중 5분 간격. 마커도 완료 알림도 없다.
@@ -418,6 +431,36 @@ def lateness_seconds(job: Job, now: datetime) -> float | None:
     """직전 예정 시각에서 몇 초 늦게 떴나. 예정 시각을 모르면 None."""
     slot = last_slot(job.cron, now) if job.cron else None
     return None if slot is None else (now - slot).total_seconds()
+
+
+def run_slot(job: Job, started: datetime) -> tuple[datetime, float | None, bool]:
+    """이 기동이 맡은 회차. (회차 시각, 지연 초, catch-up 여부).
+
+    catch-up(지연 > CATCH_UP_SLACK_SEC)이면 cron 의 직전 예정 시각이 회차다.
+    아니면 started 그대로 — 제시간 실행은 예전과 같은 날짜를 쓴다.
+
+    왜 필요한가: 2026-11-11 21:30 회차가 누락돼 11-12 13:32 에 catch-up 으로
+    떴는데 마커가 실행일(11-12)로 박혀, 그날 밤 21:30 정시 회차가 '오늘 이미
+    실행'으로 스킵됐다(09-13 에도 같은 사고). 마커·휴장 판정은 '언제
+    돌았나'가 아니라 '어느 회차를 처리했나'를 적어야 한다.
+    """
+    late = lateness_seconds(job, started)
+    if late is not None and late > CATCH_UP_SLACK_SEC:
+        return started - timedelta(seconds=late), late, True
+    return started, late, False
+
+
+def catch_up_job(job: Job, day: str) -> Job:
+    """밀린 회차용 사본. daily·exits 에 `--asof <회차 날짜>` 를 붙인다."""
+    steps = tuple(replace(s, args=[*s.args, "--asof", day])
+                  if s.name in ASOF_STEPS and "--asof" not in s.args else s
+                  for s in job.steps)
+    return replace(job, steps=steps)
+
+
+def too_late(job: Job, late: float | None) -> bool:
+    """브리핑이 지연 상한을 넘겼나."""
+    return bool(job.max_late_sec) and late is not None and late > job.max_late_sec
 
 
 def _fmt_late(sec: float) -> str:
@@ -715,6 +758,39 @@ def _notify(text: str, log: Log, enabled: bool,
         return False
 
 
+def _notify_admin(text: str, log: Log, enabled: bool) -> bool | None:
+    """관리자 채팅(TELEGRAM_CHAT_ID 첫 수신자)에만 한 줄. 결과로 rc 를 바꾸지 않는다.
+
+    보충 실행 같은 운영 신호용이다(전 수신자에게 보낼 이야기가 아니다).
+    """
+    if not enabled:
+        log(f"관리자 알림 생략 (--no-telegram) — {text}")
+        return None
+    try:
+        from stocknews.notify import TelegramNotConfigured, send_admin
+        try:
+            rep = send_admin(text)
+        except TelegramNotConfigured:
+            log("관리자 알림 생략 — TELEGRAM_BOT_TOKEN / CHAT_ID 미설정")
+            return None
+        if rep:
+            log(f"관리자 알림 발송 완료 — {text}")
+            return True
+        log("관리자 알림 " + rep.summary())
+        return False
+    except Exception as exc:                      # noqa: BLE001
+        log(f"관리자 알림 오류: {type(exc).__name__}: {_redact(str(exc))}")
+        return False
+
+
+def catch_up_line(job: Job, slot: datetime, late: float, started: datetime,
+                  intraday: bool) -> str:
+    """보충 실행 알림 한 줄."""
+    return (f"{job.emoji} {job.label} 보충 실행 · {slot:%m-%d %H:%M} 회차를 "
+            f"{_fmt_late(late)} 늦게 시작 ({started:%m-%d %H:%M})"
+            + (" · 장중이라 당일분은 건드리지 않음" if intraday else ""))
+
+
 def _summary(job: Job, started: datetime, finished: datetime,
              results: list[dict], dry: bool) -> str:
     """텔레그램 한 줄 요약."""
@@ -847,7 +923,13 @@ def main(argv: list[str] | None = None) -> int:
     log(f"락 획득 {lock.path} (만료 {LOCK_TIMEOUT_SEC // 3600}시간)")
 
     rc_final = 0
-    day = f"{started:%Y-%m-%d}"
+    # 회차 = cron 슬롯. catch-up 이면 실행일이 아니라 예정 회차 날짜다.
+    # 마커·휴장 판정·daily/exits 의 --asof 가 전부 이 날짜를 쓴다.
+    # --check-date(테스트용)는 휴장 판정 날짜만 바꾼다 — 마커와 catch-up
+    # 처리(브리핑 지연 건너뜀·보충 알림·--asof)는 실제 시계 기준이다.
+    slot_at, late, catch_up = run_slot(job, started)
+    day = f"{slot_at:%Y-%m-%d}"
+    real_catch_up = catch_up and not args.check_date
     marker = REPO / (args.done_marker or job.marker_path)
     wait_note = ""
 
@@ -856,14 +938,26 @@ def main(argv: list[str] | None = None) -> int:
         return f"{text}\n{wait_note}" if wait_note else text
 
     try:
+        # ── 브리핑이 너무 늦었으면 보내지 않는다 ──
+        # 23:00 저녁 브리핑이 새벽 2시 반에, 06:20 아침 브리핑이 장중에
+        # 나가면 그건 브리핑이 아니다. 마커는 그 회차 날짜로 남긴다 —
+        # 같은 날 다른 회차(다음 정시)를 막지 않고, 같은 회차의 재기동만
+        # 막는다. 이미 그 회차를 끝냈으면 마커를 덮어쓰지 않는다.
+        if real_catch_up and too_late(job, late):
+            log(f"{job.label} 건너뜀 — 예정 {slot_at:%m-%d %H:%M} 보다 "
+                f"{_fmt_late(late)} 늦음 (상한 {_fmt_late(job.max_late_sec)}) "
+                "· 발송하지 않음")
+            if job.once_per_day and _read_done(marker).get("date") != day:
+                _mark_done(marker, day, 0, f"건너뜀(지연 {_fmt_late(late)})")
+            log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit 0")
+            return 0
+
         # ── catch-up 이면 네트워크부터 ──
         # 절전·종료로 밀린 회차는 PC 가 깨어난 직후에 뜬다. 그때는 망이
         # 아직 없을 수 있다(09-08 DNS, 09-13 Wi-Fi 전환). 마커 확인보다
         # 앞에 두는 이유는 '이미 실행' 스킵도 알림을 보내기 때문이다.
-        late = lateness_seconds(job, started)
-        if late is not None and late > CATCH_UP_SLACK_SEC:
-            slot = started - timedelta(seconds=late)
-            log(f"catch-up 실행 — 예정 {slot:%m-%d %H:%M} 보다 "
+        if catch_up:
+            log(f"catch-up 실행 — 예정 {slot_at:%m-%d %H:%M} 보다 "
                 f"{_fmt_late(late)} 늦음 · 네트워크 확인")
             waited, net_ok = wait_for_network(log)
             if waited:
@@ -881,7 +975,7 @@ def main(argv: list[str] | None = None) -> int:
         # 두 번 나가면 그건 사람에게 그대로 보인다.
         done = _read_done(marker) if job.once_per_day else {}
         if done.get("date") == day and not args.force:
-            log(f"오늘({day}) 이미 실행 — 스킵 "
+            log(f"{'오늘' if not catch_up else '회차'}({day}) 이미 실행 — 스킵 "
                 f"(완료 {done.get('finished')} · exit {done.get('exit')} "
                 f"· {done.get('reason')})")
             log("다시 돌리려면 --force")
@@ -891,9 +985,10 @@ def main(argv: list[str] | None = None) -> int:
             # '이미 완주'라고 쓰지 않는다. reason 이 '부분 완료'·'부분 실패'
             # 일 수 있다.
             # 마커는 이미 있으므로 다시 쓰지 않는다. 알림 실패는 exit 2 로만 남긴다.
+            what = "오늘" if not catch_up else f"{slot_at:%m/%d %H:%M} 회차"
             sent = _notify(noted(f"{job.emoji} {job.label} 스킵 "
                                  f"{started:%m/%d %H:%M} | "
-                                 f"오늘 이미 실행({done.get('reason')})"),
+                                 f"{what} 이미 실행({done.get('reason')})"),
                            log, notify_on and not job.quiet_ok,
                            why="--no-telegram" if not notify_on else "quiet_ok 잡")
             rc = 2 if sent is False else 0
@@ -901,7 +996,8 @@ def main(argv: list[str] | None = None) -> int:
             return rc
 
         # ── 휴장일 판정 ──
-        when = args.check_date or started
+        when = args.check_date or slot_at
+        store = None
         try:
             store = Store(args.db)
             status = market_status(store, when)
@@ -935,6 +1031,20 @@ def main(argv: list[str] | None = None) -> int:
                 _mark_done(marker, day, rc, _with_alert(f"휴장({status})", sent))
             log(f"{job.name} 종료 {now_kst():%H:%M:%S} · exit {rc}")
             return rc
+
+        # ── 밀린 회차 ──
+        # 날짜가 바뀐 뒤 도는 회차는 daily·exits 가 '오늘'이 아니라 회차
+        # 날짜로 휴장을 판정해야 한다. 장중이면 update 는 당일분을 묻지
+        # 않고(fetch_day PENDING), daily 의 기준일은 last_price_date(직전
+        # 거래일)가 된다. 관리자 채팅에만 한 줄 남긴다.
+        if real_catch_up:
+            if not send_day and day != f"{started:%Y-%m-%d}":
+                job = catch_up_job(job, day)
+                log(f"밀린 회차 — daily·exits 에 --asof {day}")
+            if job.name == "nightly":
+                intraday = is_intraday(started, store)
+                _notify_admin(catch_up_line(job, slot_at, late, started,
+                                            intraday), log, notify_on)
 
         # ── 단계 실행 ──
         results: list[dict] = []

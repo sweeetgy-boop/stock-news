@@ -27,6 +27,8 @@ from .data import (REF_PROBE_RETRIES, REF_TICKERS, close_on,
 from .holidays import holiday_name
 from .trading_day import is_definitely_closed, market_status_reason
 from .trading_day import now_kst as _now_kst
+from .catchup import is_intraday
+from .store import in_progress_date
 
 log = logging.getLogger(__name__)
 
@@ -392,11 +394,30 @@ def fetch_day(store, trade_date: str, per_ticker_limit: int = 3200,
         rep.update({"verdict": "CLOSED", "path": "known", "detail": why})
         return 0
 
+    # ── 1-b) 오늘 봉이 아직 미완성이면 묻지 않는다 ──
+    #    2026-11-12 13:32 장중 catch-up 이 당일분을 종목별로 2,560종목
+    #    헛조회(21분)했다. 저장 단(in_progress_date)에서 전부 버려져 0건이
+    #    되자 '소스 장애'로 rc=2 를 냈다. 물어봐도 적재할 수 없는 날짜다.
+    now = _now_kst()
+    if iso == in_progress_date(now):
+        log.info("%s 는 아직 봉이 완성되지 않았습니다 (%02d:%02d) — 조회하지 "
+                 "않고 판정 보류", iso, now.hour, now.minute)
+        rep.update({"verdict": "PENDING", "path": "in_progress",
+                    "detail": f"{now:%H:%M} 장 마감 전"})
+        return 0
+
     # ── 2) 전종목 스냅샷 (요청 1회). 날짜를 반드시 대조한다 ──
     floor = load_floor(store)
     rep["floor"] = floor
-    prices, _ = market_snapshot()
-    ok, why = verify_snapshot_date(prices, trade_date)
+    if is_intraday(now, store):
+        # 장중 FDR 스냅샷은 오늘 현재가다. 기준 종목 2/3 이 어제 종가와
+        # 1원 이내면 대조를 통과해 전 종목 장중값이 지난 날짜로 적재될 수
+        # 있다. 장중에는 지난 날짜도 종목별 경로로만 받는다.
+        prices = None
+        ok, why = False, "장중이라 지난 날짜 스냅샷 경로 생략"
+    else:
+        prices, _ = market_snapshot()
+        ok, why = verify_snapshot_date(prices, trade_date)
     if ok:
         total = store.upsert_cross_section(iso, prices)
         log.info("%s 시세 적재 %d건 (스냅샷, %s)", iso, total, why)

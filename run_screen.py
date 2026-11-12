@@ -579,8 +579,11 @@ def _closed_guard(store: Store, args, mode: str) -> str | None:
     """
     if args.force:
         return None
-    if is_definitely_closed(store):
-        return f"{market_status(store)} — {mode} 생략"
+    # nightly 가 밀린 회차를 다음 날 돌릴 때 `--asof <회차 날짜>` 를 붙인다.
+    # 금요일 회차를 토요일에 돌리면 '오늘' 기준으로는 휴장이라 생략된다.
+    when = getattr(args, "asof", None)
+    if is_definitely_closed(store, when):
+        return f"{market_status(store, when)} — {mode} 생략"
     return None
 
 
@@ -2556,8 +2559,9 @@ def main(argv=None) -> int:
                     help="daily: 스캔 없이 직전 거래일에 기록된 추천만 발송 "
                          "(nightly 의 발송 요일 단계)")
     ap.add_argument("--asof", type=_iso_date, default=None,
-                    help="daily: 발송 요일·직전 거래일 판정 기준일 "
-                         "(YYYY-MM-DD). nightly 가 넘긴다")
+                    help="daily·exits: 발송 요일·직전 거래일·휴장 판정 "
+                         "기준일 (YYYY-MM-DD). nightly 가 넘긴다 "
+                         "(일요일 발송 · 밀린 회차 catch-up)")
     ap.add_argument("--include-preferred", action="store_true",
                     help="우선주 포함 (기본 제외)")
     ap.add_argument("--days", type=int, default=420, help="backfill 적재 봉 수")

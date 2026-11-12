@@ -1037,6 +1037,14 @@ WEEKLY_V2_EWMA_LAMBDA = 0.94
 
 # ── [J] 정리 ──
 # (J 구역 시작)
+# 회차 날짜 · 장중 catch-up (stocknews/catchup.py, nightly.py).
+# 장중 = 거래일 KST [시작, 끝). 이 사이에는 FDR 전종목 스냅샷이 오늘
+# 현재가라서 지난 날짜 스냅샷 경로를 쓰지 않는다(universe.fetch_day).
+INTRADAY_START_HM = (9, 0)
+INTRADAY_END_HM = (15, 40)
+# 브리핑 잡(brief-morning · brief-evening)이 예정 시각보다 이 시간을
+# 넘겨 늦게 뜨면 발송하지 않고 '건너뜀'으로 기록한다(exit 0).
+BRIEF_MAX_LATE_HOURS = 3
 # (J 구역 끝)
 
 # ── [K] 성능 ──
