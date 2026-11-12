@@ -88,7 +88,9 @@ EXIT_LOCKED = 3
 # 텔레그램을 실제로 보내는 모드. 토큰이 없으면 exit 4 로 끝나므로
 # STOCKNEWS_SEND=1 이 아닐 때는 --dry-run 을 붙인다.
 _SENDING = {"news", "daily", "exits", "brief-morning", "brief-evening",
-            "weekly", "brief-weekly", "flash"}
+            "weekly", "brief-weekly", "flash",
+            # 결과 한 줄을 관리자 채팅에만 보낸다(run_screen._emit_admin).
+            "reconcile"}
 
 # 잡별 dry-run. STOCKNEWS_SEND=1 이어도 여기 적힌 잡은 --dry-run 으로 돈다.
 #
@@ -179,7 +181,17 @@ class Step:
 #
 # 섹터 지표는 daily 안에서, 뉴스 빈도는 news 안에서 수집된다. 별도 모드가
 # 아니다 — 별도 단계로 부르려 하면 exit 64 가 난다.
+#
+# reconcile 이 **첫 단계**다(2026-11 R3-4). 밤 적재는 잠정값(is_final=0)이고
+# KRX 오픈API 확정값은 익영업일 08:00 에 열리므로, 다음 nightly 가 맨 먼저
+# 전 거래일분을 확정값(고가·저가·종가·거래량)으로 덮는다. 오늘 적재(update)
+# 보다 앞에 둬야 그날 daily 스캔이 확정된 전일 봉 위에서 돈다.
+# exit 4 중 '키 없음'(no_api_key)만 기대된 스킵이다. 미공개(not_published) ·
+# 수정주가 의심 중단(adjusted_price_suspect) · KRX 호출 실패(exit 1)는
+# 실패로 센다 — 그날 전일분이 잠정으로 남았다는 뜻이고 재시도는 없다.
 STEPS: tuple[Step, ...] = (
+    Step("reconcile", ["--mode", "reconcile"], soft=frozenset({4}),
+         soft_reasons=frozenset({"no_api_key"})),
     Step("master", ["--mode", "master"]),
     Step("update", ["--mode", "update"]),
     Step("flags", ["--mode", "flags", "--dart-limit", "400"]),

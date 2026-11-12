@@ -1409,6 +1409,10 @@ def render_reconcile(res: dict, top: int = 3) -> str:
             f"차이 {res.get('diff_tickers', 0):,}건"
             f"(종가 {df.get('c', 0):,} / 거래량 {df.get('v', 0):,}) | "
             f"추가 {res.get('added', 0):,}건")
+    skipped = res.get("skipped_split") or []
+    if skipped:
+        # 분할 흔적이라 잠정값 그대로 둔 종목 (reconcile.split_trace)
+        line += f" | 분할 흔적 건너뜀 {len(skipped):,}건"
     warns = res.get("warnings") or []
     if not warns:
         return line

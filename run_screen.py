@@ -476,21 +476,41 @@ def mode_update(store: Store, args) -> int:
     return EXIT_OK
 
 
-def _reconcile_target(store: Store, args) -> str:
-    """보정 기준일 'YYYY-MM-DD'. --date 가 없으면 오늘 이전 마지막 거래일.
+def _reconcile_target(store: Store, args, now: datetime | None = None) -> str:
+    """보정 기준일 'YYYY-MM-DD'. --date 가 없으면 **이미 공개된** 마지막 거래일.
 
     주말·공휴일·기록된 휴장일만 건너뛴다. 미확인 평일은 거래일로 본다 —
     KRX 가 빈 응답을 주면 그때 판정한다.
+
+    KRX 는 D일분을 익영업일 `KRX_PUBLISH_HOUR`(08:00) 에 연다. 21:30
+    nightly 면 전 거래일이 그대로 기준일이다. 자정을 넘겨 뜬 catch-up
+    (예: 화 00:30 에 뜬 월요일 회차)은 '전 거래일'(월)이 아직 미공개라
+    그 앞날(금)을 고른다 — 그 회차가 원래 확정했어야 할 날이다.
     """
     if args.date:
         raw = str(args.date).strip().replace("-", "")
         return datetime.strptime(raw, "%Y%m%d").strftime("%Y-%m-%d")
-    day = now_kst().date()
-    for _ in range(14):
+    now = now or now_kst()
+    publish_hour = int(getattr(_cfg, "KRX_PUBLISH_HOUR", 8))
+
+    def _open(d) -> bool:
+        return not is_definitely_closed(store, d.isoformat())
+
+    day = now.date()
+    first = None
+    for _ in range(21):
         day -= timedelta(days=1)
-        if not is_definitely_closed(store, day.isoformat()):
-            break
-    return day.isoformat()
+        if not _open(day):
+            continue
+        first = first or day
+        pub = day + timedelta(days=1)
+        for _ in range(14):
+            if _open(pub):
+                break
+            pub += timedelta(days=1)
+        if datetime(pub.year, pub.month, pub.day, publish_hour) <= now:
+            return day.isoformat()
+    return (first or now.date() - timedelta(days=1)).isoformat()
 
 
 def mode_reconcile(store: Store, args) -> int:
@@ -550,13 +570,40 @@ def mode_reconcile(store: Store, args) -> int:
         return EXIT_PRECOND
     SUMMARY.update({k: v for k, v in res.items()
                     if k not in ("warnings", "missing_in_krx",
-                                 "halted_in_krx")})
+                                 "halted_in_krx", "skipped_split")})
     SUMMARY.update({"warn_count": len(res["warnings"]),
                     "warn_top": [list(w) for w in res["warnings"][:10]],
                     "missing_in_krx": len(res["missing_in_krx"]),
-                    "halted_in_krx": len(res["halted_in_krx"])})
-    _emit(render_reconcile(res), args.dry_run)
+                    "halted_in_krx": len(res["halted_in_krx"]),
+                    "skipped_split": len(res["skipped_split"]),
+                    "skipped_split_top": [list(x) for x in
+                                          res["skipped_split"][:20]]})
+    _emit_admin(render_reconcile(res), args.dry_run)
     return EXIT_OK
+
+
+def _emit_admin(text: str, dry: bool) -> bool | None:
+    """운영 알림. **관리자 채팅에만** 보낸다(notify.send_admin).
+
+    시세 보정은 nightly 첫 단계로 매일 돈다. 결과 한 줄은 운영 정보라 전
+    수신자에게 보낼 이유가 없다. dry-run 표시는 `_emit` 과 같다(stderr).
+    """
+    if dry:
+        return _emit(text, True)
+    from stocknews.notify import send_admin
+    SUMMARY["messages"] = SUMMARY.get("messages", 0) + 1
+    try:
+        report = send_admin(text)
+    except TelegramNotConfigured as exc:
+        log.warning("관리자 알림 생략 — %s", exc)
+        return None
+    if report:
+        return True
+    SUMMARY["send_failed"] = (SUMMARY.get("send_failed", 0)
+                              + len(report.failures))
+    SUMMARY.setdefault("send_failures", []).extend(report.as_dicts())
+    log.error("관리자 알림 %s", report.summary())
+    return False
 
 
 def _scan_pool(store: Store, args):
