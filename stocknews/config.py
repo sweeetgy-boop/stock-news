@@ -904,6 +904,8 @@ PAPER_SUMMARY_TOPN = 3
 PAPER_SUMMARY_MIN_TOPN = 3
 # 일요일 성적표 ③ '추적 중 전체' 한 줄에 이어 붙이는 종목 수 (가운뎃점 구분).
 PAPER_SUNDAY_PER_LINE = 3
+# 일요일 코호트 막대 차트·캡션에 싣는 최근 코호트 수 (캡션 1,024자 안).
+PAPER_CURVE_COHORTS = 12
 # 지수 히스토리 CSV 캐시 (네트워크 실패 시 사용). cwd 기준.
 PAPER_INDEX_CACHE = "data/index_cache"
 # 그림자 청산 — 대안 세트 1개. **2026-11-12 고정. 이후 변경 금지.**

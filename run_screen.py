@@ -647,9 +647,14 @@ def _holdings_msg(store: Store, args, asof, trade_date: str, scanned: int,
     # [v2 D·F] 평일 종목 발송을 켜면 추천은 저녁 브리핑에서 나간다.
     note = ("• 새 추천은 저녁 브리핑에서 발송됩니다"
             if (_cfg.PAPER_TRACKING or _cfg.DAILY_LIST_V2) else None)
-    _emit(render_daily_holdings(positions, pm, asof, trade_date,
-                                scanned, picks, dow_label, reco_note=note),
-          args.dry_run)
+    text = render_daily_holdings(positions, pm, asof, trade_date,
+                                 scanned, picks, dow_label, reco_note=note)
+    # 보유 포지션이 없으면 '스캔 n종목 · 추천 n건 기록' 운영 상태뿐이다 —
+    # 관리자 채팅에만. 보유가 있으면 실제 자금 정보라 전원에게.
+    if positions:
+        _emit(text, args.dry_run)
+    else:
+        _emit_admin(text, args.dry_run)
 
 
 def _send_charts(store: Store, args, trade_date: str, picks=None,
@@ -828,7 +833,8 @@ def _daily_send_only(store: Store, args, asof, send_ok: bool,
         log.warning("발송할 추천 없음 — 기준일 %s 기록 없음 (마지막 기록 %s)",
                     expected, got or "없음")
         SUMMARY.update({"picks": 0, "skipped": True, "reason": "no_recos"})
-        _emit(render_reco_missing(asof, expected, got), args.dry_run)
+        # 운영 상태(그날 daily 가 기록을 못 남김) — 관리자 채팅에만.
+        _emit_admin(render_reco_missing(asof, expected, got), args.dry_run)
         return EXIT_OK
     n = int(len(rows))
     SUMMARY.update({"picks": n, "from_db": True})
@@ -1087,6 +1093,32 @@ def save_weekly_report(text: str, v2_text: str | None, trade_date,
     except OSError as exc:
         log.warning("주간 리포트 파일 기록 실패 (%s: %s)", type(exc).__name__, exc)
         SUMMARY["report_file_error"] = f"{type(exc).__name__}: {exc}"[:200]
+        return None
+    return path.resolve()
+
+
+def append_weekly_section(trade_date, section: str, head: str,
+                          pattern: str | None = None) -> Path | None:
+    """주간 파일(weekly_<trade_date>.txt)에 구역 하나를 덧붙인다.
+
+    같은 머리말(head)로 시작하는 구역이 이미 있으면 그 자리부터 끝까지를
+    새 구역으로 바꾼다 — 일요일 단계가 다시 돌아도 같은 내용이 두 번 쌓이지
+    않는다. 금요일 파일이 없으면(휴장 등) 이 구역만으로 새로 만든다.
+    """
+    d = str(trade_date or now_kst().date())
+    pat = pattern or getattr(_cfg, "WEEKLY_REPORT_FILE",
+                             "data/reports/weekly_{d}.txt")
+    path = Path(pat.format(d=d.replace("-", "")))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        old = path.read_text(encoding="utf-8") if path.exists() else ""
+        i = old.find(head)
+        if i >= 0:
+            old = old[:i]
+        body = (old.rstrip("\n") + "\n\n" if old.strip() else "") + section.rstrip("\n") + "\n"
+        path.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        log.warning("주간 파일 덧붙이기 실패 (%s: %s)", type(exc).__name__, exc)
         return None
     return path.resolve()
 
@@ -1436,8 +1468,9 @@ def _brief_evening_v2(store, args) -> int:
 
 
 def _paper_sunday(store, args, asof, trade_d: str | None) -> int:
-    """[v2 D] 일요일 — 새 추천 목록 대신 주간 성적표 + 누적 곡선 1장 +
-    이번 주 새 추천 차트 앨범(없으면 생략)."""
+    """[v2 D] 일요일 — 새 추천 목록 대신 주간 성적표 + 코호트별 수익률 막대
+    1장 + 이번 주 새 추천 차트 앨범(없으면 생략). 발송에서 빠진 상세(최대
+    낙폭·유형별·국면별)는 그 주 주간 파일(weekly_<기준 거래일>.txt)에 덧붙인다."""
     from stocknews import paper, paper_render
     from stocknews.chart import chart_path
     trade_d = trade_d or paper.brief_date(store, None)
@@ -1454,6 +1487,14 @@ def _paper_sunday(store, args, asof, trade_d: str | None) -> int:
     for msg in info.get("messages") or [text]:
         _emit(msg, args.dry_run)
     try:
+        detail = paper_render.sunday_detail(pd_, trade_d, asof)
+        dpath = append_weekly_section(trade_d, detail,
+                                      paper_render.SUNDAY_DETAIL_HEAD)
+        SUMMARY["sunday_detail_file"] = str(dpath) if dpath else None
+    except Exception as exc:  # noqa: BLE001 - 파일은 부가 기록
+        log.warning("일요일 상세 파일 기록 실패 — 건너뜀: %s", exc)
+        SUMMARY["sunday_detail_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    try:
         pts = paper_render.curve_points(pd_, trade_d)
         path = paper_render.curve_chart(
             pd_, trade_d, chart_path(trade_d, 0, "curve", DEFAULT, prefix="P"))
@@ -1462,12 +1503,12 @@ def _paper_sunday(store, args, asof, trade_d: str | None) -> int:
             SUMMARY["curve_chart"] = str(path)
             if args.dry_run:
                 _say("-" * 62)
-                _say(f"[누적 곡선 1장] {path}")
+                _say(f"[코호트 차트 1장] {path}")
                 _say("    " + cap.replace("\n", "\n    "))
             else:
                 send_album([(path, cap)])
     except Exception as exc:  # noqa: BLE001 - 차트는 부가 정보
-        log.warning("누적 곡선 실패 — 건너뜀: %s", exc)
+        log.warning("코호트 차트 실패 — 건너뜀: %s", exc)
         SUMMARY["curve_chart_error"] = f"{type(exc).__name__}: {exc}"[:200]
     wk = info.get("week_tickers") or []
     if wk:
@@ -2380,7 +2421,12 @@ def mode_exits(store: Store, args) -> int:
         if d.layer <= 1:
             _emit(render_exit_alert(d, DEFAULT), args.dry_run)
 
-    _emit(render_exit_digest(res, asof, DEFAULT), args.dry_run)
+    # 청산 신호가 없으면 '보유 n건 · 해당 없음' 운영 상태 — 관리자 채팅에만.
+    # 신호가 있으면 사람이 집행해야 하므로 전원에게.
+    if decs:
+        _emit(render_exit_digest(res, asof, DEFAULT), args.dry_run)
+    else:
+        _emit_admin(render_exit_digest(res, asof, DEFAULT), args.dry_run)
 
     errs = res.get("errors") or []
     SUMMARY.update({

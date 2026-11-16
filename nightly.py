@@ -742,7 +742,12 @@ def _health_override(step: Step, state: str, note: str,
 
 def _notify(text: str, log: Log, enabled: bool,
             why: str = "--no-telegram") -> bool | None:
-    """텔레그램 1건. 반환은 True 발송 · False 실패 · None 보내지 않음.
+    """운영 상태 알림 1건(완료·스킵·실패) — **관리자 채팅(첫 수신자)에만**.
+
+    2026-11-16 까지는 전 수신자에게 갔다. 잡 완료·스킵·실패는 운영자가 볼
+    정보라 브리핑을 받는 다른 수신자에게 보낼 이유가 없다. 콘텐츠(브리핑·
+    성적표·청산 신호)는 run_screen 이 따로 전원에게 보낸다.
+    반환은 True 발송 · False 실패 · None 보내지 않음.
 
     단계 결과는 바꾸지 않는다. 대신 호출부가 종료 코드를 2 로 올리고 마커
     reason 에 '알림 실패' 를 남긴다. 실패 원문은 여기서 로그에 쓴다 —
@@ -754,9 +759,9 @@ def _notify(text: str, log: Log, enabled: bool,
         log(f"알림 생략 ({why})")
         return None
     try:
-        from stocknews.notify import TelegramNotConfigured, send_telegram
+        from stocknews.notify import TelegramNotConfigured, send_admin
         try:
-            rep = send_telegram(text)
+            rep = send_admin(text)
         except TelegramNotConfigured:
             # 토큰이 없는 것은 설정 문제다. 파이프라인 실패가 아니다.
             log("알림 생략 — TELEGRAM_BOT_TOKEN / CHAT_ID 미설정")

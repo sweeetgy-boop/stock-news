@@ -39,6 +39,9 @@ def _fixture(n_track: int):
         {"id": 2, "ticker": "000200", "name": "다라", "signal_d": "2026-11-11",
          "entry_date": None, "enrolled": 0, "slot": "TREND",
          "skip_reason": "상한가 시가", "entry_status": "LIMIT_UP"},
+        {"id": 4, "ticker": "000350", "name": "월요편입", "signal_d": "2026-11-13",
+         "entry_date": "2026-11-16", "enrolled": 1, "slot": "VALUE",
+         "skip_reason": None, "entry_status": "OK"},
         {"id": 3, "ticker": "000300", "name": "지난주", "signal_d": "2026-11-06",
          "entry_date": "2026-11-09", "enrolled": 1, "slot": "SEQ",
          "skip_reason": None, "entry_status": "OK"},
@@ -104,12 +107,13 @@ def run(check, near, tmp):
         finally:
             _undo(P, saved)
         assert not info["split"] and len(info["messages"]) == 1
-        for h in ("① 이번 주 새 추천 (3)", "② 이번 주 만기 (1)",
+        for h in ("① 이번 주 새 추천 (4)", "② 이번 주 만기 (1)",
                   "③ 추적 중 전체 (8종목", "④ 누적 성적", "※ 검증 중 · 투자 판단 근거 아님"):
             assert h in text, (h, text)
         assert "• 가나(000100) · 매집 · 편입 11-11 · +3.21%" in text, text
         assert "• 다라(000200) · 추세 · 미편입(상한가 시가) · -" in text, text
         assert "• 마바(000400) · 보충 · 편입 대기(다음 거래일 시가) · -" in text, text
+        assert "• 월요편입(000350) · 매집 · 편입 대기(다음 거래일 시가) · -" in text, text
         assert "지난주(000300)" not in text.split("③")[0], "지난주 편입이 ①에 들어갔다"
         assert "• 만기A(000900) · 최종 -4.50% · 지수 대비 +1.25%p" in text
         assert "예전만기" not in text.split("③")[0].split("②")[1]
@@ -163,27 +167,104 @@ def run(check, near, tmp):
     check(S, "추적 40종목 한 메시지 · 상한 넘으면 ③만 다음 메시지(생략 없음)",
           sunday_40_and_split)
 
-    def curve_chain():
+    def cohort_bars():
         m = pd.DataFrame([
             {"signal_d": "2026-10-01", "net": 10.0, "idx": 5.0},
-            {"signal_d": "2026-10-01", "net": 10.0, "idx": 5.0},
+            {"signal_d": "2026-10-01", "net": 6.0, "idx": 5.0},
             {"signal_d": "2026-10-08", "net": -10.0, "idx": 0.0},
         ])
         saved = (P.matured_on, P.matured_random)
         P.matured_on = lambda pd_, d=None, start=None: m.copy()
         P.matured_random = lambda pd_, sds, h=None: {
-            "2026-10-01": [(2.0, 5)] * 3, "2026-10-08": [(-2.0, 5)] * 3}
+            "2026-10-01": [(2.0, 5), (4.0, 5), (9.0, 5)],
+            "2026-10-08": [(-2.0, 5)] * 3}
         try:
             df = R.curve_points(None, "2026-11-13")
+            png = R.curve_chart(None, "2026-11-13", tmp / "c" / "P00_curve.png")
         finally:
             P.matured_on, P.matured_random = saved
-        near(df["lvl_reco"].tolist()[-1], 99.0, 1e-9, "곡선")
-        near(df["lvl_index"].tolist()[-1], 105.0, 1e-9, "곡선")
-        near(df["lvl_random"].tolist()[-1], 102.0 * 0.98, 1e-9, "곡선")
+        assert df["signal_d"].tolist() == ["2026-10-01", "2026-10-08"]
+        assert df["n"].tolist() == [2, 1]
+        near(df["reco"][0], 8.0, 1e-9, "코호트")         # 같은 날 묶음 동일 비중 평균
+        near(df["index"][0], 5.0, 1e-9, "코호트")
+        near(df["random"][0], 4.0, 1e-9, "코호트")       # 무작위 묶음 평균의 중앙값
+        near(df["reco"][1], -10.0, 1e-9, "코호트")
+        assert not any(c.startswith("lvl_") for c in df.columns), "이어 붙인 지수가 남았다"
+        assert png is not None and png.is_file() and png.stat().st_size > 1000
         cap = R.curve_caption(df, "2026-11-13")
-        assert "시작=100" in cap and "추천 99.0 · 지수 105.0" in cap, cap
-        assert "누적합" not in cap
-    check(S, "누적 곡선 = 코호트 연결 지수(시작=100) · 캡션", curve_chain)
+        assert "10-01 (2종목): 추천 +8.00% · 지수 +5.00% · 무작위 +4.00%" in cap, cap
+        assert "10-08 (1종목): 추천 -10.00% · 지수 +0.00% · 무작위 -2.00%" in cap, cap
+        assert "코호트 = 같은 날 편입된 묶음" in cap
+        assert "시작=100" not in cap and "이어 붙" not in cap and "누적" not in cap
+    check(S, "일요일 차트 = 코호트별 추천·지수·무작위 막대 · 캡션 숫자", cohort_bars)
+
+    def sunday_detail_file():
+        import importlib
+        rs = importlib.import_module("run_screen")
+        m = pd.DataFrame([
+            {"signal_d": "2026-10-01", "net": -4.0, "idx": -5.0, "ex_idx": 1.0,
+             "mdd": -9.5, "slot": "VALUE", "regime": "상승"},
+            {"signal_d": "2026-10-08", "net": 2.0, "idx": 0.0, "ex_idx": 2.0,
+             "mdd": -3.0, "slot": "FILL*", "regime": None},
+        ])
+        saved = (P.matured_on, P.matured_random, P.pooled_percentile)
+        P.matured_on = lambda pd_, d=None, start=None: m.copy()
+        P.matured_random = lambda pd_, sds, h=None: {}
+        P.pooled_percentile = lambda reco, rnd, col="net": (40.0, 2)
+        try:
+            txt = R.sunday_detail(None, "2026-11-13", asof)
+        finally:
+            P.matured_on, P.matured_random, P.pooled_percentile = saved
+        for s in ("━━ 일요일 성적표 상세 (기준 거래일 2026-11-13) ━━",
+                  "• 최대 낙폭 중앙 -6.25% · 최악 -9.50%", "[유형별 · 수익률(비용 차감)]",
+                  "• 매집:", "• 보충:", "[국면별 · 수익률(비용 차감)]", "• 상승:",
+                  "• 국면 없음:", "무작위 대비 백분위 40"):
+            assert s in txt, (s, txt)
+        pat = str(tmp / "rp2" / "weekly_{d}.txt")
+        f = rs.save_weekly_report("금요일 본문", None, "2026-11-13", pattern=pat)
+        p1 = rs.append_weekly_section("2026-11-13", txt, R.SUNDAY_DETAIL_HEAD, pattern=pat)
+        p2 = rs.append_weekly_section("2026-11-13", txt, R.SUNDAY_DETAIL_HEAD, pattern=pat)
+        assert f == p1 == p2
+        body = p2.read_text(encoding="utf-8")
+        assert "금요일 본문" in body and body.count(R.SUNDAY_DETAIL_HEAD) == 1, body
+        assert body.index("금요일 본문") < body.index(R.SUNDAY_DETAIL_HEAD)
+        p3 = rs.append_weekly_section("2026-11-20", txt, R.SUNDAY_DETAIL_HEAD, pattern=pat)
+        assert p3.name == "weekly_20261120.txt" and p3.read_text(encoding="utf-8").startswith("━━ 일요일")
+    check(S, "일요일 빠진 줄(낙폭·유형별·국면별) → 주간 파일에 덧붙임(재실행 1회분)",
+          sunday_detail_file)
+
+    def ops_notices_admin_only():
+        import importlib
+        import inspect
+        nl = importlib.import_module("nightly")
+        src = inspect.getsource(nl._notify)
+        assert "send_admin(text)" in src and "send_telegram(" not in src
+        rs = importlib.import_module("run_screen")
+        hs = inspect.getsource(rs._holdings_msg)
+        assert "_emit_admin(text" in hs and "if positions:" in hs
+        es = inspect.getsource(rs.mode_exits)
+        assert "if decs:" in es and "_emit_admin(render_exit_digest" in es
+        ds = inspect.getsource(rs._daily_send_only)
+        assert "_emit_admin(render_reco_missing" in ds
+        # 실제 호출: _notify 는 첫 수신자에게만
+        from stocknews import notify as N
+        import os
+        calls = []
+        orig, old = N.send_telegram, os.environ.get("TELEGRAM_CHAT_ID")
+        N.send_telegram = lambda text, chat_id=None, token=None, retries=3: (
+            calls.append(chat_id) or N.SendReport(sent=1, failures=()))
+        os.environ["TELEGRAM_CHAT_ID"] = "1111,2222"
+        try:
+            assert nl._notify("완료", lambda *_a: None, True) is True
+        finally:
+            N.send_telegram = orig
+            if old is None:
+                os.environ.pop("TELEGRAM_CHAT_ID", None)
+            else:
+                os.environ["TELEGRAM_CHAT_ID"] = old
+        assert calls == ["1111"], calls
+    check(S, "운영 상태 알림(잡 완료·스킵·실패 · 보유 0 · 청산 0 · 기록 없음) = 관리자만",
+          ops_notices_admin_only)
 
     def weekly_file():
         import importlib

@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 
 __all__ = ["weekday_enabled", "contributions", "reasons_for", "slot_perf",
            "weekday_block", "sunday_scorecard", "curve_chart",
-           "weekly_shadow_block", "TEXT_LIMIT", "SEND_LIMIT"]
+           "weekly_shadow_block", "sunday_detail", "TEXT_LIMIT", "SEND_LIMIT"]
 
 TEXT_LIMIT = 4096
 # 실제로 한 메시지에 담는 상한. notify._split 이 이 길이를 넘으면 줄 경계에서
@@ -445,7 +445,12 @@ def _week_new(pd_, mon: str, fri: str, marks: pd.DataFrame) -> list[dict]:
     seen: set = set()
     for r in (pos.to_dict("records") if len(pos) else []):
         seen.add((str(r["signal_d"]), str(r["ticker"])))
-        if int(r.get("enrolled") or 0):
+        if int(r.get("enrolled") or 0) and str(r.get("entry_date") or "") > fri:
+            # 기준 거래일 뒤에 편입된 행(월요일 catch-up 등) — 그 날 기준으론 대기.
+            rows.append({"ticker": r["ticker"], "name": r.get("name"),
+                         "slot": r.get("slot"), "signal_d": r["signal_d"],
+                         "entry": "편입 대기(다음 거래일 시가)", "ret": "-"})
+        elif int(r.get("enrolled") or 0):
             ret = cur.get(int(r["id"]))
             rows.append({"ticker": r["ticker"], "name": r.get("name"),
                          "slot": r.get("slot"), "signal_d": r["signal_d"],
@@ -610,11 +615,12 @@ def sunday_scorecard(store, asof, trade_d: str, pdata=None, index=None,
 
 
 def curve_points(pd_, d: str) -> pd.DataFrame:
-    """만기 코호트(신호일)별 동일 비중 평균 → 신호일 순서로 이어 붙인 지수(시작=100).
+    """만기 코호트(신호일)별 20거래일(PAPER_DISPLAY_DAYS) 수익률 — 추천 / 시장 지수 / 무작위 중앙값.
 
-    level_i = level_{i-1} × (1 + 코호트 i 평균 수익률). 추천 / 지수 / 무작위 중앙값.
-    코호트끼리 보유 구간이 겹치므로 실제 계좌 곡선이 아니라 '코호트를 하나씩
-    차례로 들었다면'의 연결 지수다.
+    코호트 = 같은 날 편입된 묶음. 추천 = 그 묶음 확정 수익률(net) 동일 비중
+    평균, 지수 = 같은 구간 소속 시장 지수 수익률(idx) 평균, 무작위 = 같은
+    신호일 무작위 묶음 100개 평균의 중앙값. 코호트끼리 보유 구간이 겹치므로
+    이어 붙이지 않고 나란히 놓는다. 최근 PAPER_CURVE_COHORTS 개만.
     """
     m = P.matured_on(pd_, d)
     if m.empty:
@@ -629,13 +635,12 @@ def curve_points(pd_, d: str) -> pd.DataFrame:
                      "index": P._nan(g["idx"].astype(float).mean()),
                      "random": float(np.median(lst)) if lst else np.nan})
     df = pd.DataFrame(rows).sort_values("signal_d").reset_index(drop=True)
-    for c in ("reco", "index", "random"):
-        df[f"lvl_{c}"] = 100.0 * (1.0 + df[c].astype(float).fillna(0.0) / 100.0).cumprod()
-    return df
+    keep = int(getattr(C, "PAPER_CURVE_COHORTS", 12))
+    return df.tail(keep).reset_index(drop=True) if keep > 0 else df
 
 
 def curve_chart(pd_, d: str, path) -> Path | None:
-    """누적 지수 1장 (추천 vs 시장 지수 vs 무작위 중앙값, 시작=100). 없으면 None."""
+    """코호트별 20거래일 수익률 막대 1장 (추천 · 시장 지수 · 무작위 중앙값)."""
     df = curve_points(pd_, d)
     if df.empty:
         return None
@@ -649,23 +654,36 @@ def curve_chart(pd_, d: str, path) -> Path | None:
     plt.rcParams["axes.unicode_minus"] = False
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=110)
-    x = list(range(len(df) + 1))
-    labels = ["시작"] + [str(s)[5:] for s in df["signal_d"]]
-    for col, kw in (("reco", dict(marker="o", lw=2, color="#2a6fdb",
-                                  label="추천 (종이 편입)")),
-                    ("index", dict(marker="s", lw=1.5, color="#7a7a7a",
-                                   label="시장 지수")),
-                    ("random", dict(marker="^", lw=1.5, color="#e08a2a",
-                                    label="무작위 중앙값"))):
-        ax.plot(x, [100.0] + df[f"lvl_{col}"].tolist(), **kw)
-    ax.axhline(100, color="#bbbbbb", lw=0.8)
+    n = len(df)
+    fig, ax = plt.subplots(figsize=(max(6.0, 1.6 * n + 2.5), 4.5), dpi=110)
+    x = np.arange(n)
+    w = 0.26
+    series = (("reco", "추천 (종이 편입)", "#2a6fdb"),
+              ("index", "시장 지수", "#7a7a7a"),
+              ("random", "무작위 중앙값", "#e08a2a"))
+    for k, (col, lab, color) in enumerate(series):
+        vals = df[col].astype(float).to_numpy()
+        bars = ax.bar(x + (k - 1) * w, np.nan_to_num(vals), w, label=lab,
+                      color=color)
+        for b, v in zip(bars, vals):
+            if np.isfinite(v):
+                ax.annotate(f"{v:+.1f}", (b.get_x() + b.get_width() / 2, v),
+                            xytext=(0, 3 if v >= 0 else -11),
+                            textcoords="offset points", ha="center",
+                            fontsize=8, color="#333333")
+    ax.axhline(0, color="#999999", lw=0.8)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax.set_title(f"만기 코호트 연결 지수 (시작=100 · 코호트 = 같은 날 편입 묶음의 "
-                 f"{int(C.PAPER_DISPLAY_DAYS)}거래일 동일 비중 수익률)", fontsize=10)
+    ax.set_xticklabels([f"{str(s)[5:]}\n({int(c)}종목)"
+                        for s, c in zip(df["signal_d"], df["n"])], fontsize=8)
+    ax.set_ylabel("%")
     ax.set_xlabel("코호트 신호일")
-    ax.grid(alpha=0.3)
+    ax.set_title(f"코호트별 {int(C.PAPER_DISPLAY_DAYS)}거래일 수익률 (%)",
+                 fontsize=11)
+    lo = float(np.nanmin(df[["reco", "index", "random"]].to_numpy(dtype=float)))
+    hi = float(np.nanmax(df[["reco", "index", "random"]].to_numpy(dtype=float)))
+    pad = max(2.0, (max(hi, 0) - min(lo, 0)) * 0.12)
+    ax.set_ylim(min(lo, 0) - pad, max(hi, 0) + pad)
+    ax.grid(axis="y", alpha=0.3)
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
     fig.savefig(path)
@@ -674,13 +692,64 @@ def curve_chart(pd_, d: str, path) -> Path | None:
 
 
 def curve_caption(df: pd.DataFrame, d: str) -> str:
-    last = df.iloc[-1]
-    return (f"📈 <b>추천 성적 누적 지수</b> (시작=100 · 기준 {d} · 코호트 {len(df)}개)\n"
-            f"추천 {last['lvl_reco']:.1f} · 지수 {last['lvl_index']:.1f} · "
-            f"무작위 중앙 {last['lvl_random']:.1f}\n"
-            f"코호트 = 같은 날 편입된 묶음의 {int(C.PAPER_DISPLAY_DAYS)}거래일 동일 비중 "
-            "평균 수익률. 신호일 순서로 이어 붙임(보유 구간이 겹치므로 실제 계좌 곡선 아님)\n"
-            f"<i>{_e(C.CHART_DISCLAIMER)}</i>")
+    """코호트별 숫자 + '코호트 = 같은 날 편입된 묶음' 한 줄."""
+    out = [f"📊 <b>코호트별 {int(C.PAPER_DISPLAY_DAYS)}거래일 수익률</b> (기준 {d})"]
+    for r in df.to_dict("records"):
+        out.append(f"{str(r['signal_d'])[5:]} ({int(r['n'])}종목): 추천 "
+                   f"{_pct(r['reco'])} · 지수 {_pct(r['index'])} · 무작위 "
+                   f"{_pct(r['random'])}")
+    out.append("코호트 = 같은 날 편입된 묶음")
+    out.append(f"<i>{_e(C.CHART_DISCLAIMER)}</i>")
+    return "\n".join(out)
+
+
+def sunday_detail(pd_, trade_d: str, asof) -> str:
+    """일요일 발송에서 빠진 상세 — 주간 파일 전용(발송 안 함).
+
+    만기분 누적(평균·중앙·승률·지수 대비·무작위 백분위) · 최대 낙폭 · 유형별 ·
+    국면별. 2026-11-15 까지 일요일 성적표에 실리던 줄과 같은 계산이다.
+    """
+    H = int(C.PAPER_DISPLAY_DAYS)
+    m_all = P.matured_on(pd_, trade_d)
+    out = [f"{SUNDAY_DETAIL_HEAD} (기준 거래일 {trade_d}) ━━",
+           f"• 생성 {asof:%Y-%m-%d %H:%M:%S} · 발송 안 함 · 이벤트 기준(중복 제거 · "
+           f"다음 거래일 시가 편입 · 왕복 {C.ROUND_TRIP_COST_PCT:g}%p 차감)",
+           f"[만기분 누적 ({H}거래일, n={len(m_all)})]"]
+    if m_all.empty:
+        out.append("• 만기된 추적 종목 없음")
+        return "\n".join(out)
+    c = E.stat_cell(m_all["net"])
+    x = E.stat_cell(m_all["ex_idx"])
+    pct, _rank = P.pooled_percentile(
+        m_all, P.matured_random(pd_, set(m_all["signal_d"]), H))
+    mdd = m_all["mdd"].astype(float).dropna() if "mdd" in m_all else pd.Series(dtype=float)
+    if c["n"]:
+        out.append(f"• 평균 {_pct(c['mean'])} · 중앙 {_pct(c['median'])} · "
+                   f"승률 {_win(c)}")
+    out.append(f"• 지수 대비 평균 {_pct(x['mean'], '%p')} · 무작위 대비 백분위 "
+               f"{'-' if pct is None else f'{pct:.0f}'}")
+    if len(mdd):
+        out.append(f"• 최대 낙폭 중앙 {mdd.median():+.2f}% · 최악 {mdd.min():+.2f}%")
+    else:
+        out.append("• 최대 낙폭 기록 없음")
+    if len(m_all) < int(C.MIN_SCORED_FOR_JUDGMENT):
+        out.append("• 표본 부족 — 판단 보류")
+    mm = m_all.assign(slot_key=m_all["slot"].astype(str).str.rstrip("*"))
+    out.append("[유형별 · 수익률(비용 차감)]")
+    for k, g in mm.groupby("slot_key"):
+        out.append(f"• {_slot_label(k)}: {E.fmt_cell(E.stat_cell(g['net']))}")
+    out.append("[유형별 · 지수 대비]")
+    for k, g in mm.groupby("slot_key"):
+        out.append(f"• {_slot_label(k)}: {E.fmt_cell(E.stat_cell(g['ex_idx']))}")
+    out.append("[국면별 · 수익률(비용 차감)]")
+    reg = mm["regime"].fillna("국면 없음") if "regime" in mm else \
+        pd.Series("국면 없음", index=mm.index)
+    for k, g in mm.groupby(reg):
+        out.append(f"• {k}: {E.fmt_cell(E.stat_cell(g['net']))}")
+    return "\n".join(out)
+
+
+SUNDAY_DETAIL_HEAD = "━━ 일요일 성적표 상세"
 
 
 # ══════════════════════════ 주간 그림자 청산 표 ══════════════════════════

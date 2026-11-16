@@ -3355,6 +3355,10 @@ def test_market_source(tmp: Path):
                  (mod.CLOSED_WEEKEND, f"휴장({mod.CLOSED_WEEKEND}) · 알림 실패"))
         saved = (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
                  mod._net_probe, nt.send_telegram)
+        import os
+        # 잡 알림은 관리자 채팅(첫 수신자)으로만 간다(2026-11-16) — 수신자 설정 필요.
+        old_cid = os.environ.get("TELEGRAM_CHAT_ID")
+        os.environ["TELEGRAM_CHAT_ID"] = "1111,2467"
         try:
             for status, want_reason in cases:
                 root = tmp / f"nightly_alert_{status.lower()}"
@@ -3395,6 +3399,10 @@ def test_market_source(tmp: Path):
         finally:
             (mod.REPO, mod.load_env, mod.market_status, mod._run_step,
              mod._net_probe, nt.send_telegram) = saved
+            if old_cid is None:
+                os.environ.pop("TELEGRAM_CHAT_ID", None)
+            else:
+                os.environ["TELEGRAM_CHAT_ID"] = old_cid
 
     def t_nightly_catch_up_waits_for_network():
         """catch-up 이면 시작 전 네트워크 확인 — 10초 간격 최대 6회, 대기는 로그·알림에."""
@@ -10348,11 +10356,14 @@ def test_send_day(tmp: Path):
                                   send_only=True,
                                   asof=_date.fromisoformat(asof))
         saved = (dict(rs.SUMMARY), rs.send_telegram, rs.send_album,
-                 rs.run_daily, os.getcwd())
+                 rs.run_daily, os.getcwd(), nt.send_admin)
         texts, photos = [], []
+        ADMIN.clear()
         buf = io.StringIO()
         try:
             rs.SUMMARY.clear()
+            nt.send_admin = lambda t, *a, **k: (ADMIN.append(t),
+                                                nt.SendReport(sent=1))[1]
             rs.send_telegram = lambda t, *a, **k: (texts.append(t),
                                                    nt.SendReport(sent=2))[1]
             rs.send_album = lambda items, *a, **k: (photos.extend(items),
@@ -10365,10 +10376,13 @@ def test_send_day(tmp: Path):
             sm = dict(rs.SUMMARY)
         finally:
             os.chdir(saved[4])
+            nt.send_admin = saved[5]
             rs.SUMMARY.clear()
             rs.SUMMARY.update(saved[0])
             rs.send_telegram, rs.send_album, rs.run_daily = saved[1:4]
         return rc, sm, texts, photos, buf.getvalue()
+
+    ADMIN: list = []        # 관리자 채팅으로 간 글 (_emit_admin)
 
     # fixture_crash 의 마지막 봉은 2026-08-24(월). 다음 일요일은 08-30,
     # 그 직전 거래일은 08-28(금) — 기록을 그 날짜에 둔다.
@@ -10413,13 +10427,15 @@ def test_send_day(tmp: Path):
         _recos("2026-08-27")
         rc, sm, texts, photos, _ = _daily(SUN2, dry=False)
         assert rc == rs.EXIT_OK
-        assert len(texts) == 1 and "발송할 추천 없음" in texts[0], texts
-        assert "2026-08-28" in texts[0] and "2026-08-27" in texts[0], texts[0]
+        # 운영 상태 알림이라 관리자 채팅에만 (2026-11-16). 전원 발송 0건.
+        assert texts == [], texts
+        assert len(ADMIN) == 1 and "발송할 추천 없음" in ADMIN[0], ADMIN
+        assert "2026-08-28" in ADMIN[0] and "2026-08-27" in ADMIN[0], ADMIN[0]
         assert photos == [] and sm["reason"] == "no_recos", sm
         assert sm["reco_sent"] is False
         _recos(None)
         _rc, sm2, texts2, _p, _ = _daily(SUN2, dry=False)
-        assert "마지막 기록 없음" in texts2[0], texts2[0]
+        assert texts2 == [] and "마지막 기록 없음" in ADMIN[0], ADMIN
 
     def t_send_only_off_dow_silent():
         _recos(FRI)
