@@ -6595,11 +6595,19 @@ def test_cron_jobs(tmp: Path):
             assert job.steps, f"{name}: 단계가 비었다"
 
     def t_flash_is_the_only_exception():
-        """flash 만 마커·정상알림이 없다. 5분마다 도는 유일한 잡이다."""
+        """flash 만 마커가 없다. 정상 알림 생략은 flash 와 weekly 둘.
+
+        weekly 는 2026-11-16 부터 발송 없이 파일만 쓰고 관리자 한 줄을
+        run_screen 이 보낸다 — 완료 알림까지 전원에게 보내면 금요일
+        메시지를 끈 의미가 없다. 실패 알림은 그대로 나간다.
+        """
         for name, job in nl_mod.JOBS.items():
             if name == "flash":
                 assert not job.once_per_day, "flash 에 마커를 켜면 하루 1회만 돈다"
                 assert job.quiet_ok, "flash 정상 알림은 하루 84건이 된다"
+            elif name == "weekly":
+                assert job.once_per_day, "weekly: 중복 방어가 없다"
+                assert job.quiet_ok, "weekly 는 정상 완료 알림을 보내지 않는다"
             else:
                 assert job.once_per_day, f"{name}: 중복 방어가 없다"
                 assert not job.quiet_ok, f"{name}: 결과 보고가 없다"
@@ -9943,7 +9951,8 @@ def test_watch_album(tmp: Path):
         assert rc == mod.EXIT_OK
         assert [k for k, _v in order] == ["text", "album"], [k for k, _v in order]
         caps = [c for _p, c in order[1][1]]
-        assert f"({codes[1]})" in caps[0] and f"({codes[0]})" in caps[1], \
+        # 픽스처는 이름 = 코드라 표기가 "코드" 하나다 (stock_label).
+        assert codes[1] in caps[0] and codes[0] in caps[1], \
             "등급 높은 순(A -> B)이 아니다"
         assert caps[0].startswith("📌 <b>관심종목 차트 2종목</b>"), caps[0]
         assert caps[0].endswith("<i>검증 중 · 투자 판단 근거 아님</i>")
@@ -10075,9 +10084,9 @@ def test_reco_groups(tmp: Path):
         i_rest = msg.index("━━ 🌱 그 외 (2) ━━")
         assert i_big < i_rest
         big, rest = msg[i_big:i_rest], msg[i_rest:]
-        assert "2. <b>대형B</b>" in big and "3. <b>대형C</b>" in big
+        assert "2. <b>대형B(" in big and "3. <b>대형C(" in big
         assert big.index("2. <b>") < big.index("3. <b>"), "묶음 안 순위 순 아님"
-        assert "1. <b>소형A</b>" in rest and "4. <b>미상D</b>" in rest
+        assert "1. <b>소형A(" in rest and "4. <b>미상D(" in rest
         assert "시총 2.5조 · 대금 120억" in big
         assert "시총 3,000억 · 대금 500억" in rest and "시총 - · 대금 -" in rest
         assert "구분은 표시용 (선정과 무관)" in msg
@@ -10097,8 +10106,8 @@ def test_reco_groups(tmp: Path):
         msg = R.render_top10([("VALUE", r1), ("TREND", r2)], datetime(2026, 10, 2),
                              "2026-10-02", 1000, DEFAULT,
                              size={"000002": (2e12, 300e8), "000001": (1e11, 5e8)})
-        assert msg.index("━━ 🏢") < msg.index("1. <b>대형</b>") \
-            < msg.index("━━ 🌱") < msg.index("2. <b>소형</b>"), msg
+        assert msg.index("━━ 🏢") < msg.index("1. <b>대형(") \
+            < msg.index("━━ 🌱") < msg.index("2. <b>소형("), msg
 
     def t_display_only_guard():
         """선정·채점·게이트·청산 경로에 규모 구분이 없다."""
@@ -10158,8 +10167,8 @@ def test_reco_groups(tmp: Path):
         assert sm["reco_groups"]["large"] == ["000001"], sm["reco_groups"]
         assert sm["reco_groups"]["other"] == ["000002"], sm["reco_groups"]
         t = texts[0]
-        assert t.index("━━ 🏢") < t.index("2. <b>대형</b>") < t.index("━━ 🌱") \
-            < t.index("1. <b>소형</b>"), t
+        assert t.index("━━ 🏢") < t.index("2. <b>대형(") < t.index("━━ 🌱") \
+            < t.index("1. <b>소형("), t
         assert "시총 3조 · 대금 200억" in t
 
     def t_size_failure_falls_back():

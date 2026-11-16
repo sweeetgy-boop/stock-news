@@ -990,6 +990,15 @@ def mode_daily(store: Store, args) -> int:
 
 
 def mode_weekly(store: Store, args) -> int:
+    """금요일 주간 리포트 — **발송하지 않는다** (2026-11-16).
+
+    계산·기록은 예전 그대로 하고, 예전에 텔레그램으로 나가던 전체 내용
+    (자기검증 표·매집점수 상승·연속 등재·신규/이탈·청산 중심선·주중 이벤트·
+    업종 분포·전월 회고·원뿔 적중률·추천 필터 검증 표·그림자 청산 비교, 주간
+    분석 v2 가 돌았으면 그 텍스트까지)을 data/reports/weekly_YYYYMMDD.txt 에
+    저장만 한다. 저장되면 관리자 채팅(첫 수신자)에만 한 줄을 보낸다.
+    주간 메시지는 일요일 성적표 하나다.
+    """
     # --monthly 를 주면 전월 회고를 강제로 붙인다. 기본은 '그 달의 첫
     # 금요일인가'로 자동 판정한다.
     rep = weekly_report(store, cfg=DEFAULT, week_days=args.week_days,
@@ -1038,32 +1047,72 @@ def mode_weekly(store: Store, args) -> int:
             text += "\n\n" + paper_render.weekly_shadow_block(pd_, pd_.upto)
         except Exception as exc:  # noqa: BLE001 - 부가 표
             log.warning("그림자 청산 표 실패 — 생략: %s", exc)
-    _emit(text, args.dry_run)
-    _weekly_v2(store, args)
+    v2_text = _weekly_v2(store, args)
+    SUMMARY["weekly_sent"] = False
+    path = save_weekly_report(text, v2_text, rep.get("trade_date"))
+    SUMMARY["report_file"] = str(path) if path else None
+    SUMMARY["report_chars"] = len(text) + len(v2_text or "")
+    if path is not None:
+        _emit_admin(f"주간 상세 저장됨 · {path}", args.dry_run)
     return EXIT_OK
 
 
-def _weekly_v2(store: Store, args) -> None:
+def weekly_file_text(text: str, v2_text: str | None, trade_date) -> str:
+    """주간 리포트 파일 본문. 텔레그램 HTML 태그를 떼고 엔티티를 푼다."""
+    import html as _html
+    import re as _re
+
+    def plain(s: str) -> str:
+        return _html.unescape(_re.sub(r"<[^>]+>", "", s))
+    out = [f"[주간 리포트 상세] 기준 거래일 {trade_date or '-'} · "
+           f"생성 {now_kst():%Y-%m-%d %H:%M:%S} KST",
+           "※ 발송하지 않음 — 파일 전용. 주간 메시지는 일요일 성적표 하나만 나간다.",
+           "", plain(text)]
+    if v2_text:
+        out += ["", "━━ 주간 분석 v2 (기록 전용) ━━", plain(v2_text)]
+    return "\n".join(out) + "\n"
+
+
+def save_weekly_report(text: str, v2_text: str | None, trade_date,
+                       pattern: str | None = None) -> Path | None:
+    """data/reports/weekly_YYYYMMDD.txt 에 저장. 실패하면 None (경고만)."""
+    d = str(trade_date or now_kst().date())
+    pat = pattern or getattr(_cfg, "WEEKLY_REPORT_FILE",
+                             "data/reports/weekly_{d}.txt")
+    path = Path(pat.format(d=d.replace("-", "")))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(weekly_file_text(text, v2_text, trade_date),
+                        encoding="utf-8")
+    except OSError as exc:
+        log.warning("주간 리포트 파일 기록 실패 (%s: %s)", type(exc).__name__, exc)
+        SUMMARY["report_file_error"] = f"{type(exc).__name__}: {exc}"[:200]
+        return None
+    return path.resolve()
+
+
+def _weekly_v2(store: Store, args) -> str | None:
     """[I] 주간 분석. 플래그 OFF 이고 --weekly-v2 도 없으면 아무것도 안 한다.
 
-    기존 weekly 리포트가 먼저 나간 뒤에 돈다. 실패해도 weekly 의 종료
-    코드를 바꾸지 않는다(기록 전용 분석이 주간 리포트를 막으면 안 된다).
+    텍스트를 돌려준다 — mode_weekly 가 주간 리포트 파일에 함께 저장한다(발송
+    없음). 실패해도 weekly 의 종료 코드를 바꾸지 않는다(기록 전용 분석이 주간
+    리포트를 막으면 안 된다).
     """
     from stocknews import config as _C
     if not (getattr(_C, "WEEKLY_ANALYSIS_V2", False)
             or getattr(args, "weekly_v2", False)):
-        return
+        return None
     try:
         from stocknews.weekly_v2 import run_weekly_v2
         text, summ = run_weekly_v2(store, no_lock=args.no_lock)
         SUMMARY["weekly_v2"] = summ
-        if args.dry_run or getattr(_C, "WEEKLY_V2_SEND", False):
-            _emit(text, args.dry_run)
         log.info("주간 분석 v2 %.1f초 · 리포트 %s",
                  summ.get("elapsed_sec", 0.0), summ.get("report_file"))
+        return text
     except Exception as exc:  # noqa: BLE001
         log.exception("주간 분석 v2 실패: %s", exc)
         SUMMARY["weekly_v2"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return None
 
 
 def mode_hurst_backfill(store: Store, args) -> int:
@@ -1399,8 +1448,11 @@ def _paper_sunday(store, args, asof, trade_d: str | None) -> int:
     pdata = _paper_update(store, trade_d).get("data")
     pd_ = pdata or paper.PaperData(store, trade_d)
     text, info = paper_render.sunday_scorecard(store, asof, trade_d, pdata=pd_)
-    SUMMARY["scorecard"] = {k: v for k, v in info.items() if k != "week_tickers"}
-    _emit(text, args.dry_run)
+    SUMMARY["scorecard"] = {k: v for k, v in info.items()
+                            if k not in ("week_tickers", "messages")}
+    # 상한을 넘으면 ③ 이 다음 메시지로 떨어져 있다(종목 생략 없음).
+    for msg in info.get("messages") or [text]:
+        _emit(msg, args.dry_run)
     try:
         pts = paper_render.curve_points(pd_, trade_d)
         path = paper_render.curve_chart(

@@ -518,10 +518,10 @@ def hold_lines(res: DayResult) -> list[str]:
 
     목록에서 빠진 종목은 rows 에 없으므로 표시되지 않는다.
     """
-    from .renderer import _e
+    from .renderer import stock_label
     out = []
     for r in res.hold:
-        s = (f"• <b>{_e(str(r['name']))}</b> ({r['ticker']}) "
+        s = (f"• {stock_label(r['name'], r['ticker'], bold=True)} "
              f"추천 유지 {int(r['day_in_window'])}일째")
         if r["slot_changed"]:
             s += f" · 슬롯 {_slot_label(r['event_slot'])}→{_slot_label(r['slot'])}"

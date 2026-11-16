@@ -85,9 +85,16 @@ def run(check, near, tmp):
     rs = importlib.import_module("run_screen")
     orig = ev.load_index_history
 
+    from stocknews import config as C
+    rep_dir = tmp / "reports"
+
     def call(*argv) -> tuple[int, dict]:
         ev.load_index_history = lambda *a, **k: dict(fake_index)
         out = io.StringIO()
+        # 리포트 파일은 tmp 로 — cwd(저장소·운영 폴더)의 data/reports 에 쓰지 않는다.
+        saved = (C.WEEKLY_V2_REPORT_DIR, C.WEEKLY_REPORT_FILE)
+        C.WEEKLY_V2_REPORT_DIR = str(rep_dir)
+        C.WEEKLY_REPORT_FILE = str(rep_dir / "weekly_{d}.txt")
         try:
             with contextlib.redirect_stdout(out), \
                     contextlib.redirect_stderr(io.StringIO()):
@@ -95,6 +102,7 @@ def run(check, near, tmp):
                               "--env-file", str(empty_env), *argv])
         finally:
             ev.load_index_history = orig
+            C.WEEKLY_V2_REPORT_DIR, C.WEEKLY_REPORT_FILE = saved
         lines = [x for x in out.getvalue().splitlines() if x.startswith("{")]
         js = json.loads(lines[-1]) if lines else {}
         return rc, js
@@ -119,6 +127,15 @@ def run(check, near, tmp):
             assert isinstance(rc, int), f"{name}: 종료 코드가 int 아님 {rc!r}"
             assert rc == want, f"{name}: rc={rc} (기대 {want}) json={str(js)[:300]}"
             assert js.get("exit_code") == rc, f"{name}: JSON exit_code {js.get('exit_code')} ≠ rc {rc}"
+            if name.startswith("weekly"):
+                # 발송 없음 · 파일 1개(tmp) · v2 텍스트도 같은 파일에
+                from pathlib import Path
+                assert js.get("weekly_sent") is False, js
+                f = Path(js.get("report_file") or "")
+                assert f.is_file() and f.parent == rep_dir.resolve(), js.get("report_file")
+                body = f.read_text(encoding="utf-8")
+                assert "주간 누적 분석" in body and "주간 분석 v2" in body
+                assert "<b>" not in body and "&amp;" not in body
         check(S, f"{name} → rc {want}", one)
 
     def all_modes_return_int():

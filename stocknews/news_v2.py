@@ -415,7 +415,7 @@ def dart_block(store, focus: Focus, asof, fetch=None) -> tuple[list[str], dict]:
     전 거래일 장 마감 뒤 공시까지, 저녁 23:00 이면 그날 하루다.
     fetch(bgn, end) 는 `fetch_dart_disclosures` 와 같은 규약(스모크 주입용).
     """
-    from .renderer import _e
+    from .renderer import _e, stock_label
     codes = focus.all
     info = {"targets": len(codes), "rows": 0, "source": None}
     if not codes:
@@ -467,23 +467,30 @@ def dart_block(store, focus: Focus, asof, fetch=None) -> tuple[list[str], dict]:
     rows = [r for r in rows if not per_re.search(str(r.get("report_nm") or ""))]
     info["periodic"] = sum(int(r.get("_n", 1)) for r in periodic)
     cap = int(C.NEWS_V2_DART_MAX_LINES)
+    # 종목 표기는 "종목명(종목코드)" (2026-11-16 통일).
     for r in rows[:cap]:
-        name = r.get("corp_name") or focus.names.get(r["stock_code"], r["stock_code"])
-        title = (r["report_nm"] if r.get("_title_full")
-                 else f"{name} {r['report_nm']}")
+        code = r["stock_code"]
+        name = r.get("corp_name") or focus.names.get(code, "")
+        rpt = str(r["report_nm"] or "")
+        if r.get("_title_full"):
+            # 수집분 제목은 "회사명 보고서명" — 앞의 이름은 표기와 겹치므로 뗀다.
+            nm = name or focus.names.get(code, "")
+            if nm and rpt.startswith(nm):
+                rpt = rpt[len(nm):].lstrip()
         url = r.get("url") or _DART_VIEW.format(r.get("rcept_no", ""))
         more = f" ({r['_n']}건)" if r.get("_n", 1) > 1 else ""
-        out.append(f"• <a href=\"{_e(url)}\">{_e(title[:100])}</a>{more}")
+        out.append(f"• <a href=\"{_e(url)}\">{stock_label(name, code)} "
+                   f"{_e(rpt[:90])}</a>{more}")
     if len(rows) > cap:
         out.append(f"• 외 {len(rows) - cap}건")
     if periodic:
-        names: list[str] = []
+        labels: list[str] = []
         for r in periodic:
-            nm = r.get("corp_name") or focus.names.get(r["stock_code"],
-                                                       r["stock_code"])
-            if nm not in names:
-                names.append(nm)
-        out.append(f"• 정기보고서 {info['periodic']}건({_e('·'.join(names))})")
+            nm = r.get("corp_name") or focus.names.get(r["stock_code"], "")
+            lab = stock_label(nm, r["stock_code"])
+            if lab not in labels:
+                labels.append(lab)
+        out.append(f"• 정기보고서 {info['periodic']}건: {'·'.join(labels)}")
     if res is None:
         out.append("(DART 직접 조회 불가(키 없음·실패) — 수집 배치가 넣은 공시만 표시)")
     elif res.get("truncated"):
@@ -691,7 +698,7 @@ def render_evening_v2(store, asof, picks: list | None = None,
     foot_lines / stock_block / watchlist 는 renderer.render_evening_brief 와
     같은 뜻이다([B] 제외 한 줄 · [D·F] 종목 부분 ①②③④ · 관심종목 목록).
     """
-    from .renderer import _e, render_watchlist
+    from .renderer import _e, render_watchlist, stock_label
     info: dict = {}
     focus = focus_tickers(store, asof)
     info.update(focus=len(focus.all), focus_source=focus.source, d_ref=focus.d_ref)
@@ -752,7 +759,7 @@ def render_evening_v2(store, asof, picks: list | None = None,
             for _, r in picks:
                 n = hit.get(r.ticker)
                 if n:
-                    out.append(f"• <b>{_e(r.name)}</b> 관련 뉴스 {n}건 "
+                    out.append(f"• {stock_label(r.name, r.ticker, bold=True)} 관련 뉴스 {n}건 "
                                f"· 매집 {r.value_score:.1f}/추세 {r.trend_score:.1f}")
         else:
             out.append("• 추천 종목 관련 뉴스 없음 (조용한 바닥일 수 있음)")

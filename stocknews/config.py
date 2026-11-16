@@ -902,6 +902,8 @@ PAPER_SUMMARY_TOPN = 3
 # (넘는 분량은 send_telegram 이 나눠 보낸다). 2026-11-12 저녁 dry-run 에서
 # 뉴스 링크 길이 때문에 상위·하위가 0줄까지 깎여 요약 한 줄만 남았다.
 PAPER_SUMMARY_MIN_TOPN = 3
+# 일요일 성적표 ③ '추적 중 전체' 한 줄에 이어 붙이는 종목 수 (가운뎃점 구분).
+PAPER_SUNDAY_PER_LINE = 3
 # 지수 히스토리 CSV 캐시 (네트워크 실패 시 사용). cwd 기준.
 PAPER_INDEX_CACHE = "data/index_cache"
 # 그림자 청산 — 대안 세트 1개. **2026-11-12 고정. 이후 변경 금지.**
@@ -1053,9 +1055,12 @@ INDICATOR_BACKFILL_DAYS = 250
 # 않는다. 기본 OFF = 지금과 같은 weekly. `--weekly-v2` 로 1회 강제 실행 가능.
 # 기록 전용 — 점수·등급·추천 선정에 아무 값도 돌려주지 않는다.
 WEEKLY_ANALYSIS_V2 = False
-# 리포트를 텔레그램으로도 보낼지. False 면 파일(+ --dry-run 시 콘솔)만.
+# 2026-11-16 부터 쓰지 않는다 — 금요일 weekly 는 아무것도 발송하지 않고 주간
+# 분석 v2 텍스트도 data/reports/weekly_YYYYMMDD.txt 에 함께 저장만 한다.
 WEEKLY_V2_SEND = False
 WEEKLY_V2_REPORT_DIR = "data/reports"
+# 금요일 weekly 전체 내용 파일 (발송 대신). {d} = 리포트 기준 거래일 YYYYMMDD.
+WEEKLY_REPORT_FILE = "data/reports/weekly_{d}.txt"
 # 채점 보유기간(거래일). [0] score_events 의 ex_med_20 을 쓴다.
 WEEKLY_V2_HORIZON = 20
 # 허스트(DFA-1): 최근 이 수의 일간 수익률. 미만이면 NULL 기록.

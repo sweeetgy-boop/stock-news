@@ -15,11 +15,26 @@ from .news import (canonical_source, cluster_items, normalize_url,
                    representative_rank)
 
 __all__ = ["bar", "render_detail", "render_digest", "render_fib_list",
-           "render_watchlist"]
+           "render_watchlist", "stock_label"]
 
 
 def _e(s) -> str:
     return html.escape(str(s), quote=False)
+
+
+def stock_label(name, code, bold: bool = False) -> str:
+    """발송 메시지의 종목 표기 — **"종목명(종목코드)"** 하나로 통일 (2026-11-16).
+
+    이름이 없거나 코드와 같으면 코드만. bold 면 표기 전체를 <b> 로 감싼다.
+    HTML 이스케이프를 여기서 한다(호출부에서 다시 하지 않는다).
+    """
+    code = str(code or "").strip()
+    nm = str(name or "").strip()
+    if nm.lower() in ("", "nan", "none") or nm == code:
+        s = _e(code)
+    else:
+        s = f"{_e(nm)}({_e(code)})" if code else _e(nm)
+    return f"<b>{s}</b>" if bold else s
 
 
 def _display_width(s: str) -> int:
@@ -144,7 +159,7 @@ def render_detail(r: ScreenResult, news_title: str | None = None,
     head = [
         f"🚨 <b>[{r.grade} 등급 시그널]</b> {r.mark}",
         "",
-        f"📌 종목: <b>{_e(r.name)} ({r.ticker})</b>",
+        f"📌 종목: {stock_label(r.name, r.ticker, bold=True)}",
         f"📌 현재가: <b>{_fmt(r.price)}</b>",
         f"📌 트랙: {track_kr}",
         f"📌 매집 {r.value_score:.1f} / 추세 {r.trend_score:.1f}",
@@ -187,7 +202,7 @@ def render_digest(items: list[ScreenResult], asof, cfg: Config = DEFAULT) -> str
         if r.trend and r.trend.best_cross and r.trend.best_cross.kind == "GOLDEN":
             cross = f" · {r.trend.best_cross.pair}GC D+{r.trend.best_cross.bars_ago}"
         out.append(
-            f"\n{i}. <b>{_e(r.name)}</b> {r.mark} [{r.grade}]  "
+            f"\n{i}. {stock_label(r.name, r.ticker, bold=True)} {r.mark} [{r.grade}]  "
             f"V{r.value_score:.1f}/T{r.trend_score:.1f}\n"
             f"   {r.price:,.0f}원{cross}\n"
             + (line2 + "\n" if line2 else "")
@@ -220,7 +235,7 @@ def render_fib_list(items: list[ScreenResult], asof,
         gcs = ""
         if r.trend and r.trend.best_cross and r.trend.best_cross.kind == "GOLDEN":
             gcs = f" · {r.trend.best_cross.pair}GC D+{r.trend.best_cross.bars_ago}"
-        return (f"• <b>{_e(r.name)}</b> ({r.ticker}) {r.mark}\n"
+        return (f"• {stock_label(r.name, r.ticker, bold=True)} {r.mark}\n"
                 f"  {r.price:,.0f}원 · 되돌림 {f.ratio:.3f} · "
                 f"고점 {f.high:,.0f}({f.high_age}일전){gcs}")
 
@@ -319,7 +334,7 @@ def render_top10(picks: list, asof, trade_date: str, scanned: int,
     body = []
     for i, (slot, r) in enumerate(picks, 1):
         f, q, t = r.fib, r.liq, r.trend
-        l1 = (f"{i}. <b>{_e(r.name)}</b> ({r.ticker}) {r.mark} "
+        l1 = (f"{i}. {stock_label(r.name, r.ticker, bold=True)} {r.mark} "
               f"[{r.grade}·{SLOT_LABEL.get(slot, slot)}]")
         l2 = (f"   {r.price:,.0f}원 · 매집 {r.value_score:.1f} / 추세 "
               f"{r.trend_score:.1f}{_size_bits(size, r.ticker)}")
@@ -378,7 +393,7 @@ def render_reco_stored(rows, asof, send_dow_label: str = "일요일",
     body = []
     for _, r in rows.iterrows():
         slot = str(r["slot"])
-        l1 = (f"{int(r['rank'])}. <b>{_e(str(r['name']))}</b> ({r['ticker']}) "
+        l1 = (f"{int(r['rank'])}. {stock_label(r['name'], r['ticker'], bold=True)} "
               f"[{r['grade']}·{SLOT_LABEL.get(slot, slot)}]")
         if marks and marks.get(str(r["ticker"])):
             l1 += f" · {_e(marks[str(r['ticker'])])}"
@@ -564,7 +579,9 @@ def _audit_table(a: dict) -> list[str]:
 
 def _audit_block(a: dict) -> list[str]:
     """자기검증 블록. 다중 기간(audit_multi)과 단일(audit_recos) 둘 다 받는다."""
-    head = ["━━ ① 지난 추천 자기검증 ━━"]
+    head = ["━━ ① 지난 추천 자기검증 (중복 포함 참고용) ━━",
+            "• recos 건수 기준 — 같은 종목 재추천이 매번 따로 셉니다. "
+            "발송 문구의 성적(이벤트 기준)과 다릅니다"]
     if not a:
         return head + ["• 데이터 부족"]
     if "by_horizon" in a:
@@ -585,7 +602,7 @@ def _monthly_block(m: dict) -> list[str]:
         f"• 기간 {m.get('start', '')} ~ {m.get('end', '')}",
         f"• 추천 {m.get('recos', 0)}건 · 진입 {len(ent)}건 · 청산 {len(ex)}건",
         "",
-        "보유기간별 성적",
+        "보유기간별 성적 (중복 포함 참고용 · recos 건수 기준)",
     ]
     rows, _ = _horizon_rows(m)
     out.append("<pre>" + "\n".join(rows) + "</pre>")
@@ -906,8 +923,12 @@ def _tick_map(store, rows) -> dict:
     out: dict = {}
     if m is None or m.empty:
         return out
+    # 표시 값 = "종목명(종목코드)". 묶기(_group_events)에도 이 값이 들어가지만
+    # 이름↔코드가 1:1 이라 같은 종목 판정은 그대로다.
     for nid, grp in m.groupby("news_id"):
-        out[nid] = list(dict.fromkeys(grp["name"].tolist()))
+        out[nid] = list(dict.fromkeys(
+            f"{n}({t})" if str(n or "").strip() and str(n) != str(t) else str(t)
+            for n, t in zip(grp["name"], grp["ticker"])))
     return out
 
 
@@ -1020,7 +1041,7 @@ def render_evening_brief(store, asof, picks: list | None = None,
             for _, r in picks:
                 n = hit.get(r.ticker)
                 if n:
-                    out.append(f"• <b>{_e(r.name)}</b> 관련 뉴스 {n}건 "
+                    out.append(f"• {stock_label(r.name, r.ticker, bold=True)} 관련 뉴스 {n}건 "
                                f"· 매집 {r.value_score:.1f}/추세 {r.trend_score:.1f}")
         else:
             out.append("• 추천 종목 관련 뉴스 없음 (조용한 바닥일 수 있음)")
@@ -1101,7 +1122,7 @@ def render_watchlist(store) -> str:
             hit = [k for k in _WATCH_FLAG_KEYS if f.get(k)]
             if hit:
                 bits.append("⚑ " + "·".join(hit))
-            out.append(f"• <b>{_e(name)}</b>  " + "  ".join(bits))
+            out.append(f"• {stock_label(name, code, bold=True)}  " + "  ".join(bits))
     if scan_d:
         out.append(f"(스캔 기준일 {scan_d} · 등락률은 마지막 두 봉 종가 기준)")
     return "\n".join(out)
@@ -1175,7 +1196,7 @@ def render_exit_alert(dec, cfg: Config = DEFAULT) -> str:
     lines = [
         f"{head}{icon} <b>[청산 신호 · {label}]</b>",
         "",
-        f"📌 종목: <b>{_e(dec.name)} ({dec.ticker})</b>",
+        f"📌 종목: {stock_label(dec.name, dec.ticker, bold=True)}",
         f"📌 조치: <b>{act} 청산</b> · {dec.qty:,}주",
         f"📌 기준 종가: {dec.signal_price:,.0f}원",
         f"📌 수익률: <b>{dec.ret_pct:+.2f}%</b> "
@@ -1213,7 +1234,7 @@ def render_exit_digest(res: dict, asof, cfg: Config = DEFAULT) -> str:
         icon = _dec_icon(d)
         label = _dec_label(d)
         act = "전량" if d.action == "EXIT_ALL" else f"{d.ratio * 100:.0f}%"
-        out.append(f"{icon} <b>{_e(d.name)}</b> [{label}] {act} {d.qty:,}주")
+        out.append(f"{icon} {stock_label(d.name, d.ticker, bold=True)} [{label}] {act} {d.qty:,}주")
         out.append(f"   {d.signal_price:,.0f}원 · {d.ret_pct:+.2f}%")
         out.append(f"   {_e(d.reason[:90])}")
     out.append("")
@@ -1236,7 +1257,7 @@ def render_positions(positions: list, price_map: dict | None = None) -> str:
                 cur = float(df["종가"].iloc[-1])
         ret = f"{(cur / p.entry_price - 1) * 100:+.2f}%" if cur else "-"
         track = {"VALUE": "매집", "TREND": "추세"}.get(p.track, p.track)
-        out.append(f"#{p.id} <b>{_e(p.name)}</b> ({p.ticker}) [{track}]")
+        out.append(f"#{p.id} {stock_label(p.name, p.ticker, bold=True)} [{track}]")
         out.append(f"   진입 {p.entry_date} @ {p.entry_price:,.0f}원 "
                    f"· 잔량 {p.remaining:,}/{p.qty:,}주 · {ret}")
         stops = []

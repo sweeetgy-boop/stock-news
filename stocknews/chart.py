@@ -35,7 +35,7 @@ from .contracts import ObvSignal, ScreenResult
 from .cost_basis import POC_MIN_LOOKBACK, volume_profile
 from .indicators import moving_averages, obv_fit, obv_series, split_traces
 from .notify import TELEGRAM_CAPTION_MAX, caption_units, fit_caption, now_kst
-from .renderer import bar
+from .renderer import bar, stock_label
 from .screener import HARD_EXCLUSION_FLAGS
 
 log = logging.getLogger(__name__)
@@ -554,7 +554,7 @@ def render_chart(res: ScreenResult, ohlcv: pd.DataFrame, path,
 
         # ── 제목 · 범례 ──
         fig.text(0.075, top_y(0.31),
-                 f"{res.name} ({res.ticker})   {res.grade} 등급   "
+                 f"{res.name}({res.ticker})   {res.grade} 등급   "
                  f"매집 {res.value_score:.2f} · 추세 {res.trend_score:.2f}",
                  fontsize=14, fontweight="bold", color=INK, ha="left")
         sub = [f"기준일 {trade_date or df.index[-1].strftime('%Y-%m-%d')}",
@@ -637,7 +637,7 @@ def chart_caption(res: ScreenResult, rank: int | None = None,
     """
     head = f"{rank}. " if rank is not None else ""
     lines = [
-        f"📈 <b>{head}{_e(res.name)}</b> ({res.ticker}) [{res.grade}] {res.mark}".rstrip(),
+        f"📈 <b>{head}{stock_label(res.name, res.ticker)}</b> [{res.grade}] {res.mark}".rstrip(),
         f"매집 {res.value_score:.2f} · 추세 {res.trend_score:.2f} · "
         f"{TRACK_KR.get(res.track, res.track)} · 종가 {res.price:,.0f}원"
         + (f" ({trade_date})" if trade_date else ""),

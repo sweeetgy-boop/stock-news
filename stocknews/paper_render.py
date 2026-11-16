@@ -23,15 +23,20 @@ import pandas as pd
 from . import config as C
 from . import events as E
 from . import paper as P
-from .renderer import SLOT_LABEL, _e
+from .renderer import SLOT_LABEL, _e, stock_label
 
 log = logging.getLogger(__name__)
 
 __all__ = ["weekday_enabled", "contributions", "reasons_for", "slot_perf",
            "weekday_block", "sunday_scorecard", "curve_chart",
-           "weekly_shadow_block", "TEXT_LIMIT"]
+           "weekly_shadow_block", "TEXT_LIMIT", "SEND_LIMIT"]
 
 TEXT_LIMIT = 4096
+# 실제로 한 메시지에 담는 상한. notify._split 이 이 길이를 넘으면 줄 경계에서
+# 임의로 자른다(TELEGRAM_MAX - 128). 일요일 성적표는 그 전에 ③을 따로 떼어
+# 낸다 — 그래야 ③이 아닌 엉뚱한 곳에서 잘리지 않는다.
+SEND_LIMIT = TEXT_LIMIT - 128
+DISCLAIMER = "※ 검증 중 · 투자 판단 근거 아님"
 FOOTER = ("※ 추적 = 종이 편입(실제 보유 아님) · 다음 거래일 시가 · 왕복 "
           f"{C.ROUND_TRIP_COST_PCT:g}%p 차감 · 검증 중 · 투자 판단 근거 아님")
 FOOTER_LITE = "※ 검증 중 · 투자 판단 근거 아님"
@@ -267,8 +272,8 @@ def _new_section(store, d: str, rows: list[dict], perf: dict, paper_on: bool,
         for r in [x for x in rows if str(x.get("slot") or "").rstrip("*") == k]:
             t = str(r["ticker"])
             i += 1
-            out.append(f"{i}. <b>{_e(r.get('name') or t)}</b>"
-                       f" ({t}) [{_e(r.get('grade'))}·{_e(_slot_label(r.get('slot')))}]"
+            out.append(f"{i}. {stock_label(r.get('name'), t, bold=True)}"
+                       f" [{_e(r.get('grade'))}·{_e(_slot_label(r.get('slot')))}]"
                        f" 매집 {float(r.get('value_score') or 0):.1f} / 추세 "
                        f"{float(r.get('trend_score') or 0):.1f}")
             out.append(_reason_line(reasons.get(t)))
@@ -284,7 +289,7 @@ def _keep_section(rows: list[dict]) -> list[str]:
         return []
     out = [f"━━ 추천 유지 ({len(keep)}) ━━"]
     for r in keep:
-        out.append(f"• {_e(r.get('name') or r['ticker'])} ({r['ticker']}) — "
+        out.append(f"• {stock_label(r.get('name'), r['ticker'])} — "
                    f"추천 유지 {int(r.get('day_in_window') or 1)}일째")
     return out
 
@@ -298,7 +303,7 @@ def _matured_section(pd_, d: str) -> list[str]:
     for r in m.sort_values("net", ascending=False).to_dict("records"):
         tag = " [소급]" if int(r.get("backfill") or 0) else ""
         st = "" if r["status"] == E.ST_OK else f" ({_e(r['status'])})"
-        out.append(f"• <b>{_e(r.get('name') or r['ticker'])}</b> ({r['ticker']}) "
+        out.append(f"• {stock_label(r.get('name'), r['ticker'], bold=True)} "
                    f"{_pct(P._nan(r['net']))} · 지수 대비 "
                    f"{_pct(P._nan(r['ex_idx']), '%p')}{st}{tag}")
     return out
@@ -346,7 +351,7 @@ def _tracking_section(pd_, d: str, topn: int) -> tuple[list[str], dict]:
 
     def _ln(r):
         tag = " [소급]" if int(r.get("backfill") or 0) else ""
-        return (f"  {_e(r.get('name') or r['ticker'])} {_pct(P._nan(r['net']))}"
+        return (f"  {stock_label(r.get('name'), r['ticker'])} {_pct(P._nan(r['net']))}"
                 f"{_move_x(pd_.store, r)} ({int(r['day_n'])}일째){tag}")
     if topn > 0 and len(s):
         top = s.head(topn)
@@ -418,63 +423,199 @@ def _week_bounds(trade_d: str, cal: list[str]) -> tuple[str, str]:
     return mon, trade_d
 
 
-def sunday_scorecard(store, asof, trade_d: str, pdata=None, index=None
-                     ) -> tuple[str, dict]:
-    """일요일 주간 성적표 (PAPER_TRACKING). 새 추천 목록은 보내지 않는다."""
+def _md(x) -> str:
+    s = str(x or "")
+    return s[5:] if len(s) >= 10 else (s or "-")
+
+
+def _week_new(pd_, mon: str, fri: str, marks: pd.DataFrame) -> list[dict]:
+    """이번 주(신호일 mon~fri) 새 추천 — 편입 행 + 아직 편입 전인 발송 기록.
+
+    발송(paper_sends)은 됐는데 다음 거래일 시가가 아직 없으면 편입 행이
+    없다(금요일 저녁 발송분은 월요일 시가에 편입). 그것도 '이번 주 새
+    추천'이므로 '편입 대기'로 싣는다.
+    """
+    pos = pd_.book.positions()
+    pos = pos[(pos["signal_d"] >= mon) & (pos["signal_d"] <= fri)] \
+        if len(pos) else pos
+    cur = {}
+    if marks is not None and len(marks):
+        cur = {int(r["id"]): P._nan(r.get("net")) for r in marks.to_dict("records")}
+    rows: list[dict] = []
+    seen: set = set()
+    for r in (pos.to_dict("records") if len(pos) else []):
+        seen.add((str(r["signal_d"]), str(r["ticker"])))
+        if int(r.get("enrolled") or 0):
+            ret = cur.get(int(r["id"]))
+            rows.append({"ticker": r["ticker"], "name": r.get("name"),
+                         "slot": r.get("slot"), "signal_d": r["signal_d"],
+                         "entry": f"편입 {_md(r.get('entry_date'))}",
+                         "ret": _pct(ret) if ret is not None else "-"})
+        else:
+            rows.append({"ticker": r["ticker"], "name": r.get("name"),
+                         "slot": r.get("slot"), "signal_d": r["signal_d"],
+                         "entry": f"미편입({r.get('skip_reason') or r.get('entry_status')})",
+                         "ret": "-"})
+    sends = pd_.book.sends()
+    if len(sends):
+        sends = sends[(sends["d"] >= mon) & (sends["d"] <= fri)]
+    a = pd_.assigned
+    amap = {(str(x["d"]), str(x["ticker"])): x for x in a.to_dict("records")} \
+        if a is not None and len(a) else {}
+    for s in (sends.to_dict("records") if len(sends) else []):
+        k = (str(s["d"]), str(s["ticker"]))
+        if k in seen:
+            continue
+        rec = amap.get(k)
+        if rec is not None and (str(rec.get("event_date")), k[1]) in seen:
+            continue                     # 같은 이벤트가 이미 편입돼 있다
+        seen.add(k)
+        rows.append({"ticker": k[1], "name": (rec or {}).get("name"),
+                     "slot": (rec or {}).get("slot"), "signal_d": k[0],
+                     "entry": "편입 대기(다음 거래일 시가)", "ret": "-"})
+    rows.sort(key=lambda r: (str(r["signal_d"]), str(r["ticker"])))
+    return rows
+
+
+def _win(c: dict) -> str:
+    w = c.get("win")
+    return "-" if w is None or not np.isfinite(w) else f"{w:.0f}%"
+
+
+def _join_rows(items: list[str], per_line: int) -> list[str]:
+    per_line = max(1, int(per_line))
+    return [" · ".join(items[i:i + per_line])
+            for i in range(0, len(items), per_line)]
+
+
+def _cum_lines(pd_, m_all: pd.DataFrame, H: int) -> tuple[list[str], dict]:
+    """④ 누적 성적 두 줄 — 만기(H거래일) 확정분, 이벤트 기준."""
+    if m_all is None or m_all.empty:
+        return ["없음"], {}
+    c = E.stat_cell(m_all["net"])
+    x = E.stat_cell(m_all["ex_idx"])
+    pct, _rank = P.pooled_percentile(
+        m_all, P.matured_random(pd_, set(m_all["signal_d"]), H))
+    few = " · 표본 부족" if len(m_all) < int(C.MIN_SCORED_FOR_JUDGMENT) else ""
+    l1 = (f"• 만기 {len(m_all)}건 · 지수 대비 평균 {_pct(x['mean'], '%p')} · "
+          f"승률 {_win(c)}"
+          f" · 무작위 대비 백분위 {'-' if pct is None else f'{pct:.0f}'}{few}")
+    parts = []
+    mm = m_all.assign(slot_key=m_all["slot"].astype(str).str.rstrip("*"))
+    order = [k for k in ("VALUE", "TREND", "SEQ", "FILL") if k in set(mm["slot_key"])]
+    order += sorted(set(mm["slot_key"]) - set(order))
+    for k in order:
+        g = mm[mm["slot_key"] == k]
+        cx = E.stat_cell(g["ex_idx"])
+        cw = E.stat_cell(g["net"])
+        lab = _e(_slot_label(k))
+        if not cx.get("enough"):
+            parts.append(f"{lab} 표본 부족(n={cx.get('n', len(g))})")
+        else:
+            parts.append(f"{lab} {_pct(cx['mean'], '%p')}·승률 {cw['win']:.0f}%"
+                         f"(n={cx['n']})")
+    l2 = "• 유형별 지수 대비: " + " · ".join(parts)
+    info = {"mean": c.get("mean"), "win": c.get("win"), "ex_idx": x.get("mean"),
+            "pct": pct}
+    return [l1, l2], info
+
+
+def sunday_scorecard(store, asof, trade_d: str, pdata=None, index=None,
+                     limit: int | None = None) -> tuple[str, dict]:
+    """일요일 주간 성적표 (PAPER_TRACKING) — 주간 메시지는 이것 하나만 나간다.
+
+      ① 이번 주 새 추천   종목명(종목코드) · 유형 · 편입일 · 현재 수익률
+      ② 이번 주 만기      종목명(종목코드) · 최종 수익률 · 지수 대비
+      ③ 추적 중 전체      종목명(종목코드) 수익률, 높은 순, 가운뎃점으로 이어
+                          한 줄에 여러 종목. 생략 없음
+      ④ 누적 성적 두 줄   지수 대비·승률·무작위 대비 백분위 / 유형별
+      ⑤ 면책 문구
+    0건인 칸은 "없음" 한 줄. 합쳐서 SEND_LIMIT 를 넘으면 ③을 다음 메시지로
+    떼어 보낸다(info["messages"]). 종목은 빼지 않는다 — ③ 자체가 길면 ③을
+    여러 메시지로 나눈다. 성적은 전부 이벤트 기준(paper_positions: 중복 제거 ·
+    다음 거래일 시가 편입 · 왕복 비용 차감)이다.
+    """
+    limit = int(SEND_LIMIT if limit is None else limit)
     pd_ = pdata or P.PaperData(store, trade_d, index=index)
     mon, fri = _week_bounds(trade_d, pd_.cal)
-    pos = pd_.book.positions()
-    pos = pos[pos["signal_d"] <= trade_d] if len(pos) else pos
-    wk = pos[(pos["signal_d"] >= mon)] if len(pos) else pos
+    H = int(C.PAPER_DISPLAY_DAYS)
+    marks = P.active_marks(pd_, trade_d)
+    new = _week_new(pd_, mon, fri, marks)
     m_all = P.matured_on(pd_, trade_d)
     m_wk = m_all[m_all["exit_date"] >= mon] if len(m_all) else m_all
-    skipped_all = int((pos["enrolled"] == 0).sum()) if len(pos) else 0
-    skipped_wk = int((wk["enrolled"] == 0).sum()) if len(wk) else 0
-    info = {"week": [mon, fri], "new": int(len(wk)), "matured_week": int(len(m_wk)),
-            "matured_all": int(len(m_all)), "not_enrolled": skipped_all,
-            "week_tickers": [str(t) for t in wk["ticker"]] if len(wk) else []}
-    H = int(C.PAPER_DISPLAY_DAYS)
-    out = [f"🗓 <b>[주간 성적표]</b> {asof:%Y-%m-%d} · 기준 거래일 {trade_d}",
-           f"• 이번 주({mon}~{fri}) 새 추천 {len(wk)}건 · 만기 {len(m_wk)}건 · "
-           f"미편입 {skipped_wk}건 (누적 {skipped_all}건)", ""]
-    out.append(f"━━ 만기분 누적 ({H}거래일, n={len(m_all)}) ━━")
-    if m_all.empty:
-        out.append("• 만기된 추적 종목 없음")
+
+    head = [f"🗓 <b>[주간 성적표]</b> {asof:%Y-%m-%d} · 기준 거래일 {trade_d}",
+            f"• 이번 주 {mon}~{fri} · 성적은 이벤트 기준(같은 종목 재추천 1건) · "
+            f"다음 거래일 시가 편입 · 왕복 {C.ROUND_TRIP_COST_PCT:g}%p 차감"]
+    s1 = [f"━━ ① 이번 주 새 추천 ({len(new)}) ━━"]
+    s1 += [f"• {stock_label(r['name'], r['ticker'])} · {_e(_slot_label(r['slot']))}"
+           f" · {_e(r['entry'])} · {r['ret']}" for r in new] or ["없음"]
+    s2 = [f"━━ ② 이번 주 만기 ({len(m_wk)}) · {H}거래일 확정 ━━"]
+    if len(m_wk):
+        for r in m_wk.sort_values("net", ascending=False).to_dict("records"):
+            st = "" if r["status"] == E.ST_OK else f" ({_e(r['status'])})"
+            s2.append(f"• {stock_label(r.get('name'), r['ticker'])} · 최종 "
+                      f"{_pct(P._nan(r['net']))} · 지수 대비 "
+                      f"{_pct(P._nan(r['ex_idx']), '%p')}{st}")
     else:
-        c = E.stat_cell(m_all["net"])
-        x = E.stat_cell(m_all["ex_idx"])
-        pct, rank = P.pooled_percentile(
-            m_all, P.matured_random(pd_, set(m_all["signal_d"]), H))
-        mdd = m_all["mdd"].astype(float).dropna()
-        if c["n"]:
-            out.append(f"• 평균 {_pct(c['mean'])} · 중앙 {_pct(c['median'])} · "
-                       f"승률 {c['win']:.0f}%")
-        out.append(f"• 지수 대비 평균 {_pct(x['mean'], '%p')} · 무작위 대비 백분위 "
-                   f"{'-' if pct is None else f'{pct:.0f}'}")
-        if len(mdd):
-            out.append(f"• 최대 낙폭 중앙 {mdd.median():+.2f}% · 최악 {mdd.min():+.2f}%")
-        info.update({"mean": c["mean"], "median": c["median"], "win": c["win"],
-                     "ex_idx": x["mean"], "pct": pct})
-    if len(m_all) < int(C.MIN_SCORED_FOR_JUDGMENT):
-        out.append("• 표본 부족 — 판단 보류")
-    if len(m_all):
-        out.append("")
-        out.append("━━ 슬롯별 ━━")
-        m_all = m_all.assign(slot_key=m_all["slot"].astype(str).str.rstrip("*"))
-        for k, g in m_all.groupby("slot_key"):
-            out.append(f"• {_e(_slot_label(k))}: {E.fmt_cell(E.stat_cell(g['net']))}")
-        out.append("━━ 국면별 ━━")
-        reg = m_all["regime"].fillna("국면 없음")
-        for k, g in m_all.groupby(reg):
-            out.append(f"• {_e(k)}: {E.fmt_cell(E.stat_cell(g['net']))}")
-    out.append("")
-    out.append(FOOTER)
-    out.append(f"⏰ {asof:%Y-%m-%d %H:%M:%S}")
-    return "\n".join(out), info
+        s2.append("없음")
+    n3 = 0 if marks is None else int(len(marks))
+    s3_head = f"━━ ③ 추적 중 전체 ({n3}종목 · 수익률 높은 순) ━━"
+    s3_body: list[str] = []
+    if n3:
+        mk = marks.assign(_v=marks["net"].astype(float))
+        mk = mk.sort_values("_v", ascending=False, na_position="last")
+        items = [f"{stock_label(r.get('name'), r['ticker'])} "
+                 f"{_pct(P._nan(r['net']))}" for r in mk.to_dict("records")]
+        s3_body = _join_rows(items, int(getattr(C, "PAPER_SUNDAY_PER_LINE", 3)))
+    else:
+        s3_body = ["없음"]
+    cum, cinfo = _cum_lines(pd_, m_all, H)
+    s4 = [f"━━ ④ 누적 성적 (만기 {H}거래일) ━━", *cum]
+    s5 = [DISCLAIMER]
+
+    def _join(blocks):
+        return "\n\n".join("\n".join(b) for b in blocks if b)
+
+    full = _join([head, s1, s2, [s3_head, *s3_body], s4, s5])
+    messages = [full]
+    split = False
+    if len(full) > limit:
+        split = True
+        first = _join([head, s1, s2, [s3_head, "• 다음 메시지로 보냄"], s4, s5])
+        messages = [first]
+        chunk: list[str] = []
+        parts: list[list[str]] = []
+        for ln in s3_body:
+            cand = chunk + [ln]
+            if chunk and len("\n".join(["X" * 60, s3_head, *cand])) > limit:
+                parts.append(chunk)
+                chunk = [ln]
+            else:
+                chunk = cand
+        if chunk:
+            parts.append(chunk)
+        for i, p in enumerate(parts, 1):
+            tag = f" ({i}/{len(parts)})" if len(parts) > 1 else ""
+            messages.append("\n".join(
+                [f"🗓 <b>[주간 성적표 ③]</b> 기준 거래일 {trade_d}{tag}",
+                 s3_head, *p]))
+    info = {"week": [mon, fri], "new": len(new), "matured_week": int(len(m_wk)),
+            "matured_all": int(len(m_all)), "tracking": n3,
+            "week_tickers": [str(r["ticker"]) for r in new
+                             if not str(r["entry"]).startswith("미편입")],
+            "split": split, "messages": messages,
+            "lengths": [len(x) for x in messages], **cinfo}
+    return "\n\n".join(messages) if split else full, info
 
 
 def curve_points(pd_, d: str) -> pd.DataFrame:
-    """만기 코호트(신호일)별 평균 → 누적합. 추천 / 지수 / 무작위 중앙값."""
+    """만기 코호트(신호일)별 동일 비중 평균 → 신호일 순서로 이어 붙인 지수(시작=100).
+
+    level_i = level_{i-1} × (1 + 코호트 i 평균 수익률). 추천 / 지수 / 무작위 중앙값.
+    코호트끼리 보유 구간이 겹치므로 실제 계좌 곡선이 아니라 '코호트를 하나씩
+    차례로 들었다면'의 연결 지수다.
+    """
     m = P.matured_on(pd_, d)
     if m.empty:
         return pd.DataFrame()
@@ -483,17 +624,18 @@ def curve_points(pd_, d: str) -> pd.DataFrame:
     rows = []
     for sd, g in m.groupby("signal_d"):
         lst = [x[0] for x in rnd.get(sd, []) if x[0] is not None]
-        rows.append({"signal_d": sd, "reco": P._nan(g["net"].astype(float).mean()),
+        rows.append({"signal_d": sd, "n": int(len(g)),
+                     "reco": P._nan(g["net"].astype(float).mean()),
                      "index": P._nan(g["idx"].astype(float).mean()),
                      "random": float(np.median(lst)) if lst else np.nan})
-    df = pd.DataFrame(rows).sort_values("signal_d")
+    df = pd.DataFrame(rows).sort_values("signal_d").reset_index(drop=True)
     for c in ("reco", "index", "random"):
-        df[f"cum_{c}"] = df[c].fillna(0.0).cumsum()
+        df[f"lvl_{c}"] = 100.0 * (1.0 + df[c].astype(float).fillna(0.0) / 100.0).cumprod()
     return df
 
 
 def curve_chart(pd_, d: str, path) -> Path | None:
-    """누적 곡선 1장 (추천 vs 시장 지수 vs 무작위 중앙값). 없으면 None."""
+    """누적 지수 1장 (추천 vs 시장 지수 vs 무작위 중앙값, 시작=100). 없으면 None."""
     df = curve_points(pd_, d)
     if df.empty:
         return None
@@ -508,17 +650,23 @@ def curve_chart(pd_, d: str, path) -> Path | None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=110)
-    x = pd.to_datetime(df["signal_d"])
-    ax.plot(x, df["cum_reco"], marker="o", lw=2, color="#2a6fdb", label="추천 (종이 편입)")
-    ax.plot(x, df["cum_index"], marker="s", lw=1.5, color="#7a7a7a", label="시장 지수")
-    ax.plot(x, df["cum_random"], marker="^", lw=1.5, color="#e08a2a",
-            label="무작위 중앙값")
-    ax.axhline(0, color="#bbbbbb", lw=0.8)
-    ax.set_title(f"만기 코호트 누적 ({int(C.PAPER_DISPLAY_DAYS)}거래일 수익률 합, %p)")
-    ax.set_xlabel("신호일")
+    x = list(range(len(df) + 1))
+    labels = ["시작"] + [str(s)[5:] for s in df["signal_d"]]
+    for col, kw in (("reco", dict(marker="o", lw=2, color="#2a6fdb",
+                                  label="추천 (종이 편입)")),
+                    ("index", dict(marker="s", lw=1.5, color="#7a7a7a",
+                                   label="시장 지수")),
+                    ("random", dict(marker="^", lw=1.5, color="#e08a2a",
+                                    label="무작위 중앙값"))):
+        ax.plot(x, [100.0] + df[f"lvl_{col}"].tolist(), **kw)
+    ax.axhline(100, color="#bbbbbb", lw=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_title(f"만기 코호트 연결 지수 (시작=100 · 코호트 = 같은 날 편입 묶음의 "
+                 f"{int(C.PAPER_DISPLAY_DAYS)}거래일 동일 비중 수익률)", fontsize=10)
+    ax.set_xlabel("코호트 신호일")
     ax.grid(alpha=0.3)
     ax.legend(loc="best", fontsize=9)
-    fig.autofmt_xdate()
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -527,10 +675,11 @@ def curve_chart(pd_, d: str, path) -> Path | None:
 
 def curve_caption(df: pd.DataFrame, d: str) -> str:
     last = df.iloc[-1]
-    return (f"📈 <b>추천 성적 누적 곡선</b> (기준 {d}, 코호트 {len(df)}개)\n"
-            f"추천 {last['cum_reco']:+.2f}%p · 지수 {last['cum_index']:+.2f}%p · "
-            f"무작위 중앙 {last['cum_random']:+.2f}%p\n"
-            "코호트 = 같은 날 편입된 묶음의 20거래일 평균 수익률, 단순 누적합\n"
+    return (f"📈 <b>추천 성적 누적 지수</b> (시작=100 · 기준 {d} · 코호트 {len(df)}개)\n"
+            f"추천 {last['lvl_reco']:.1f} · 지수 {last['lvl_index']:.1f} · "
+            f"무작위 중앙 {last['lvl_random']:.1f}\n"
+            f"코호트 = 같은 날 편입된 묶음의 {int(C.PAPER_DISPLAY_DAYS)}거래일 동일 비중 "
+            "평균 수익률. 신호일 순서로 이어 붙임(보유 구간이 겹치므로 실제 계좌 곡선 아님)\n"
             f"<i>{_e(C.CHART_DISCLAIMER)}</i>")
 
 

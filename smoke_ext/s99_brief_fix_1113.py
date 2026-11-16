@@ -72,14 +72,14 @@ def run(check, near, tmp):
         out, info = nv.dart_block(None, f, "2026-11-12",
                                   fetch=lambda b, e: {"rows": rows})
         body = [x for x in out if x.startswith("•")]
-        assert body[-1] == "• 정기보고서 4건(가나·다라·마바)", body
+        assert body[-1] == "• 정기보고서 4건: 가나(111110)·다라(222220)·마바(333330)", body
         assert not any("분기보고서" in x or "반기보고서" in x for x in body[:-1]), body
         assert any("주요사항보고서" in x for x in body), "정기 아닌 보고서가 빠졌다"
         assert any("영업(잠정)실적" in x for x in body)
         assert info["periodic"] == 4 and info["rows"] == 6
         only = [r for r in rows if "분기" in r["report_nm"]]
         out2, _ = nv.dart_block(None, f, "2026-11-12", fetch=lambda b, e: {"rows": only})
-        assert [x for x in out2 if x.startswith("•")] == ["• 정기보고서 2건(가나)"], out2
+        assert [x for x in out2 if x.startswith("•")] == ["• 정기보고서 2건: 가나(111110)"], out2
     check(S, "공시 블록: 정기보고서(기재정정 포함)는 맨 아래 한 줄", periodic_dart)
 
     def name_boundary():

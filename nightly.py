@@ -289,8 +289,11 @@ JOBS: dict[str, Job] = {
                          _one("brief-evening", ["--mode", "brief-evening"]),
                          cron="0 23 * * 1-5",
                          max_late_sec=brief_max_late_sec()),
+    # 2026-11-16: 금요일 weekly 는 발송하지 않는다(파일 저장 + 관리자 한 줄은
+    # run_screen 이 보낸다). 그래서 완료 알림도 실패일 때만 보낸다(quiet_ok).
     "weekly": Job("weekly", "주간 리포트", "\U0001f4c8",
-                  _one("weekly", ["--mode", "weekly"]), cron="45 22 * * 5"),
+                  _one("weekly", ["--mode", "weekly"]), cron="45 22 * * 5",
+                  quiet_ok=True),
     # 장중 5분 간격. 마커도 완료 알림도 없다.
     "flash": Job("flash", "flash", "\u26a1",
                  _one("flash", ["--mode", "flash", *FLASH_EXTRA_ARGS]),

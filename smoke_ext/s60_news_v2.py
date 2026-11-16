@@ -217,9 +217,9 @@ def run(check, near, tmp):
             body.append(l)
         assert body == [
             '• <a href="https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20261111000200">'
-            '가나전자 기업설명회(IR)개최</a> (2건)',
+            '가나전자(000010) 기업설명회(IR)개최</a> (2건)',
             '• <a href="https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20261111000123">'
-            '가나전자 주요사항보고서(자기주식취득결정)</a>',
+            '가나전자(000010) 주요사항보고서(자기주식취득결정)</a>',
         ], body
         assert "비대상" not in text
         assert text.index("📑") < text.index("⭐"), "공시 블록이 뉴스 위가 아님"
