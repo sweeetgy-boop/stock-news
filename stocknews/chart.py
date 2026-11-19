@@ -193,14 +193,19 @@ def korean_font(cfg: Config = DEFAULT) -> str | None:
 
     matplotlib 기본 폰트(DejaVu Sans)에는 한글이 없어 □ 로 나온다. 에러가
     아니라 경고만 나고 PNG 는 멀쩡히 생기므로, 보기 전에는 모른다.
+
+    찾는 순서: `cfg.chart.font`(맑은 고딕) -> Windows 면 malgun.ttf 직접 등록
+    -> `cfg.chart.font_fallbacks`(macOS·Linux 의 한글 폰트). Windows 에서는
+    첫 단계에서 끝나므로 예전과 같은 폰트가 잡힌다.
     """
     if "name" in _FONT:
         return _FONT["name"]
     from matplotlib import font_manager
 
     want = cfg.chart.font
-    name = want if any(f.name == want for f in font_manager.fontManager.ttflist) else None
-    if name is None:
+    have = {f.name for f in font_manager.fontManager.ttflist}
+    name = want if want in have else None
+    if name is None and os.name == "nt":
         # 폰트 캐시가 시스템 폰트를 못 본 경우. 파일을 직접 등록한다.
         windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows"
         p = Path(windir) / "Fonts" / "malgun.ttf"
@@ -211,8 +216,11 @@ def korean_font(cfg: Config = DEFAULT) -> str | None:
             except Exception as exc:  # noqa: BLE001
                 log.warning("맑은 고딕 등록 실패 (%s): %s", p, exc)
     if name is None:
-        log.warning("한글 폰트 '%s' 없음 — 차트의 한글이 □ 로 깨집니다. "
-                    "맑은 고딕(malgun.ttf)을 설치하십시오.", want)
+        name = next((f for f in cfg.chart.font_fallbacks if f in have), None)
+    if name is None:
+        log.warning("한글 폰트 '%s' 없음 (후보 %s 도 없음) — 차트의 한글이 □ 로 "
+                    "깨집니다. 맑은 고딕(Windows) 또는 후보 폰트 중 하나를 "
+                    "설치하십시오.", want, ", ".join(cfg.chart.font_fallbacks) or "-")
     _FONT["name"] = name
     return name
 

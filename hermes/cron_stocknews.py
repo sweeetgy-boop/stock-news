@@ -2,7 +2,8 @@
 """Hermes cron -> stock-news 잡 드라이버. LLM 없음. 표준 라이브러리만.
 
 이 파일은 저장소의 **정본**이고, 실제로 도는 사본은
-`%LOCALAPPDATA%\\hermes\\scripts\\stocknews_<잡>.py` 에 있습니다.
+Hermes 의 scripts 폴더(`~/.hermes/scripts/stocknews_<잡>.py`, Windows 는
+`%LOCALAPPDATA%\\hermes\\scripts\\`)에 있습니다.
 Hermes 의 `--script` 는 그 디렉터리 아래만 받습니다. 고칠 때는 정본과
 사본 전부를 같이 고치십시오.
 
@@ -27,7 +28,8 @@ Hermes cron 은 잡을 두 형태로 돌립니다. LLM 에이전트에게 프롬
 
 계약
 ----
-- `nightly.cmd --job <잡>` 을 **정확히 1회** 호출한다.
+- 런처(`nightly.cmd` · macOS 는 `nightly.sh`)에 `--job <잡>` 을 붙여
+  **정확히 1회** 호출한다.
 - 종료 코드가 무엇이든 재시도하지 않는다. 다음 기회는 다음 트리거다.
 - `--force` 를 붙이지 않는다. 완주 마커를 우회하는 유일한 수단이므로,
   자동 경로에서는 절대 쓰지 않는다.
@@ -41,8 +43,45 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-REPO = r"C:\Users\sweee\Documents\stock-news"
-LAUNCHER = REPO + r"\hermes\nightly.cmd"
+# 호스트별 운영 저장소와 런처.
+#
+# 사본은 Hermes 의 scripts 폴더에서 돌므로 `__file__` 로는 저장소를 찾을 수
+# 없다. 그래서 OS 별 기본 경로를 여기 박아 두고, 같은 바이트가 Windows 와
+# macOS 양쪽에서 돈다.
+#
+#   Windows   C:\Users\sweee\Documents\stock-news    cmd /c hermes\nightly.cmd
+#   macOS     ~/stock-news-prod                       /bin/sh hermes/nightly.sh
+#
+# STOCKNEWS_REPO 는 검증용이다(격리된 사본을 이 사슬 그대로 돌려볼 때).
+# 운영에서는 설정하지 않는다 — 설정하면 그 경로가 운영 저장소가 된다.
+_WIN = os.name == "nt"
+REPO_WINDOWS = r"C:\Users\sweee\Documents\stock-news"
+REPO_POSIX = "~/stock-news-prod"
+REPO_ENV = "STOCKNEWS_REPO"
+
+
+def repo_dir(environ=None, windows=None) -> str:
+    """이 호스트의 운영 저장소 경로."""
+    environ = os.environ if environ is None else environ
+    windows = _WIN if windows is None else windows
+    override = (environ.get(REPO_ENV) or "").strip()
+    if override:
+        return os.path.expanduser(override)
+    return REPO_WINDOWS if windows else os.path.expanduser(REPO_POSIX)
+
+
+def launch_cmd(repo: str, args=(), windows=None) -> list:
+    """런처 호출 명령. Windows 는 cmd /c + .cmd, 그 밖은 /bin/sh + .sh.
+
+    /bin/sh 로 명시해 부르므로 .sh 의 실행 비트에 기대지 않는다.
+    """
+    windows = _WIN if windows is None else windows
+    if windows:
+        return ["cmd", "/c", repo + r"\hermes\nightly.cmd", *args]
+    return ["/bin/sh", repo.rstrip("/") + "/hermes/nightly.sh", *args]
+
+
+REPO = repo_dir()
 
 # 잡별 시간 상한(초). '이건 매달린 것이다' 를 뜻하는 값이지 정상 상한이
 # 아니다. nightly 실측 최악은 backfill 이 끼지 않는 한 40분 안쪽이고,
@@ -103,7 +142,7 @@ def main() -> int:
         print(f"부모 파이썬 환경 제거: {', '.join(dropped)}", flush=True)
     try:
         proc = subprocess.run(
-            ["cmd", "/c", LAUNCHER, "--job", job],
+            launch_cmd(REPO, ("--job", job)),
             cwd=REPO,
             capture_output=True,
             timeout=TIMEOUT_SEC.get(job, DEFAULT_TIMEOUT),
@@ -120,7 +159,7 @@ def main() -> int:
         return 1
 
     mins = (datetime.now() - started).total_seconds() / 60.0
-    # 정상 경로는 한 줄만 남긴다. 상세는 logs\<잡>_YYYYMMDD.log 와 DB
+    # 정상 경로는 한 줄만 남긴다. 상세는 logs/<잡>_YYYYMMDD.log 와 DB
     # runs 테이블에 있고, 사람에게 가는 알림은 nightly.py 가 이미 보냈다.
     print(f"{job} rc={rc} · {mins:.0f}분", flush=True)
 

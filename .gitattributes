@@ -1,0 +1,2 @@
+# sh 는 CRLF 로 체크아웃되면 실행되지 않는다 (Windows autocrlf 방어).
+*.sh text eol=lf

@@ -2,6 +2,9 @@
 
 이 저장소를 자동으로 운용하는 에이전트를 위한 규약입니다.
 호스트는 **Windows PC (타임존 KST)** 이고, 모든 실행은 아래 래퍼를 통합니다.
+macOS 호스트(2026-11 이관 준비)에서는 같은 규약을 `.sh` 래퍼로 지킵니다 —
+`hermes\nightly.cmd` 는 `hermes/nightly.sh`, `hermes\run.cmd` 는 `hermes/run.sh`
+로 읽으십시오. 다른 점은 16장에 모았습니다.
 
 ---
 
@@ -503,8 +506,8 @@ hermes\run.cmd --mode runs         배치 이력 + 스케줄 공백 점검
 이라 락을 잡지 않고 DB 를 바꾸지 않습니다(5장). 파이프라인 단계도
 아닙니다. 상태를 확인할 때 언제든 부르십시오.
 
-코드를 수정했다면 **반드시 `smoke` 를 먼저 돌리십시오.** 263건 전부 통과해야
-합니다. 실패가 있으면 커밋하지 마십시오.
+코드를 수정했다면 **반드시 `smoke` 를 먼저 돌리십시오.** 전 항목이 통과해야
+합니다(2026-11-19 현재 742건). 실패가 있으면 커밋하지 마십시오.
 
 DB 안의 `runs` 테이블에 모든 배치 이력(모드·성공·실패·소요)이 남습니다.
 `main()` 이 한 곳에서 기록하므로 예외로 죽은 실행도 남습니다.
@@ -1311,3 +1314,51 @@ nightly 완료나 락 해제를 기다릴 때는 **간격과 상한을 정한 �
   만들지 마십시오.
 - 뉴스 태그(`_tick_map`), 공시 블록, 차트 캡션, 브리핑 ①②③, 일요일 성적표,
   청산 신호가 전부 이 함수를 씁니다.
+
+---
+
+## 16. macOS 호스트 — Windows 와 같은 규약, 다른 래퍼 (2026-11-19)
+
+같은 저장소·같은 커밋이 Windows 와 macOS 양쪽에서 돕니다. 판단(마커·락·
+휴장·알림·종료 코드)은 전부 `nightly.py` / `run_screen.py` 에 있고 OS 를
+보지 않습니다. OS 마다 다른 것은 '인터프리터를 찾아 넘기는' 부분뿐입니다.
+
+```
+                Windows                              macOS
+파이프라인      hermes\nightly.cmd                   hermes/nightly.sh
+개별·점검       hermes\run.cmd                       hermes/run.sh
+인터프리터      venv\Scripts\python.exe -> ...       venv/bin/python -> .venv/bin/python
+                                                     -> PATH 의 python3.13/3.12/3.11/python3
+cron 스크립트   %LOCALAPPDATA%\hermes\scripts\       ~/.hermes/scripts/
+운영 저장소     C:\Users\sweee\Documents\stock-news  ~/stock-news-prod
+개발 클론       (별도)                               ~/projects/stock-news
+한글 폰트       Malgun Gothic                        Apple SD Gothic Neo (-> AppleGothic)
+```
+
+- **래퍼 규칙은 같습니다.** 저장소 루트로 cd(실패 90) · UTF-8 환경변수 3개 ·
+  인터프리터 탐색(없으면 91) · 정확히 3.12 가드(아니면 92) · 종료 코드 그대로.
+  `nightly.sh` 만 `STOCKNEWS_ENTRY=nightly` 를 세웁니다. 두 `.sh` 는 ASCII 와
+  셸 내장 명령만 씁니다 — Hermes cron 의 PATH 가 비어도 돌아야 하기 때문입니다.
+- **cron 스크립트는 한 벌입니다.** `hermes/cron_stocknews.py` ·
+  `hermes/cron_nightly.py` 가 `os.name` 으로 저장소 경로와 런처를 고릅니다
+  (Windows: `cmd /c ...nightly.cmd` · 그 밖: `/bin/sh ...nightly.sh`).
+  `STOCKNEWS_REPO` 는 격리된 사본을 같은 사슬로 돌려보는 **검증용**입니다.
+  운영 환경에는 설정하지 마십시오 — 설정하면 그 경로가 운영 저장소가 됩니다.
+- **실발송 스위치는 OS 환경변수 `STOCKNEWS_SEND=1` 그대로입니다.** macOS 에는
+  `setx` 가 없으므로 Hermes 게이트웨이(LaunchAgent)의 환경에 넣어야 합니다.
+  넣기 전까지 발송 모드는 전부 `--dry-run` 입니다.
+  **단, `nightly.py` 자신의 운영 알림(완료·스킵·실패 -> 관리자 채팅)은
+  `STOCKNEWS_SEND` 와 무관하게 나갑니다.** dry-run 검증은 `--no-telegram` 을
+  붙이고, 텔레그램 키가 없는 격리 사본에서 하십시오(15장).
+- **실행 주체는 한 대입니다.** Windows 와 macOS 가 같은 날 같은 잡을 돌면
+  1장의 사고가 기계 두 대로 재현됩니다(마커·락은 기계마다 따로입니다).
+  한쪽 Hermes 잡 6개를 전부 pause 한 것을 `hermes cron list` 로 확인한 뒤에
+  다른 쪽을 켜십시오.
+- **운영 폴더는 `git pull` 만 합니다.** 수정·smoke 는 개발 클론에서 합니다.
+- `.env` 는 CRLF 그대로 옮겨도 됩니다. 로더(`stocknews/env.py`)가 줄 끝을
+  정리합니다. 셸에서 `source` 하지 마십시오 — 값 끝에 `\r` 이 붙습니다.
+- `KIWOOM_OPENAPI_DIR` 은 OCX 점검(`kiwoom.check_environment`)만 읽습니다.
+  macOS 에는 OCX 가 없으므로 의미가 없고, REST 경로(`credit-kiwoom`)는 읽지
+  않습니다.
+- `hermes/afterclose.cmd` · `first_run.cmd` · `run.ps1` 은 Windows 전용이고
+  macOS 대응본이 없습니다(파이프라인 경로가 아닙니다).

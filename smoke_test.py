@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -6722,6 +6723,62 @@ def test_cron_jobs(tmp: Path):
         finally:
             shim.__file__ = saved_file
 
+    def _load_cron(fname: str):
+        sp = importlib.util.spec_from_file_location(
+            "_cron_" + fname.replace(".", "_"), str(repo / "hermes" / fname))
+        mod = importlib.util.module_from_spec(sp)
+        sp.loader.exec_module(mod)
+        return mod
+
+    def t_cron_host_paths():
+        """같은 바이트가 Windows 와 macOS 에서 각자의 런처를 부른다.
+
+        Windows 쪽 값은 2026-11 이관 전 하드코딩과 글자 단위로 같아야 한다 —
+        달라지면 운영 PC 의 사본이 다른 것을 띄운다.
+        """
+        win_repo = "C:\\Users\\sweee\\Documents\\stock-news"
+        for fname, args in (("cron_stocknews.py", ("--job", "news")),
+                            ("cron_nightly.py", ())):
+            m = _load_cron(fname)
+            assert m.repo_dir({}, windows=True) == win_repo, m.repo_dir({}, windows=True)
+            assert m.launch_cmd(win_repo, args, windows=True) == [
+                "cmd", "/c", win_repo + "\\hermes\\nightly.cmd", *args]
+            home = m.repo_dir({}, windows=False)
+            assert home == os.path.expanduser("~/stock-news-prod"), home
+            assert m.launch_cmd(home, args, windows=False) == [
+                "/bin/sh", home + "/hermes/nightly.sh", *args]
+            # 검증용 오버라이드. 공백뿐이면 무시한다.
+            assert m.repo_dir({"STOCKNEWS_REPO": " /x/y "}, windows=False) == "/x/y"
+            assert m.repo_dir({"STOCKNEWS_REPO": "  "}, windows=False) == home
+            # 이 호스트의 기본값이 실제로 쓰인다
+            assert m.REPO == m.repo_dir(), (m.REPO, m.repo_dir())
+            # --force / --no-telegram 같은 인자를 스크립트가 덧붙이지 않는다
+            src = (repo / "hermes" / fname).read_text(encoding="utf-8")
+            assert '"--force"' not in src and "'--force'" not in src, fname
+
+    def t_cron_helpers_identical():
+        """두 정본의 호스트 판정 블록은 같은 글자여야 한다 (한쪽만 고치는 사고 방지)."""
+        def block(fname):
+            src = (repo / "hermes" / fname).read_text(encoding="utf-8")
+            a = src.index("# 호스트별 운영 저장소와 런처.")
+            b = src.index("REPO = repo_dir()")
+            return src[a:b]
+        assert block("cron_stocknews.py") == block("cron_nightly.py")
+
+    def t_cron_stdlib_only():
+        """Hermes 번들 파이썬으로 돈다. 표준 라이브러리 말고는 import 하지 않는다."""
+        import ast
+        allowed = {"os", "subprocess", "sys", "datetime", "pathlib"}
+        for fname in ("cron_stocknews.py", "cron_nightly.py"):
+            tree = ast.parse((repo / "hermes" / fname).read_text(encoding="utf-8"))
+            mods = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    mods |= {a.name.split(".")[0] for a in node.names}
+                elif isinstance(node, ast.ImportFrom):
+                    mods.add((node.module or "").split(".")[0])
+            assert mods <= allowed, (fname, mods - allowed)
+
     check("cron", "잡 카탈로그", t_catalog)
     check("cron", "flash 만 마커·알림 예외", t_flash_is_the_only_exception)
     check("cron", "잡별 마커 분리", t_markers_are_distinct)
@@ -6732,6 +6789,9 @@ def test_cron_jobs(tmp: Path):
     check("cron", "flash 추가 인자 경로 (기본 없음)", t_flash_extra_args_path)
     check("cron", "일일 상한 = 창별 예산 합 9", t_daily_cap_is_window_sum)
     check("cron", "사본은 파일명에서 잡 추출", t_shim_derives_job_from_filename)
+    check("cron", "호스트별 저장소·런처 (Windows 값 불변)", t_cron_host_paths)
+    check("cron", "정본 2개의 호스트 판정 블록 동일", t_cron_helpers_identical)
+    check("cron", "cron 스크립트는 표준 라이브러리만", t_cron_stdlib_only)
 
 
 def test_interpreter_guard(tmp: Path):
@@ -6814,6 +6874,129 @@ def test_interpreter_guard(tmp: Path):
     check("interpreter", "래퍼 가드 + exit 92", t_launchers_have_guard)
     check("interpreter", "가드가 인계보다 앞", t_guard_precedes_handoff)
     check("interpreter", "래퍼는 ASCII 전용", t_launchers_ascii_only)
+
+    # ── macOS / Linux 래퍼 (.sh) — .cmd 와 같은 규칙 ──
+    SH_RUN = "hermes/run.sh"
+    SH_NIGHT = "hermes/nightly.sh"
+    SH_DISPATCH = {SH_RUN: '"$PYEXE" run_screen.py "$@"',
+                   SH_NIGHT: '"$PYEXE" nightly.py "$@"'}
+
+    def t_sh_launchers_have_guard():
+        for name in (SH_RUN, SH_NIGHT):
+            src = (repo / name).read_text(encoding="utf-8")
+            assert src.startswith("#!/bin/sh\n"), f"{name}: #!/bin/sh 아님"
+            assert "version_info[:2]==(3,12)" in src, f"{name}: 가드 없음"
+            for code in ("exit 90", "exit 91", "exit 92"):
+                assert code in src, f"{name}: {code} 없음"
+            assert src.index("version_info[:2]==(3,12)") < src.index(
+                SH_DISPATCH[name]), f"{name}: 가드가 인계 뒤에 있다"
+            raw = (repo / name).read_bytes()
+            assert not [b for b in raw if b > 0x7F], f"{name}: 비ASCII 바이트"
+            assert b"\r" not in raw, f"{name}: CR 이 섞였다 (sh 가 못 읽는다)"
+            # 실발송 스위치와 마커 우회는 래퍼가 건드리지 않는다
+            for line in src.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                assert "STOCKNEWS_SEND" not in line, f"{name}: {line.strip()}"
+                assert "--force" not in line, f"{name}: {line.strip()}"
+
+    def t_sh_same_interpreter_order():
+        """두 .sh 의 인터프리터 탐색 블록은 같은 글자여야 한다."""
+        def block(name):
+            src = (repo / name).read_text(encoding="utf-8")
+            return src[src.index("PYEXE=\n"):src.index('if [ -z "$PYEXE" ]')]
+        assert block(SH_RUN) == block(SH_NIGHT)
+        order = block(SH_RUN)
+        assert order.index("/venv/bin/python") < order.index("/.venv/bin/python") \
+            < order.index("python3.13 python3.12 python3.11 python3"), order
+
+    def _fake_repo(name: str, py_rc: int | None):
+        """래퍼를 가짜 저장소에 복사한다. venv/bin/python 은 기록만 하는 sh 스텁.
+
+        py_rc None = 인터프리터 없음. 스텁은 `-c` (버전 가드)에 py_rc 로 답하고,
+        그 밖의 호출은 인자·cwd·환경을 파일에 남긴 뒤 7 로 끝난다.
+        """
+        root = tmp / f"shrepo_{name}_{py_rc}"
+        (root / "hermes").mkdir(parents=True)
+        for f in (SH_RUN, SH_NIGHT):
+            shutil.copy(repo / f, root / f)
+        if py_rc is not None:
+            stub = root / "venv" / "bin" / "python"
+            stub.parent.mkdir(parents=True)
+            stub.write_text(
+                "#!/bin/sh\n"
+                f'if [ "$1" = "-c" ]; then exit {py_rc}; fi\n'
+                'out="$PWD/called.txt"\n'
+                'for a in "$@"; do echo "arg=$a" >> "$out"; done\n'
+                'echo "cwd=$PWD" >> "$out"\n'
+                'echo "entry=${STOCKNEWS_ENTRY:-}" >> "$out"\n'
+                'echo "utf8=${PYTHONUTF8:-}/${PYTHONIOENCODING:-}/'
+                '${PYTHONDONTWRITEBYTECODE:-}" >> "$out"\n'
+                'echo "send=${STOCKNEWS_SEND:-unset}" >> "$out"\n'
+                "exit 7\n", encoding="ascii")
+            stub.chmod(0o755)
+        return root
+
+    def _sh(root: Path, script: str, *args, cwd=None):
+        import subprocess
+        env = {"PATH": str(tmp / "empty_path"), "HOME": str(tmp)}
+        return subprocess.run(["/bin/sh", str(root / script), *args],
+                              cwd=str(cwd or tmp), env=env,
+                              capture_output=True, timeout=30)
+
+    def t_sh_handoff():
+        """3.12 면 저장소 루트에서, 표식·UTF-8 환경을 세우고, 인자를 그대로 넘긴다."""
+        if os.name == "nt":
+            return
+        root = _fake_repo("ok", 0)
+        p = _sh(root, SH_NIGHT, "--job", "brief morning", "--no-telegram")
+        assert p.returncode == 7, (p.returncode, p.stderr)   # 종료 코드 그대로
+        got = (root / "called.txt").read_text(encoding="utf-8").splitlines()
+        assert got[:4] == ["arg=nightly.py", "arg=--job", "arg=brief morning",
+                           "arg=--no-telegram"], got
+        assert f"cwd={root.resolve()}" in got, got
+        assert "entry=nightly" in got and "utf8=1/utf-8/1" in got, got
+        assert "send=unset" in got, got
+        (root / "called.txt").unlink()
+        # run.sh: 모드 인계 · smoke · verify. 진입 표식은 세우지 않는다.
+        for argv, want in ((("--mode", "runs", "--json"),
+                            ["arg=run_screen.py", "arg=--mode", "arg=runs", "arg=--json"]),
+                           (("smoke", "-v"), ["arg=smoke_test.py", "arg=-v"]),
+                           (("verify",), ["arg=verify_env.py"])):
+            p = _sh(root, SH_RUN, *argv, cwd=root / "hermes")
+            assert p.returncode == 7, (argv, p.returncode, p.stderr)
+            got = (root / "called.txt").read_text(encoding="utf-8").splitlines()
+            assert got[:len(want)] == want, (argv, got)
+            assert "entry=" in got, got
+            (root / "called.txt").unlink()
+
+    def t_sh_wrong_python_is_92():
+        """3.12 가 아니면 인계하지 않고 92."""
+        if os.name == "nt":
+            return
+        root = _fake_repo("old", 92)
+        for script in (SH_NIGHT, SH_RUN):
+            p = _sh(root, script, "--job", "news")
+            assert p.returncode == 92, (script, p.returncode, p.stderr)
+            assert b"3.12 required" in p.stderr, p.stderr
+            assert not (root / "called.txt").exists(), f"{script}: 가드 후 인계했다"
+
+    def t_sh_no_python_is_91():
+        """venv 도 PATH 의 파이썬도 없으면 91. 셸 내장만 쓰므로 PATH 가 비어도 돈다."""
+        if os.name == "nt":
+            return
+        (tmp / "empty_path").mkdir(exist_ok=True)
+        root = _fake_repo("none", None)
+        for script in (SH_NIGHT, SH_RUN):
+            p = _sh(root, script)
+            assert p.returncode == 91, (script, p.returncode, p.stderr)
+            assert b"python not found" in p.stderr, p.stderr
+
+    check("interpreter", ".sh 래퍼 가드 + 90/91/92 + ASCII", t_sh_launchers_have_guard)
+    check("interpreter", ".sh 인터프리터 탐색 순서 동일", t_sh_same_interpreter_order)
+    check("interpreter", ".sh 인계: cwd·표식·인자·종료 코드", t_sh_handoff)
+    check("interpreter", ".sh 버전 불일치 -> 92 (인계 없음)", t_sh_wrong_python_is_92)
+    check("interpreter", ".sh 인터프리터 없음 -> 91", t_sh_no_python_is_91)
 
 
 def test_agent_contract(tmp: Path):
@@ -8985,7 +9168,7 @@ def test_chart(tmp: Path):
                                tmp / "c" / "c.png").is_file()
 
     def t_font():
-        """맑은 고딕이 있으면 잡고, 없으면 None (경고 후 기본 폰트)."""
+        """맑은 고딕이 있으면 잡고, 없으면 후보 폰트, 그것도 없으면 None."""
         saved = dict(ch._FONT)
         env = {k: os.environ.get(k) for k in ("WINDIR", "SystemRoot")}
         try:
@@ -8998,7 +9181,7 @@ def test_chart(tmp: Path):
             for k in env:
                 os.environ[k] = str(tmp / "nofonts")
             cfg = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
-                DEFAULT.chart, font="__없는폰트__"))
+                DEFAULT.chart, font="__없는폰트__", font_fallbacks=()))
             assert ch.korean_font(cfg) is None, "없는 폰트를 찾았다고 함"
         finally:
             for k, v in env.items():
@@ -9006,6 +9189,40 @@ def test_chart(tmp: Path):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+            ch._FONT.clear()
+            ch._FONT.update(saved)
+
+    def t_font_fallbacks():
+        """맑은 고딕이 없는 호스트(macOS·Linux)는 후보 목록에서 순서대로 잡는다.
+
+        Windows 는 `font` 가 먼저 잡혀 후보에 닿지 않아야 한다 — 닿으면 운영
+        차트의 글꼴이 바뀐다.
+        """
+        from matplotlib import font_manager
+        have = sorted({f.name for f in font_manager.fontManager.ttflist})
+        assert DEFAULT.chart.font == "Malgun Gothic", DEFAULT.chart.font
+        assert DEFAULT.chart.font_fallbacks[:2] == (
+            "Apple SD Gothic Neo", "AppleGothic"), DEFAULT.chart.font_fallbacks
+        saved = dict(ch._FONT)
+        try:
+            # 후보는 앞에서부터, 설치된 첫 폰트
+            ch._FONT.clear()
+            cfg = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
+                DEFAULT.chart, font="__없는폰트__",
+                font_fallbacks=("__없는후보__", have[0], have[-1])))
+            assert ch.korean_font(cfg) == have[0], ch.korean_font(cfg)
+            # font 가 있으면 후보를 보지 않는다
+            ch._FONT.clear()
+            cfg = dataclasses.replace(DEFAULT, chart=dataclasses.replace(
+                DEFAULT.chart, font=have[-1], font_fallbacks=(have[0],)))
+            assert ch.korean_font(cfg) == have[-1], ch.korean_font(cfg)
+            # macOS 는 기본 탑재 한글 폰트가 있으므로 반드시 잡혀야 한다
+            if sys.platform == "darwin":
+                ch._FONT.clear()
+                got = ch.korean_font()
+                assert got in DEFAULT.chart.font_fallbacks or got == DEFAULT.chart.font, \
+                    f"macOS 에서 한글 폰트를 못 잡았다: {got}"
+        finally:
             ch._FONT.clear()
             ch._FONT.update(saved)
 
@@ -9428,6 +9645,7 @@ def test_chart(tmp: Path):
     check("chart", "밴드·피보·P0 선 = 채점값 (앵커)", t_levels_anchor)
     check("chart", "PNG 생성 (범위 밖 · 신호 없음 포함)", t_render_png)
     check("chart", "한글 폰트 / 없으면 None", t_font)
+    check("chart", "한글 폰트 후보 (macOS·Linux)", t_font_fallbacks)
     check("chart", "캡션 내용 + 이스케이프 + 경고", t_caption_content)
     check("chart", "앨범 첫 장 면책 문구", t_album_items_disclaimer)
     check("chart", "캡션 1,024자 상한", t_caption_limit)

@@ -175,7 +175,13 @@ class ChartConfig:
     vp_top: int = 3                  # 우측에 그릴 상위 구간 수
     out_dir: str = "data/charts"     # 그 아래 YYYYMMDD/ (기준 거래일)
     keep_days: int = 7               # 폴더 이름 날짜가 이보다 오래되면 정리
-    font: str = "Malgun Gothic"      # 맑은 고딕. 없으면 경고 후 기본 폰트
+    font: str = "Malgun Gothic"      # 맑은 고딕. 없으면 아래 후보, 그것도 없으면 경고 후 기본 폰트
+    # `font` 가 없는 호스트에서 차례로 찾는 한글 폰트. Windows 는 맑은 고딕이
+    # 먼저 잡히므로 이 목록에 닿지 않는다(그림 불변). macOS 는 기본 탑재
+    # 폰트, Linux 는 흔히 깔리는 폰트 순서다.
+    font_fallbacks: tuple[str, ...] = (
+        "Apple SD Gothic Neo", "AppleGothic",
+        "NanumGothic", "Noto Sans CJK KR")
     dpi: int = 110
     # 세로 비율 메인 : 거래량 : OBV. OBV 는 거래량과 y축을 공유하지 않는
     # 별도 패널이다(한 패널에 두면 이중 y축이 된다).
