@@ -57,6 +57,10 @@ KNOWN_KEYS: tuple[str, ...] = (
     "KIWOOM_REST_PER_HOUR",
     "KIWOOM_OPENAPI_DIR",
     "TZ",
+    # 실발송 스위치와 잡별 dry-run (nightly.py 가 load_env 뒤에 읽는다).
+    # 운영 저장소의 .env 에만 넣는다 — 개발 클론에는 넣지 않는다.
+    "STOCKNEWS_SEND",
+    "STOCKNEWS_DRY_JOBS",
     # v2 운영 플래그 (config.py [L] 구역 ENV_OVERRIDE_FLAGS 와 같은 목록)
     "RECO_COOLDOWN_DAYS",
     "EXCLUDE_SEQ_FROM_SEND",

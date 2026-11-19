@@ -101,6 +101,16 @@ _SENDING = {"news", "daily", "exits", "brief-morning", "brief-evening",
 # 없어서 flash 를 켜지 못하고 있었다 (2026-09-09).
 DRY_JOBS_ENV = "STOCKNEWS_DRY_JOBS"
 
+# 실발송 스위치. 값이 정확히 "1" 일 때만 켜진 것이다.
+#
+# 2026-11-19 까지는 main() 이 이 값을 load_env() **앞에서** 읽어서, OS
+# 환경변수(Windows 의 setx)로만 켤 수 있었다. macOS 에는 setx 가 없고, 셸
+# 프로필이나 launchd 에 넣으면 개발 클론과 다른 프로세스까지 같이 켜진다.
+# 지금은 .env 를 먼저 올린 뒤에 읽으므로 **운영 폴더의 .env** 에 한 줄로 켤 수
+# 있다 — 그 저장소에서 도는 실행에만 닿는다. OS 환경변수가 있으면 예전처럼
+# 그쪽이 이긴다(load_env 의 override=False).
+SEND_ENV = "STOCKNEWS_SEND"
+
 # flash 에 추가로 넘길 인자. 켤 때 결정한다 — 기본은 아무것도 안 넘긴다.
 #
 #   ("--no-update",)   당일 시세 적재를 건너뛰고 전일 봉으로 스캔한다.
@@ -315,6 +325,27 @@ def dry_jobs_from_env(value: str | None) -> set[str]:
         return set()
     return {tok.strip().lower() for tok in value.replace(";", ",").split(",")
             if tok.strip()}
+
+
+def send_switch_on(environ=None) -> bool:
+    """실발송 스위치가 켜졌는가. main() 과 --send-check 가 같이 쓴다."""
+    environ = os.environ if environ is None else environ
+    return environ.get(SEND_ENV) == "1"
+
+
+def send_check_line(job: Job, dry: bool, dry_jobs: set[str], env_rep: dict) -> str:
+    """--send-check 한 줄. 값은 싣지 않고 '어디서 왔는가'만 적는다."""
+    if SEND_ENV in (env_rep.get("applied") or []):
+        src = ".env"
+    elif os.environ.get(SEND_ENV):
+        src = "OS 환경변수"
+    else:
+        src = "없음"
+    job_dry = dry or job.name.lower() in dry_jobs
+    return (f"발송 스위치 {'켜짐' if not dry else '꺼짐'} · 잡 {job.name} = "
+            f"{'실발송' if not job_dry else 'dry-run'} · {SEND_ENV} 출처 {src}"
+            f" · .env {env_rep.get('path')} ({'있음' if env_rep.get('exists') else '없음'})"
+            + (f" · {DRY_JOBS_ENV}={','.join(sorted(dry_jobs))}" if dry_jobs else ""))
 
 
 def apply_dry_jobs(job: Job, dry_jobs: set[str]) -> Job:
@@ -885,6 +916,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lock-dir", default="data/locks")
     ap.add_argument("--done-marker", default=None,
                     help="'오늘 완주' 마커 경로. 기본은 잡별 경로. --force 로 무시")
+    ap.add_argument("--send-check", action="store_true",
+                    help="발송 스위치를 어떻게 인식하는지 한 줄 출력하고 끝낸다. "
+                         "락·마커·로그·단계·알림 전부 없음")
     args = ap.parse_args(argv)
 
     job = JOBS[args.job]
@@ -895,18 +929,6 @@ def main(argv: list[str] | None = None) -> int:
     # 세우면 단계까지 전달되고, rc=3 알림이 점유자를 지목할 수 있다.
     os.environ["STOCKNEWS_JOB"] = job.name
     started = now_kst()
-    log = Log(REPO / "logs" / f"{job.name}_{started:%Y%m%d}.log")
-    dry = os.getenv("STOCKNEWS_SEND") != "1"
-    dry_jobs = dry_jobs_from_env(os.getenv(DRY_JOBS_ENV))
-    job = apply_dry_jobs(job, dry_jobs)
-    job_dry = dry or job.name.lower() in dry_jobs
-    notify_on = not args.no_telegram
-
-    log("=" * 62)
-    log(f"{job.name} 시작 {started:%Y-%m-%d %H:%M:%S} KST "
-        f"(발송 {'실제' if not job_dry else 'dry-run'}"
-        + (f" · {DRY_JOBS_ENV}={','.join(sorted(dry_jobs))}" if dry_jobs else "")
-        + ")")
 
     # .env 를 환경변수로 올린다. 이게 없으면 _notify 가 토큰을 못 찾아
     # 조용히 생략된다 — 실패 알림까지 안 나간다.
@@ -917,7 +939,27 @@ def main(argv: list[str] | None = None) -> int:
     # load_env 를 부르는데 nightly.py 는 부르지 않아서, 이 드라이버가
     # 내는 알림만 전부 사라지고 있었다. 자식 단계는 각자 로드하므로
     # 그쪽 알림은 정상이었고, 그래서 눈에 띄지 않았다.
+    #
+    # 발송 스위치를 읽기 **전에** 올린다(SEND_ENV 주석). 순서를 되돌리면
+    # .env 의 STOCKNEWS_SEND 가 조용히 무시되고 전부 dry-run 으로 돈다.
     env_rep = load_env()
+    dry = not send_switch_on()
+    dry_jobs = dry_jobs_from_env(os.getenv(DRY_JOBS_ENV))
+    job = apply_dry_jobs(job, dry_jobs)
+    job_dry = dry or job.name.lower() in dry_jobs
+    notify_on = not args.no_telegram
+
+    if args.send_check:
+        # 확인 전용. 락·마커·로그 파일을 만들기 전에 끝낸다.
+        print(send_check_line(job, dry, dry_jobs, env_rep), flush=True)
+        return 0
+
+    log = Log(REPO / "logs" / f"{job.name}_{started:%Y%m%d}.log")
+    log("=" * 62)
+    log(f"{job.name} 시작 {started:%Y-%m-%d %H:%M:%S} KST "
+        f"(발송 {'실제' if not job_dry else 'dry-run'}"
+        + (f" · {DRY_JOBS_ENV}={','.join(sorted(dry_jobs))}" if dry_jobs else "")
+        + ")")
     if not env_rep["exists"]:
         log(f".env 없음 ({env_rep['path']}) — OS 환경변수만 사용")
 

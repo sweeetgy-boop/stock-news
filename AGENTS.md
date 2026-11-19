@@ -507,7 +507,7 @@ hermes\run.cmd --mode runs         배치 이력 + 스케줄 공백 점검
 아닙니다. 상태를 확인할 때 언제든 부르십시오.
 
 코드를 수정했다면 **반드시 `smoke` 를 먼저 돌리십시오.** 전 항목이 통과해야
-합니다(2026-11-19 현재 742건). 실패가 있으면 커밋하지 마십시오.
+합니다(2026-11-19 현재 745건). 실패가 있으면 커밋하지 마십시오.
 
 DB 안의 `runs` 테이블에 모든 배치 이력(모드·성공·실패·소요)이 남습니다.
 `main()` 이 한 곳에서 기록하므로 예외로 죽은 실행도 남습니다.
@@ -1344,9 +1344,20 @@ cron 스크립트   %LOCALAPPDATA%\hermes\scripts\       ~/.hermes/scripts/
   (Windows: `cmd /c ...nightly.cmd` · 그 밖: `/bin/sh ...nightly.sh`).
   `STOCKNEWS_REPO` 는 격리된 사본을 같은 사슬로 돌려보는 **검증용**입니다.
   운영 환경에는 설정하지 마십시오 — 설정하면 그 경로가 운영 저장소가 됩니다.
-- **실발송 스위치는 OS 환경변수 `STOCKNEWS_SEND=1` 그대로입니다.** macOS 에는
-  `setx` 가 없으므로 Hermes 게이트웨이(LaunchAgent)의 환경에 넣어야 합니다.
-  넣기 전까지 발송 모드는 전부 `--dry-run` 입니다.
+- **실발송 스위치 `STOCKNEWS_SEND=1` 은 운영 저장소의 `.env` 에 넣습니다**
+  (2026-11-19). `nightly.py` 가 `.env` 를 올린 **뒤에** 스위치를 읽으므로 그
+  저장소에서 도는 실행에만 닿고, 셸·개발 클론·다른 프로세스에는 영향이
+  없습니다. macOS 에는 `setx` 가 없어서 이렇게 바꿨습니다. OS 환경변수에 같은
+  이름이 있으면 예전처럼 그쪽이 이깁니다 — Windows 운영(`setx`)은 그대로입니다.
+  **개발 클론의 `.env` 에는 넣지 마십시오.** 넣기 전까지 발송 모드는 전부
+  `--dry-run` 입니다. 인식 상태는 발송 없이 확인합니다(락·마커·로그·단계·알림
+  전부 없음, 한 줄 출력):
+
+  ```
+  hermes/nightly.sh --send-check                 (Windows: hermes\nightly.cmd --send-check)
+  발송 스위치 꺼짐 · 잡 nightly = dry-run · STOCKNEWS_SEND 출처 없음 · .env ... (있음)
+  ```
+
   **단, `nightly.py` 자신의 운영 알림(완료·스킵·실패 -> 관리자 채팅)은
   `STOCKNEWS_SEND` 와 무관하게 나갑니다.** dry-run 검증은 `--no-telegram` 을
   붙이고, 텔레그램 키가 없는 격리 사본에서 하십시오(15장).

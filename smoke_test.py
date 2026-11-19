@@ -6779,11 +6779,96 @@ def test_cron_jobs(tmp: Path):
                     mods.add((node.module or "").split(".")[0])
             assert mods <= allowed, (fname, mods - allowed)
 
+    def t_send_switch_exact_one():
+        """실발송 스위치는 정확히 "1" 일 때만 켜진다. 비슷한 값은 전부 dry-run."""
+        f = nl_mod.send_switch_on
+        assert f({"STOCKNEWS_SEND": "1"}) is True
+        for bad in ("", "0", "true", "yes", "on", " 1", "1 ", "01", "11"):
+            assert f({"STOCKNEWS_SEND": bad}) is False, repr(bad)
+        assert f({}) is False
+
+    def _send_check(fake_env: dict, os_env: dict | None = None) -> tuple[int, str, Path]:
+        """`--send-check` 를 가짜 .env 로 돌린다. (rc, stdout, 가짜 저장소 루트)."""
+        import contextlib
+        import io
+        root = tmp / f"sendcheck_{len(list(tmp.glob('sendcheck_*')))}"
+        root.mkdir()
+        keys = ("STOCKNEWS_SEND", "STOCKNEWS_DRY_JOBS", "STOCKNEWS_JOB")
+        saved_env = {k: os.environ.get(k) for k in keys}
+        saved = (nl_mod.REPO, nl_mod.load_env)
+
+        def fake_load_env(path=None, override=False):
+            applied = []
+            for k, v in fake_env.items():
+                if v and not os.environ.get(k):     # OS 환경변수가 이긴다
+                    os.environ[k] = v
+                    applied.append(k)
+            return {"path": str(root / ".env"), "exists": True, "applied": applied}
+
+        try:
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ.update(os_env or {})
+            nl_mod.REPO, nl_mod.load_env = root, fake_load_env
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = nl_mod.main(["--job", "weekly", "--send-check"])
+            return rc, buf.getvalue(), root
+        finally:
+            nl_mod.REPO, nl_mod.load_env = saved
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def t_send_switch_read_after_env():
+        """스위치는 load_env **뒤에** 읽는다 — 운영 .env 한 줄로 켤 수 있어야 한다.
+
+        2026-11-19 까지는 앞에서 읽어서 .env 의 값이 조용히 무시됐다(OS
+        환경변수로만 켜짐). 순서를 되돌리면 이 검사가 깨진다.
+        """
+        rc, out, _ = _send_check({"STOCKNEWS_SEND": "1"})
+        assert rc == 0 and "발송 스위치 켜짐" in out and "= 실발송" in out, out
+        assert "출처 .env" in out, out
+        rc, out, _ = _send_check({})
+        assert rc == 0 and "발송 스위치 꺼짐" in out and "= dry-run" in out, out
+        assert "출처 없음" in out, out
+        # OS 환경변수가 .env 를 이긴다 (Windows 운영: setx STOCKNEWS_SEND 1)
+        rc, out, _ = _send_check({}, os_env={"STOCKNEWS_SEND": "1"})
+        assert "발송 스위치 켜짐" in out and "출처 OS 환경변수" in out, out
+        rc, out, _ = _send_check({"STOCKNEWS_SEND": "1"}, os_env={"STOCKNEWS_SEND": "0"})
+        assert "발송 스위치 꺼짐" in out and "출처 OS 환경변수" in out, out
+        # 잡별 dry-run 도 .env 에서 읽힌다
+        rc, out, _ = _send_check({"STOCKNEWS_SEND": "1", "STOCKNEWS_DRY_JOBS": "weekly"})
+        assert "발송 스위치 켜짐" in out and "= dry-run" in out, out
+        # 값 자체는 출력에 싣지 않는다 (이름과 출처만)
+        assert "STOCKNEWS_SEND=1" not in out, out
+
+    def t_send_check_has_no_side_effects():
+        """--send-check 는 락·마커·로그를 만들지 않고, 단계도 알림도 돌지 않는다."""
+        called = []
+        saved = (nl_mod._run_step, nl_mod._notify, nl_mod._notify_admin)
+        try:
+            nl_mod._run_step = lambda *a, **k: called.append("step")
+            nl_mod._notify = lambda *a, **k: called.append("notify")
+            nl_mod._notify_admin = lambda *a, **k: called.append("admin")
+            rc, out, root = _send_check({"STOCKNEWS_SEND": "1"})
+        finally:
+            nl_mod._run_step, nl_mod._notify, nl_mod._notify_admin = saved
+        assert rc == 0 and len(out.strip().splitlines()) == 1, out
+        assert called == [], called
+        assert list(root.iterdir()) == [], [p.name for p in root.iterdir()]
+
     check("cron", "잡 카탈로그", t_catalog)
     check("cron", "flash 만 마커·알림 예외", t_flash_is_the_only_exception)
     check("cron", "잡별 마커 분리", t_markers_are_distinct)
     check("cron", "카탈로그 모드 실재", t_modes_exist)
     check("cron", "발송 모드 기본 dry-run", t_sending_modes_are_dry_by_default)
+    check("cron", "발송 스위치는 정확히 1", t_send_switch_exact_one)
+    check("cron", "발송 스위치는 .env 를 올린 뒤 읽는다 (OS 환경변수 우선)",
+          t_send_switch_read_after_env)
+    check("cron", "--send-check 는 부작용 없음", t_send_check_has_no_side_effects)
     check("cron", "STOCKNEWS_DRY_JOBS 파싱", t_dry_jobs_env_parse)
     check("cron", "STOCKNEWS_DRY_JOBS 잡별 dry-run", t_dry_jobs_force_dry_run)
     check("cron", "flash 추가 인자 경로 (기본 없음)", t_flash_extra_args_path)
