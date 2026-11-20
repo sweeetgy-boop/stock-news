@@ -350,20 +350,38 @@ def _norm(s) -> str:
     return "".join(str(s or "").split())
 
 
+def _corp_norm(s) -> str:
+    t = _norm(s).lower()
+    for w in ("주식회사", "(주)", "㈜"):
+        t = t.replace(w, "")
+    return t
+
+
+def _is_company(filer, corp) -> bool:
+    """제출인이 그 회사 자신인가(이름이 같거나 한쪽이 다른 쪽을 포함)."""
+    a, b = _corp_norm(filer), _corp_norm(corp)
+    return bool(a and b and (a == b or a in b or b in a))
+
+
 def classify_dispute(report_nm: str, flr_nm: str = "", corp_name: str = "") -> str | None:
-    """공시 제목(과 제출인) → 유형. 해당 없으면 None. 정정·결과 보고는 뺀다."""
-    nm = _norm(report_nm)
-    if not nm or (nm.startswith("[") and "정정" in nm[:nm.find("]") + 1]):
+    """공시 제목(과 제출인) → 유형. 해당 없으면 None.
+
+    제목은 공백을 모두 뺀 뒤 본다. [기재정정]·[첨부추가] 같은 머리표가 붙은 것은 원본이
+    아니라서 뺀다. 판결·결정(결과)과 공개매수 설명서·결과보고서도 뺀다.
+    (research/dispute 조사의 분류와 같은 규칙)
+    """
+    import re
+    t = _norm(report_nm)
+    if not t or re.match(r"^\[[^\]]+\]", t):
         return None
-    if "경영권분쟁소송" in nm and "제기" in nm:
+    if t.startswith("소송등의제기") and "경영권분쟁" in t:
         return "lawsuit"
-    if nm.startswith("공개매수신고서"):
+    if t == "공개매수신고서":
         return "tender"
-    if "의결권대리행사권유" in nm or nm.startswith("위임장권유참고서류") \
-            or nm.startswith("의결권대리행사권유참고서류"):
-        f, cn = _norm(flr_nm), _norm(corp_name)
-        if f and cn and f != cn and cn not in f and f not in cn:
-            return "proxy"
+    if t.startswith("의결권대리행사권유에관한의견표명서"):
+        return "proxy"                    # 회사가 주주 측 권유에 낸 의견 = 주주 측 권유가 있다
+    if t.startswith("의결권대리행사권유참고서류") and not _is_company(flr_nm, corp_name):
+        return "proxy"
     return None
 
 

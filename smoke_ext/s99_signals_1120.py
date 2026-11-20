@@ -256,7 +256,10 @@ def run(check, near, tmp):
         assert f("소송등의판결ㆍ결정(경영권분쟁소송)") is None
         assert f("소송등의제기ㆍ신청(일정금액이상의청구)") is None
         assert f("공개매수신고서") == "tender" and f("공개매수결과보고서") is None
+        assert f("[첨부추가]공개매수신고서") is None and f("공개매수설명서") is None
         assert f("의결권대리행사권유참고서류", "가나다", "가나다") is None            # 회사가 낸 것
+        assert f("의결권대리행사권유참고서류", "(주)가나다", "가나다") is None
+        assert f("의결권대리행사권유에관한의견표명서", "가나다", "가나다") == "proxy"   # 주주 측 권유에 대한 회사 의견
         assert f("의결권대리행사권유참고서류", "행동주의펀드", "가나다") == "proxy"
         assert f("주식등의대량보유상황보고서(일반)", "누구", "가나다") is None
         nxt = lambda x: cal[E._pos(cal, x) + 1] if E._pos(cal, x) + 1 < len(cal) else None  # noqa: E731
