@@ -2,7 +2,8 @@
 """2026-11-20 저녁 브리핑 "오늘 기록된 추천 10" 한 문단 (DAILY_RECO_LINE).
 
 그날 recos 전부 · 순위순 · 발송 필터와 무관 · ① 바로 위 · 기본 OFF ·
-all = 브리핑 안(전체 수신자) / admin = 관리자 채팅에만 별도 메시지.
+all = 브리핑 안(전체 수신자) / admin = 관리자 채팅에만 별도 메시지 /
+separate = admin 과 같은 별도 메시지를 전체 수신자에게.
 """
 from __future__ import annotations
 
@@ -125,6 +126,9 @@ def run(check, near, tmp):
             got, info = R.weekday_block(st, d, paper_on=False, pdata=pdx)
             C.DAILY_RECO_LINE = "admin"       # admin 은 블록에 넣지 않는다
             adm, ia = R.weekday_block(st, d, paper_on=False, pdata=pdx)
+            C.DAILY_RECO_LINE = "separate"    # separate 도 블록에 넣지 않는다
+            assert R.reco_line_mode() == "separate"
+            sep, isp = R.weekday_block(st, d, paper_on=False, pdata=pdx)
         finally:
             _back(snap)
         lines, _ = R.reco_line_block(st, d)
@@ -133,6 +137,7 @@ def run(check, near, tmp):
         assert info["reco_line"]["n"] == 10
         assert info["reco_line"]["len"] == len(head)
         assert adm == base and "reco_line" not in ia
+        assert sep == base and "reco_line" not in isp, "separate 가 본문을 바꿨다"
         on_p, ip = R.weekday_block(st, d, paper_on=True, pdata=pdx, reco_line=True)
         off_p, _ = R.weekday_block(st, d, paper_on=True, pdata=pdx, reco_line=False)
         assert on_p == head + "\n\n" + off_p
@@ -140,7 +145,7 @@ def run(check, near, tmp):
         _, tight = R.weekday_block(st, d, paper_on=True, pdata=pdx, reco_line=True,
                                    limit_room=len(off_p))
         assert tight["topn"] == min(C.PAPER_SUMMARY_TOPN, C.PAPER_SUMMARY_MIN_TOPN)
-    check(S, "all = ① 바로 위 · 나머지 텍스트 동일 · admin 은 블록에 없음",
+    check(S, "all = ① 바로 위 · 나머지 텍스트 동일 · admin·separate 는 블록에 없음",
           above_section_one)
 
     def filtered_still_listed():
@@ -180,16 +185,19 @@ def run(check, near, tmp):
         from stocknews.env import KNOWN_KEYS
         assert "DAILY_RECO_LINE" in KNOWN_KEYS
         assert C.ENV_OVERRIDE_FLAGS["DAILY_RECO_LINE"] is str
-        assert C.ENV_FLAG_CHOICES["DAILY_RECO_LINE"] == ("off", "all", "admin")
+        assert C.ENV_FLAG_CHOICES["DAILY_RECO_LINE"] == (
+            "off", "all", "admin", "separate")
         snap = _keep()
         try:
             for raw, want in (("all", "all"), ("ADMIN", "admin"), (" Admin ", "admin"),
-                              ("off", "off"), ("0", "off"), ("false", "off")):
+                              ("off", "off"), ("0", "off"), ("false", "off"),
+                              ("separate", "separate"), ("Separate ", "separate")):
                 C.DAILY_RECO_LINE = "sentinel"
                 out = C.apply_env_flags({"DAILY_RECO_LINE": raw})
                 assert C.DAILY_RECO_LINE == want and not out["invalid"], (raw, out)
                 assert out["applied"] == {"DAILY_RECO_LINE": want}
-            for raw in ("1", "true", "yes", "on", "everyone", "all,admin"):
+            for raw in ("1", "true", "yes", "on", "everyone", "all,admin",
+                        "seperate", "split"):
                 C.DAILY_RECO_LINE = "off"
                 out = C.apply_env_flags({"DAILY_RECO_LINE": raw})
                 assert C.DAILY_RECO_LINE == "off", f"{raw!r} 로 켜졌다"
@@ -199,7 +207,7 @@ def run(check, near, tmp):
             assert C.DAILY_RECO_LINE == "admin" and not out["applied"]
         finally:
             _back(snap)
-    check(S, ".env 값: all·admin·off(0) 만 받는다 · 1/true/오타는 무시(OFF 유지)",
+    check(S, ".env 값: all·admin·separate·off(0) 만 받는다 · 1/true/오타는 무시(OFF 유지)",
           env_values)
 
     def wiring():
@@ -247,9 +255,99 @@ def run(check, near, tmp):
         assert src.index("record_sends") < src.index("_daily_reco_line(")
         helper = inspect.getsource(rs._daily_reco_line)
         assert "record_sends" not in helper.split('"""')[2], "발송 기록을 건드린다"
-        assert "_emit_admin(" in helper and "_emit(" not in helper.replace(
-            "_emit_admin(", "")
+        assert "_emit_admin(" in helper
         legacy = inspect.getsource(rs.mode_brief_evening)
         assert "no_stock_block" in legacy
     check(S, "admin = 관리자 채팅 1건(브리핑 뒤) · all = 추가 발송 없음 · off = 무동작",
           wiring)
+
+    def separate_all():
+        import run_screen as rs
+        from stocknews.notify import SendFailure, SendReport
+
+        class A:
+            dry_run = False
+        want = "\n".join(R.reco_line_block(st, d)[0])
+        sent: list = []
+        admin: list = []
+        o_send, o_adm, o_sum = rs.send_telegram, rs._emit_admin, dict(rs.SUMMARY)
+        snap = _keep()
+        try:
+            C.DAILY_RECO_LINE = "separate"
+            rs._emit_admin = lambda text, dry: admin.append(text)
+            # ① 전원 성공 — chat_id 를 지정하지 않는다(= TELEGRAM_CHAT_ID 전체)
+            rs.SUMMARY.clear()
+            rs.send_telegram = lambda text, **kw: (
+                sent.append((text, kw)) or SendReport(sent=2))
+            rs._daily_reco_line(st, A, d, {})
+            assert sent == [(want, {})], "전체 수신자 경로가 아니다"
+            assert not admin, "separate 인데 관리자 전용으로 보냈다"
+            got = rs.SUMMARY["reco_line"]
+            assert got["mode"] == "separate" and got["to"] == "all"
+            assert got["sent"] is True and "failed" not in got
+            assert got["tickers"] == order and got["len"] == len(want)
+            assert not rs.SUMMARY.get("send_failed")
+            # ② 한 명만 실패 — 수신자가 SUMMARY·로그에 남고 exit 2 재료가 된다
+            rs.SUMMARY.clear()
+            rs.SUMMARY["send_failures"] = [{"chat": "****0001", "status": 403,
+                                            "error": "앞선 본문 실패"}]
+            rs.SUMMARY["send_failed"] = 1
+            rs.send_telegram = lambda text, **kw: SendReport(
+                sent=1, failures=(SendFailure("****2222", 400, "chat not found"),))
+            seen: list = []
+
+            class L:        # 스모크는 logging 을 꺼 두므로 로거를 바꿔 끼운다
+                def error(self, msg, *a):
+                    seen.append(msg % a if a else msg)
+                info = warning = debug = exception = error
+            o_log = rs.log
+            rs.log = L()
+            try:
+                rs._daily_reco_line(st, A, d, {})
+            finally:
+                rs.log = o_log
+            got = rs.SUMMARY["reco_line"]
+            assert got["sent"] is True, "한 명은 받았다"
+            assert got["failed"] == ["****2222: 400"], got
+            assert rs.SUMMARY["send_failed"] == 2
+            fl = rs.SUMMARY["send_failures"]
+            assert fl[0].get("kind") is None, "앞선 실패에 표시가 붙었다"
+            assert fl[1] == {"chat": "****2222", "status": 400,
+                             "error": "chat not found", "kind": "reco_line"}, fl
+            assert any("****2222: 400" in m and "기록된 추천 목록" in m
+                       for m in seen), seen
+            fails = list(fl)
+            # ③ dry-run 은 보내지 않는다
+            rs.SUMMARY.clear()
+            rs.send_telegram = lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("dry-run 인데 발송"))
+
+            class Dr:
+                dry_run = True
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                rs._daily_reco_line(st, Dr, d, {})
+            assert want in buf.getvalue() and rs.SUMMARY["reco_line"]["sent"] is None
+        finally:
+            rs.send_telegram, rs._emit_admin = o_send, o_adm
+            rs.SUMMARY.clear()
+            rs.SUMMARY.update(o_sum)
+            _back(snap)
+        # nightly 의 관리자 알림에 그 수신자가 실린다
+        import importlib
+        from datetime import datetime
+        nl = importlib.import_module("nightly")
+        text = nl._summary(
+            nl.JOBS["brief-evening"], datetime(2026, 11, 20, 23, 0),
+            datetime(2026, 11, 20, 23, 2),
+            [{"name": "brief-evening", "state": "warn", "rc": 2, "elapsed": 70.0,
+              "detail": "", "json": {"send_failures": fails[1:]}}], False)
+        assert "발송 실패 1건 (수신자 ****2222: 400)" in text, text
+        # 종료 코드: send_failed 가 있으면 main() 이 부분 실패(2)로 올린다
+        src = inspect.getsource(rs.main)
+        assert 'SUMMARY.get("send_failed") and rc == EXIT_OK' in src
+        assert "rc = EXIT_PARTIAL" in src
+    check(S, "separate = 전체 수신자 별도 1건 · 일부 실패는 수신자가 로그·알림에 · dry-run 무발송",
+          separate_all)

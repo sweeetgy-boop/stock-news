@@ -933,10 +933,14 @@ PAPER_ALT_TRAIL_ARM_PCT = 10.0
 #       "all"   브리핑 안, "① 오늘 새 추천" 바로 위 — 전체 수신자.
 #       "admin" 브리핑은 그대로 두고, 관리자 채팅(TELEGRAM_CHAT_ID 첫
 #               수신자)에만 별도 메시지 1건.
+#       "separate" 브리핑은 그대로 두고, admin 과 같은 별도 메시지 1건을
+#               **전체 수신자**에게. 일부 수신자만 실패하면 그 수신자가 로그와
+#               --json(send_failures)에 남고 잡이 exit 2 로 끝나 관리자
+#               알림에 "발송 실패 n건 (수신자 ****1234: 400)" 이 실린다.
 #     종목 부분(①②③④)이 있는 경로(PAPER_TRACKING 또는 DAILY_LIST_V2)에서만
 #     동작한다. 모듈: stocknews/paper_render.py (reco_line_*)
 DAILY_RECO_LINE = "off"
-DAILY_RECO_LINE_MODES = ("off", "all", "admin")
+DAILY_RECO_LINE_MODES = ("off", "all", "admin", "separate")
 # (DF 구역 끝)
 
 # ── [E] 위험 정보 ──

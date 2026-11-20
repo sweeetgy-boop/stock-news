@@ -1478,10 +1478,15 @@ def _brief_evening_v2(store, args) -> int:
 
 
 def _daily_reco_line(store, args, d: str, info: dict) -> None:
-    """DAILY_RECO_LINE — "오늘 기록된 추천 10" 한 문단의 집계와 관리자 발송.
+    """DAILY_RECO_LINE — "오늘 기록된 추천 10" 한 문단의 집계와 별도 발송.
 
     all   : 문단은 이미 브리핑 안(① 바로 위)에 있다. 여기서는 집계만 싣는다.
     admin : 브리핑은 그대로다. 같은 문단을 관리자 채팅에만 별도 메시지로 보낸다.
+    separate : 브리핑은 그대로다. admin 과 같은 별도 메시지를 전체 수신자에게
+            보낸다. 일부 수신자만 실패하면 `_emit` 이 수신자별로 로그와
+            SUMMARY.send_failures 에 남기고(여기서 kind=reco_line 을 붙인다)
+            main() 이 exit 2 로 올린다 — nightly 의 관리자 알림에 그 수신자가
+            실린다.
     off   : 아무것도 하지 않는다(SUMMARY 도 그대로).
     recos 는 읽기만 한다. 발송 기록(paper.record_sends)과 무관하다 — 이 목록에
     실렸다고 추적에 편입되지 않는다. 실패해도 브리핑(이미 나감)에는 영향이 없다.
@@ -1498,12 +1503,28 @@ def _daily_reco_line(store, args, d: str, info: dict) -> None:
         lines, rinfo = paper_render.reco_line_block(store, d)
         text = "\n".join(lines)
         SUMMARY["reco_line"] = {"mode": mode, **rinfo, "len": len(text)}
-        SUMMARY["reco_line"]["sent"] = _emit_admin(text, args.dry_run)
+        if mode == "admin":
+            SUMMARY["reco_line"]["sent"] = _emit_admin(text, args.dry_run)
+            return
+        # separate — 전체 수신자. 이 메시지에서 새로 생긴 실패만 골라 표시한다.
+        SUMMARY["reco_line"]["to"] = "all"
+        n0 = len(SUMMARY.get("send_failures", []))
+        SUMMARY["reco_line"]["sent"] = _emit(text, args.dry_run)
+        new = SUMMARY.get("send_failures", [])[n0:]
+        if new:
+            for f in new:
+                f["kind"] = "reco_line"
+            failed = [f"{f.get('chat', '????')}: {f.get('status') or '무응답'}"
+                      for f in new]
+            SUMMARY["reco_line"]["failed"] = failed
+            log.error("기록된 추천 목록(전체 수신자) %d명 실패 — 수신자 %s · "
+                      "브리핑 본문은 이미 나갔습니다", len(new), ", ".join(failed))
     except Exception as exc:  # noqa: BLE001 - 부가 메시지다
         SUMMARY.setdefault("reco_line", {"mode": mode})["error"] = (
             f"{type(exc).__name__}: {exc}"[:200])
-        log.warning("기록된 추천 목록(관리자) 발송 실패 — 브리핑은 이미 "
-                    "끝났습니다 (%s)", SUMMARY["reco_line"]["error"])
+        log.warning("기록된 추천 목록(%s) 발송 실패 — 브리핑은 이미 "
+                    "끝났습니다 (%s)", "관리자" if mode == "admin" else "전체 수신자",
+                    SUMMARY["reco_line"]["error"])
 
 
 def _paper_sunday(store, args, asof, trade_d: str | None) -> int:

@@ -10,8 +10,9 @@
      PAPER_TRACKING 꺼짐 → ②③ 대신 유지 종목 "추천 유지 n일째" 한 줄씩
   ④ B 의 "오늘 제외" 한 줄 (훅이 None 이면 생략)
   DAILY_RECO_LINE=all 이면 ① 바로 위에 "오늘 기록된 추천 10" 한 문단
-  (그날 recos 전부 · 순위순 · 발송 필터와 무관). admin 이면 이 블록에는 넣지
-  않고 run_screen 이 관리자 채팅에 따로 보낸다.
+  (그날 recos 전부 · 순위순 · 발송 필터와 무관). admin · separate 면 이 블록
+  에는 넣지 않고 run_screen 이 따로 보낸다(admin = 관리자 채팅만, separate =
+  전체 수신자).
 
 문장 생성·해석·전망을 넣지 않는다. 숫자와 조건 이름만 적는다.
 """
@@ -260,9 +261,10 @@ RECO_LINE_EMPTY = "오늘 기록된 추천 없음"
 
 
 def reco_line_mode() -> str:
-    """DAILY_RECO_LINE 의 현재 값: "off" · "all" · "admin". 모르는 값은 "off"."""
+    """DAILY_RECO_LINE 의 현재 값: "off" · "all" · "admin" · "separate".
+    모르는 값은 "off"."""
     m = str(getattr(C, "DAILY_RECO_LINE", "off") or "off").strip().lower()
-    return m if m in ("all", "admin") else "off"
+    return m if m in ("all", "admin", "separate") else "off"
 
 
 def recorded_recos(store, d: str) -> list[dict]:
