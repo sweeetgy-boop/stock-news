@@ -102,8 +102,12 @@ def fetch_all(tickers: list[str], get=None, workers: int | None = None,
     get = get or (lambda code: _http_get(code, timeout))
     t0 = time.perf_counter()
     errs: dict[str, int] = {}
+    # 전체 시간 상한 — 네이버가 느리거나 막혀도 daily 단계를 오래 붙잡지 않는다.
+    deadline = t0 + float(getattr(C, "DIVIDEND_BUDGET_SEC", 60.0))
 
     def one(code):
+        if time.perf_counter() > deadline:
+            return code, None, "시간 상한"
         try:
             rec = parse_annual(get(code))
             if rec is None:

@@ -352,6 +352,10 @@ def run(check, near, tmp):
         assert nightly.fail_streak(job, True, root=root) == 2
         assert nightly.fail_streak(job, True, root=root) == 3                    # 3회째 → 알림
         assert nightly.fail_streak(job, False, root=root) == 0                   # 성공하면 0
+        stamp = (root / "data" / "cron_failstreak_dispute-watch.json").stat().st_mtime_ns
+        assert nightly.fail_streak(job, False, root=root) == 0                   # 성공이 이어지면 파일 그대로
+        assert (root / "data" / "cron_failstreak_dispute-watch.json").stat().st_mtime_ns == stamp
+        assert nightly.fail_streak(job, False, root=tmp / "none") == 0 and not (tmp / "none").exists()
         import inspect
         src = inspect.getsource(nightly.main)
         assert "streak % job.fail_alert_after == 0" in src and 'r["rc"] != EXIT_LOCKED' in src
@@ -379,6 +383,13 @@ def run(check, near, tmp):
             got, finfo = DV.fetch_all(sorted(FETCH) + ["830099"],
                                       get=lambda c: FETCH[c] if c in FETCH else 1 / 0, workers=2)
             assert set(got) == set(FETCH) and finfo["errors"] == {"ZeroDivisionError": 1}
+            keep_b = C.DIVIDEND_BUDGET_SEC                      # 전체 시간 상한을 넘으면 남은 종목은 건너뜀
+            C.DIVIDEND_BUDGET_SEC = -1.0
+            try:
+                g0, f0 = DV.fetch_all(sorted(FETCH), get=lambda c: FETCH[c], workers=2)
+            finally:
+                C.DIVIDEND_BUDGET_SEC = keep_b
+            assert g0 == {} and f0["errors"] == {"시간 상한": len(FETCH)}, f0
             # 자료가 모자라면 0건이 아니라 "자료 없음"
             bad = DV.record(st, d, get=lambda c: {"oops": 1})
             assert bad["status"] == "no_data" and "0/7" in bad["reason"], bad

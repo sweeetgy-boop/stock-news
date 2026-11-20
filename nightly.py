@@ -704,7 +704,9 @@ def fail_streak(job: "Job", failed: bool, locked: bool = False, root: Path | Non
         n = 0
     if locked:
         return n
-    n = n + 1 if failed else 0
+    was, n = n, (n + 1 if failed else 0)
+    if n == was:                      # 성공이 이어지는 동안에는 파일을 건드리지 않는다
+        return n
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"streak": n, "at": f"{now_kst():%Y-%m-%d %H:%M:%S}"}),

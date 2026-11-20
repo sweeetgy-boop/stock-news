@@ -1001,6 +1001,7 @@ DIVIDEND_STOP_DAYS = 60          # 최근 이 달력 일수 안에 목록에 있
 DIVIDEND_MIN_COVERAGE = 0.50     # 유니버스 중 자료를 받은 비율이 이보다 낮으면 "자료 없음"
 DIVIDEND_WORKERS = 4             # 동시 요청 수
 DIVIDEND_TIMEOUT = 8.0           # 요청 1건 제한 시간(초)
+DIVIDEND_BUDGET_SEC = 60.0       # 자료 받기 전체 시간 상한(초). 넘으면 남은 종목은 건너뛴다
 FINANCE_RANK_TOP = 10
 # (S 구역 끝)
 
