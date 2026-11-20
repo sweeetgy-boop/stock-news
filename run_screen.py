@@ -207,7 +207,7 @@ PARTIAL_FAIL_RATIO = 0.10
 _WRITE_MODES = {"master", "backfill", "update", "flags", "credit",
                 "credit-kiwoom", "collect-dividends", "dividend-report",
                 "daily", "exits", "news", "brief-morning", "brief-evening",
-                "flash", "pos-open", "fill", "pos-close", "holidays",
+                "flash", "dispute-watch", "pos-open", "fill", "pos-close", "holidays",
                 "reconcile", "reco-events-backfill", "regime-backfill",
                 "paper", "risk-backfill",
                 "indicators-backfill", "hurst-backfill"}
@@ -258,6 +258,25 @@ def _emit(text: str, dry: bool) -> bool | None:
     log.error("텔레그램 %s (%d자 · 성공 %d명)",
               report.summary(), len(text), report.sent)
     return report.sent > 0
+
+
+def _signal_alert(where: str, errors, dry: bool) -> None:
+    """[S] 신호 기능(눌림목·분쟁 공시·반토막·첫 보도) 오류 한 줄 — **관리자 채팅에만**.
+
+    신호 기능은 기록·표시 전용이라 실패해도 스캔·recos 기록·브리핑 발송은 정상으로
+    끝난다. 그 사실과 실패한 부분만 알린다. 알림 자체가 실패해도 조용히 넘어간다.
+    """
+    errs = [str(e) for e in (errors or []) if e]
+    if not errs:
+        return
+    SUMMARY.setdefault("signal_errors", []).append({"where": where, "errors": errs})
+    msg = (f"⚠ 신호 기능 오류 ({where}) — 스캔·추천 기록·발송은 정상입니다 · "
+           + " / ".join(errs))[:600]
+    log.error("%s", msg)
+    try:
+        _emit_admin(msg, dry)
+    except Exception as exc:  # noqa: BLE001 - 알림 실패가 잡을 죽이면 안 된다
+        log.warning("신호 기능 오류 알림 실패 (%s)", type(exc).__name__)
 
 
 def _partial(ok: int, failed: int) -> bool:
@@ -976,6 +995,7 @@ def mode_daily(store: Store, args) -> int:
         SUMMARY["indicator_log"] = res["indicator_log"]
     if res.get("signals") is not None:            # [S] 플래그 ON 일 때만
         SUMMARY["signals"] = res["signals"]
+        _signal_alert("daily", res["signals"].get("errors"), args.dry_run)
     ok, failed = len(res["results"]), len(res["errors"])
     reg = res.get("regime") or {}
     SUMMARY["regime"] = {k: reg.get(k) for k in
@@ -1058,7 +1078,8 @@ def mode_weekly(store: Store, args) -> int:
     # [S] 신호 유형별 성적 (PULLBACK_LIST / DISPUTE_LIST ON 일 때만 · 파일 전용)
     try:
         from stocknews import signals as _signals
-        sig_lines = _signals.type_lines(store, rep.get("trade_date") or "9999-12-31")
+        sig_lines = _signals.type_lines(store, rep.get("trade_date") or "9999-12-31",
+                                        scope="file")
         if sig_lines:
             text += "\n\n" + "\n".join(
                 ["━━ 신호 유형별 성적 (기록 전용 · 종이 추적) ━━", *sig_lines])
@@ -1248,6 +1269,21 @@ def _collect_news(store: Store, args) -> dict:
                       use_yahoo=not args.no_yahoo,
                       use_dart=not args.no_dart,
                       counts=counts)
+    # [S] 경영권 분쟁 검색 6개 (DISPUTE_NEWS_LINE / _INSTANT ON 일 때만). 기존 검색어에는
+    # 분쟁 관련 검색이 없어 첫 보도가 수집되지 않는다. 소스별 건수(counts)에는 넣지 않는다.
+    from stocknews import dispute_news as _dnews
+    dn_info: dict = {}
+    if _dnews.enabled() and not args.no_google:
+        try:
+            first = _dnews.is_first_run(store)
+            extra = (_dnews.collect_watch(days=_dnews.SEED_DAYS, per_query=_dnews.SEED_PER_QUERY)
+                     if first else _dnews.collect_watch())
+            raw = list(raw) + list(extra)
+            dn_info["extra_collected"] = len(extra)
+            if first:
+                dn_info["seed_days"] = _dnews.SEED_DAYS
+        except Exception as exc:  # noqa: BLE001 - 부가 수집
+            dn_info["collect_error"] = f"{type(exc).__name__}: {exc}"[:160]
     res = process_and_store(store, raw)
     SUMMARY["news_sources"] = dict(counts)
     if _ns.LAST_WARN:
@@ -1263,6 +1299,13 @@ def _collect_news(store: Store, args) -> dict:
     dis = _signals.maybe_collect_disputes(store)
     if dis is not None:
         SUMMARY["disputes"] = dis
+        _signal_alert("news · 분쟁 공시", [dis.get("error")], bool(args.dry_run))
+    # [S] 경영권 분쟁 첫 보도 감지 (분쟁 공시 적재 뒤 — "공시 뒤 보도" 판정에 쓴다).
+    det = _dnews.maybe_detect(store)
+    if det is not None:
+        SUMMARY["dispute_news"] = {**dn_info, **det}
+        _signal_alert("news · 분쟁 첫 보도", [det.get("error"), dn_info.get("collect_error")],
+                      bool(args.dry_run))
     return res
 
 
@@ -1296,6 +1339,48 @@ def mode_news(store: Store, args) -> int:
     # 기록 전용이고 실패를 삼키므로 이 모드의 종료 코드에 영향이 없다.
     freq = collect_news_freq(store, cfg=DEFAULT)
     SUMMARY["news_freq"] = {k: v for k, v in freq.items() if k != "top"}
+    return EXIT_OK
+
+
+def mode_dispute_watch(store: Store, args) -> int:
+    """[S] 장중 경영권 분쟁 첫 보도 확인 (DISPUTE_NEWS_INSTANT). **예약 등록 없음.**
+
+    분쟁 관련 Google 검색 6개만 받아 정리하고(뉴스 표에 저장), 첫 보도를 감지한다.
+    새 첫 보도가 있으면 바로 별도 메시지 1건을 전체 수신자에게 보낸다(종목 정보다).
+    플래그가 꺼져 있거나 거래일 09:00~15:30 밖이면 아무것도 하지 않는다. 시세를 받지
+    않으므로 등락률은 싣지 않는다.
+    """
+    from stocknews import dispute_news as _dnews
+    if not _dnews.instant_on():
+        SUMMARY.update({"skipped": True, "reason": "DISPUTE_NEWS_INSTANT off", "sent": 0})
+        return EXIT_OK
+    asof = now_kst()
+    ok, why = should_scan_intraday(store, asof)
+    t = asof.strftime("%H:%M")
+    if ok and not ("09:00" <= t <= "15:30"):
+        ok, why = False, f"장시간 밖 ({t})"
+    if not ok and not args.ignore_window:
+        SUMMARY.update({"skipped": True, "reason": why, "sent": 0})
+        return EXIT_OK
+    t0 = time.time()
+    raw = _dnews.collect_watch()
+    res = process_and_store(store, raw)
+    det = _dnews.detect(store)
+    d = store.last_price_date()
+    rows = _dnews.to_show(store, d) if d else []
+    SUMMARY.update({"requests": len(_dnews.WATCH_QUERIES), "collected": res["collected"],
+                    "stored": res["stored"], "detect": det, "new": len(rows), "sent": 0,
+                    "work_sec": round(time.time() - t0, 1)})
+    if not rows:
+        return EXIT_OK
+    lines = [f"🔔 <b>[경영권 분쟁 첫 보도]</b> {asof:%m-%d %H:%M}",
+             *_dnews.show_lines(store, d, rows, with_returns=False),
+             "※ 기록용 알림 · 검증 중"]
+    sent = _emit("\n".join(lines), args.dry_run)
+    if sent and not args.dry_run:
+        _dnews.mark_shown(store, [int(r["id"]) for r in rows])
+    SUMMARY["sent"] = len(rows) if (sent or args.dry_run) else 0
+    SUMMARY["tickers"] = [str(r["ticker"]) for r in rows]
     return EXIT_OK
 
 
@@ -1483,7 +1568,7 @@ def _brief_evening_v2(store, args) -> int:
     if sent and info.get("new_tickers"):
         SUMMARY["sends_recorded"] = paper.record_sends(
             store, d, info["new_tickers"], paper.KIND_NEW)
-    _daily_reco_line(store, args, d, info)
+    _daily_reco_line(store, args, d, info, brief_sent=sent)
     if info.get("new_rows"):
         rows = pd.DataFrame(info["new_rows"])
         rows["rank"] = range(1, len(rows) + 1)      # ① 의 번호와 같게
@@ -1493,8 +1578,8 @@ def _brief_evening_v2(store, args) -> int:
     return EXIT_OK
 
 
-def _daily_reco_line(store, args, d: str, info: dict) -> None:
-    """DAILY_RECO_LINE — "오늘 기록된 추천 10" 한 문단의 집계와 별도 발송.
+def _daily_reco_line(store, args, d: str, info: dict, brief_sent=None) -> None:
+    """DAILY_RECO_LINE — "오늘 기록된 추천" 문단의 집계와 별도 발송.
 
     all   : 문단은 이미 브리핑 안(① 바로 위)에 있다. 여기서는 집계만 싣는다.
     admin : 브리핑은 그대로다. 같은 문단을 관리자 채팅에만 별도 메시지로 보낸다.
@@ -1506,26 +1591,65 @@ def _daily_reco_line(store, args, d: str, info: dict) -> None:
     off   : 아무것도 하지 않는다(SUMMARY 도 그대로).
     recos 는 읽기만 한다. 발송 기록(paper.record_sends)과 무관하다 — 이 목록에
     실렸다고 추적에 편입되지 않는다. 실패해도 브리핑(이미 나감)에는 영향이 없다.
+
+    [S] 신호 후보 플래그가 켜져 있으면 문단이 여러 구역이 된다. 4,096자를 넘으면
+    구역 단위로 나눠 여러 메시지로 보낸다(signals.pack_messages). 실제로 나간 첫 보도는
+    표시했다고 기록하고(다음 회차에 다시 싣지 않는다), 신호 부분의 오류는 관리자에게만
+    한 줄 알린다 — 그때도 【점수】 줄은 나간다.
     """
     from stocknews import paper_render
     mode = paper_render.reco_line_mode()
     if mode == "off":
         return
+
+    def _after(sig: dict | None, sent) -> None:
+        if not sig:
+            return
+        _signal_alert("기록된 추천 메시지", sig.get("errors"), args.dry_run)
+        if sent and not args.dry_run and sig.get("news_ids"):
+            try:
+                from stocknews import dispute_news as _dnews
+                SUMMARY["reco_line"]["news_marked"] = _dnews.mark_shown(store, sig["news_ids"])
+            except Exception as exc:  # noqa: BLE001 - 기록 전용
+                _signal_alert("첫 보도 표시 기록", [f"{type(exc).__name__}: {exc}"[:160]],
+                              args.dry_run)
+
+    def _public(rinfo: dict) -> dict:
+        """SUMMARY 에 싣는 집계 — 메시지 본문(signals.messages)은 뺀다."""
+        if "signals" not in rinfo:
+            return dict(rinfo)
+        sig = {k: v for k, v in rinfo["signals"].items() if k != "messages"}
+        return {**rinfo, "signals": sig}
+
     if mode == "all":
         if info.get("reco_line"):
-            SUMMARY["reco_line"] = {"mode": mode, **info["reco_line"]}
+            SUMMARY["reco_line"] = {"mode": mode, **_public(info["reco_line"])}
+            _after(info["reco_line"].get("signals"), brief_sent)
         return
     try:
         lines, rinfo = paper_render.reco_line_block(store, d)
         text = "\n".join(lines)
-        SUMMARY["reco_line"] = {"mode": mode, **rinfo, "len": len(text)}
+        sig = rinfo.get("signals")
+        msgs = (sig or {}).get("messages") or [text]
+        SUMMARY["reco_line"] = {"mode": mode, **_public(rinfo), "len": len(text)}
+        if len(msgs) > 1:
+            SUMMARY["reco_line"]["parts"] = [len(m) for m in msgs]
         if mode == "admin":
-            SUMMARY["reco_line"]["sent"] = _emit_admin(text, args.dry_run)
+            sent = None
+            for m in msgs:
+                r = _emit_admin(m, args.dry_run)
+                sent = r if sent is None else (sent or r)
+            SUMMARY["reco_line"]["sent"] = sent
+            _after(sig, sent)
             return
         # separate — 전체 수신자. 이 메시지에서 새로 생긴 실패만 골라 표시한다.
         SUMMARY["reco_line"]["to"] = "all"
         n0 = len(SUMMARY.get("send_failures", []))
-        SUMMARY["reco_line"]["sent"] = _emit(text, args.dry_run)
+        sent = None
+        for m in msgs:
+            r = _emit(m, args.dry_run)
+            sent = r if sent is None else (sent or r)
+        SUMMARY["reco_line"]["sent"] = sent
         new = SUMMARY.get("send_failures", [])[n0:]
         if new:
             for f in new:
@@ -1535,6 +1659,7 @@ def _daily_reco_line(store, args, d: str, info: dict) -> None:
             SUMMARY["reco_line"]["failed"] = failed
             log.error("기록된 추천 목록(전체 수신자) %d명 실패 — 수신자 %s · "
                       "브리핑 본문은 이미 나갔습니다", len(new), ", ".join(failed))
+        _after(sig, sent)
     except Exception as exc:  # noqa: BLE001 - 부가 메시지다
         SUMMARY.setdefault("reco_line", {"mode": mode})["error"] = (
             f"{type(exc).__name__}: {exc}"[:200])
@@ -2792,6 +2917,7 @@ MODES = {
     "hurst-backfill": mode_hurst_backfill,
     "fib": mode_fib,
     "flash": mode_flash,
+    "dispute-watch": mode_dispute_watch,
     "news": mode_news,
     "brief-morning": mode_brief_morning,
     "brief-evening": mode_brief_evening,

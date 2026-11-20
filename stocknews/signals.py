@@ -44,7 +44,7 @@ from . import events as E
 
 log = logging.getLogger(__name__)
 
-__all__ = ["pullback_on", "dispute_on", "halfdrop_on", "any_on", "pullback_arrays",
+__all__ = ["pullback_on", "dispute_on", "halfdrop_on", "any_on", "pack_messages", "pullback_arrays",
            "high_drop", "load_bars", "scan_dates", "record_pullback", "maybe_daily",
            "update_tracking", "collect_disputes", "record_disputes",
            "maybe_collect_disputes", "dispute_event_day", "classify_dispute",
@@ -59,10 +59,13 @@ HIGH_WIN = 250        # 고점 창(당일 제외)
 BARS = 440            # 종목당 읽는 봉 수 (60 + 120 + 250 여유)
 KIND_PULLBACK = "pullback"
 KIND_DISPUTE = "dispute"
-KIND_LABEL = {KIND_PULLBACK: "눌림목", KIND_DISPUTE: "경영권 분쟁"}
+KIND_NEWS = "dispute_news"
+KIND_LABEL = {KIND_PULLBACK: "눌림목", KIND_DISPUTE: "경영권 분쟁 공시", KIND_NEWS: "분쟁 첫 보도"}
 RULE_H20 = "h20"
 RULE_MA = "ma_exit"
 HOLD_DAYS = 20
+# 유형별 보유 거래일(확정 성적 rule = h<n>)
+KIND_HORIZONS = {KIND_PULLBACK: (20,), KIND_DISPUTE: (20,), KIND_NEWS: (5, 20, 60)}
 DISPUTE_SAME_DAYS = 120       # 같은 종목의 이 거래일 안 공시는 같은 분쟁
 DISPUTE_SHOW_DAYS = 5         # 표시: 최근 5거래일 안의 공시만
 MINUS = "−"
@@ -80,8 +83,12 @@ def halfdrop_on() -> bool:
     return bool(getattr(C, "HALF_DROP_WARN", False))
 
 
+def news_on() -> bool:
+    return bool(getattr(C, "DISPUTE_NEWS_LINE", False))
+
+
 def any_on() -> bool:
-    return pullback_on() or dispute_on() or halfdrop_on()
+    return pullback_on() or dispute_on() or halfdrop_on() or news_on()
 
 
 def _now() -> str:
@@ -395,7 +402,8 @@ def dispute_event_day(rcept_dt: str, cal_next) -> str | None:
 def collect_disputes(days: int | None = None, pause: float = 0.3,
                      max_pages: int | None = None, get=None) -> tuple[list[dict], dict]:
     """Open DART 목록에서 최근 days 일의 경영권 분쟁 공시를 고른다. 키가 없으면 빈 목록.
-    (항목 목록, {"requests": n, "error": ...})"""
+    (항목 목록, {"requests": n, "error": ...}). 종목을 지정하지 않은 조회는 한 번에 3개월까지라
+    85일씩 끊어 받는다."""
     key = os.getenv("DART_API_KEY")
     info: dict = {"requests": 0}
     if not key:
@@ -410,38 +418,48 @@ def collect_disputes(days: int | None = None, pause: float = 0.3,
     bgn = end - timedelta(days=days)
     get = get or (lambda params: requests.get(
         "https://opendart.fss.or.kr/api/list.json", params=params, timeout=(5, 20)).json())
+    windows = []
+    lo = bgn
+    while lo <= end:
+        hi = min(end, lo + timedelta(days=84))
+        windows.append((lo, hi))
+        lo = hi + timedelta(days=1)
     out: dict[str, dict] = {}
-    for detail in DISPUTE_QUERIES:
-        for page in range(1, max_pages + 1):
-            try:
-                data = get({"crtfc_key": key, "bgn_de": bgn.strftime("%Y%m%d"),
-                            "end_de": end.strftime("%Y%m%d"),
-                            "pblntf_detail_ty": detail, "page_no": page, "page_count": 100})
-            except Exception as exc:  # noqa: BLE001 - 수집은 뉴스 단계를 막지 않는다
-                info["error"] = f"{type(exc).__name__}"[:80]
-                break
-            info["requests"] += 1
-            status = str(data.get("status"))
-            if status == "013":            # 조회된 데이터 없음
-                break
-            if status != "000":
-                info["error"] = f"DART {status}"
-                break
-            for it in data.get("list") or []:
-                code = str(it.get("stock_code") or "").strip()
-                kind = classify_dispute(it.get("report_nm"), it.get("flr_nm"), it.get("corp_name"))
-                if not kind or len(code) != 6:
-                    continue
-                dt = str(it.get("rcept_dt") or "")
-                out[str(it.get("rcept_no"))] = {
-                    "rcept_no": str(it.get("rcept_no")), "ticker": code,
-                    "name": it.get("corp_name"), "kind": kind,
-                    "rcept_dt": f"{dt[:4]}-{dt[4:6]}-{dt[6:8]}" if len(dt) == 8 else dt,
-                    "title": " ".join(str(it.get("report_nm") or "").split()),
-                    "filer": it.get("flr_nm")}
-            if page >= int(data.get("total_page") or 1):
-                break
-            time.sleep(pause)
+    for w_lo, w_hi in windows:
+        for detail in DISPUTE_QUERIES:
+            for page in range(1, max_pages + 1):
+                try:
+                    data = get({"crtfc_key": key, "bgn_de": w_lo.strftime("%Y%m%d"),
+                                "end_de": w_hi.strftime("%Y%m%d"),
+                                "pblntf_detail_ty": detail, "page_no": page, "page_count": 100})
+                except Exception as exc:  # noqa: BLE001 - 수집은 뉴스 단계를 막지 않는다
+                    info["error"] = f"{type(exc).__name__}"[:80]
+                    break
+                info["requests"] += 1
+                status = str(data.get("status"))
+                if status == "013":            # 조회된 데이터 없음
+                    break
+                if status != "000":
+                    info["error"] = f"DART {status}"
+                    break
+                for it in data.get("list") or []:
+                    code = str(it.get("stock_code") or "").strip()
+                    kind = classify_dispute(it.get("report_nm"), it.get("flr_nm"),
+                                            it.get("corp_name"))
+                    if not kind or len(code) != 6:
+                        continue
+                    dt = str(it.get("rcept_dt") or "")
+                    out[str(it.get("rcept_no"))] = {
+                        "rcept_no": str(it.get("rcept_no")), "ticker": code,
+                        "name": it.get("corp_name"), "kind": kind,
+                        "rcept_dt": f"{dt[:4]}-{dt[4:6]}-{dt[6:8]}" if len(dt) == 8 else dt,
+                        "title": " ".join(str(it.get("report_nm") or "").split()),
+                        "filer": it.get("flr_nm")}
+                if page >= int(data.get("total_page") or 1):
+                    break
+                if page >= max_pages:
+                    info["truncated"] = info.get("truncated", 0) + 1
+                time.sleep(pause)
     return list(out.values()), info
 
 
@@ -461,17 +479,44 @@ def record_disputes(store, items: list[dict], source: str = "dart") -> int:
         return con.total_changes - before
 
 
+def _meta_get(store, k: str) -> str | None:
+    with closing(_conn(store)) as con:
+        r = con.execute("SELECT v FROM sig_meta WHERE k=?", (k,)).fetchone()
+        return r[0] if r else None
+
+
+def _meta_set(store, k: str, v: str) -> None:
+    with closing(_conn(store)) as con:
+        con.execute("INSERT INTO sig_meta(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                    (k, v))
+        con.commit()
+
+
 def maybe_collect_disputes(store) -> dict | None:
-    """DISPUTE_LIST 가 켜져 있을 때만. **예외를 올리지 않는다** — 뉴스 수집을 죽이지 않는다."""
+    """DISPUTE_LIST 가 켜져 있을 때만. **예외를 올리지 않는다** — 뉴스 수집을 죽이지 않는다.
+
+    처음 켠 날 한 번은 DISPUTE_SEED_DAYS(190일)를 되돌아본다 — "첫 보도" 판정이 직전
+    120거래일의 분쟁 공시를 보기 때문이다. 끝까지 받았을 때만 표시(sig_meta)를 남기고,
+    중간에 끊기면 다음 수집 때 다시 한다.
+    """
     if not dispute_on():
         return None
     try:
-        items, info = collect_disputes()
+        seeded = _meta_get(store, "dispute_seed")
+        if seeded:
+            items, info = collect_disputes()
+        else:
+            items, info = collect_disputes(days=int(C.DISPUTE_SEED_DAYS), max_pages=120)
+            info["seed_days"] = int(C.DISPUTE_SEED_DAYS)
         info["found"] = len(items)
-        info["added"] = record_disputes(store, items)
+        info["added"] = record_disputes(store, items, source="dart" if seeded else "seed")
+        if not seeded and not info.get("error") and not info.get("skipped") \
+                and not info.get("truncated"):
+            _meta_set(store, "dispute_seed", _now())
+            info["seeded"] = True
         return info
     except Exception as exc:  # noqa: BLE001 - 기록 전용
-        log.warning("경영권 분쟁 공시 감지 실패 — 건너뜁니다 (%s: %s)", type(exc).__name__, exc)
+        log.exception("경영권 분쟁 공시 감지 실패 — 건너뜁니다: %s", exc)
         return {"error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
@@ -511,9 +556,6 @@ def _enroll(store, cal: list[str], upto: str, stats: dict) -> None:
     todo: list[dict] = []
     with closing(_conn(store)) as con:
         have = {(r["kind"], r["ticker"], r["signal_d"]) for r in _paper_rows(con)}
-        last_dispute: dict[str, str] = {}
-        for r in _paper_rows(con, "WHERE kind=?", (KIND_DISPUTE,)):
-            last_dispute[r["ticker"]] = max(last_dispute.get(r["ticker"], ""), r["signal_d"])
         if pullback_on():
             for r in con.execute("SELECT d,ticker,name,ma FROM sig_pullback WHERE listed=1 "
                                  "AND d<=? ORDER BY d, rank", (upto,)).fetchall():
@@ -523,12 +565,31 @@ def _enroll(store, cal: list[str], upto: str, stats: dict) -> None:
             def nxt(x):
                 i = E._pos(cal, x) + 1
                 return cal[i] if 0 <= i < len(cal) else None
-            for r in con.execute("SELECT * FROM sig_dispute ORDER BY rcept_dt, rcept_no").fetchall():
+            # 처음 켠 날 한꺼번에 받아 둔 과거 공시(source=seed)는 편입하지 않는다 — 판정 근거로만 쓴다.
+            for r in con.execute("SELECT * FROM sig_dispute WHERE COALESCE(source,'')<>'seed' "
+                                 "ORDER BY rcept_dt, rcept_no").fetchall():
                 sd = dispute_event_day(r["rcept_dt"], nxt)
-                if sd is None or sd > upto:
+                if sd is None or sd > upto or sd not in pos:
+                    continue
+                # 같은 종목의 앞선 공시가 120거래일 안에 있으면 같은 분쟁 — 추적 행을 만들지 않는다.
+                lo = cal[max(0, pos[sd] - DISPUTE_SAME_DAYS)]
+                if con.execute(
+                        "SELECT 1 FROM sig_dispute WHERE ticker=? AND rcept_dt>=? AND "
+                        "(rcept_dt<? OR (rcept_dt=? AND rcept_no<?)) LIMIT 1",
+                        (r["ticker"], lo, r["rcept_dt"], r["rcept_dt"], r["rcept_no"])).fetchone():
                     continue
                 todo.append({"kind": KIND_DISPUTE, "ticker": str(r["ticker"]), "name": r["name"],
                              "signal_d": sd, "ref": str(r["rcept_no"]), "sub": r["kind"]})
+        from . import dispute_news as DN
+        if DN.enabled():
+            for r in con.execute("SELECT * FROM sig_dispute_news WHERE kind=? AND "
+                                 "(show_skip IS NULL OR shown=1) ORDER BY detected, id",
+                                 (DN.KIND_FIRST,)).fetchall():
+                i = E._pos(cal, str(r["detected"])[:10])     # 감지한 날(휴장이면 그 전 거래일)
+                if i < 0 or cal[i] > upto:
+                    continue
+                todo.append({"kind": KIND_NEWS, "ticker": str(r["ticker"]), "name": r["name"],
+                             "signal_d": cal[i], "ref": str(r["id"]), "sub": r["expr"]})
     todo = [t for t in todo if (t["kind"], t["ticker"], t["signal_d"]) not in have
             and t["signal_d"] in pos and pos[t["signal_d"]] + 1 < len(cal)]
     if not todo:
@@ -542,11 +603,10 @@ def _enroll(store, cal: list[str], upto: str, stats: dict) -> None:
             continue
         skip = None
         if t["kind"] == KIND_DISPUTE:
-            ld = last_dispute.get(t["ticker"])
-            if ld and ld in pos and 0 <= pos[t["signal_d"]] - pos[ld] <= DISPUTE_SAME_DAYS:
-                continue                      # 같은 분쟁 — 추적 행을 만들지 않는다
             if t["ticker"] not in _universe(store, t["signal_d"]):
                 skip = "운영 유니버스 밖"
+        elif t["kind"] == KIND_NEWS and t["ticker"] not in _universe(store, t["signal_d"]):
+            skip = "운영 유니버스 밖"
         sc = E.score_events(pd.DataFrame([{"ticker": t["ticker"], "event_date": t["signal_d"]}]),
                             panel, horizons=(1,)).iloc[0]
         status = str(sc["entry_status"])
@@ -557,8 +617,6 @@ def _enroll(store, cal: list[str], upto: str, stats: dict) -> None:
                      1 if ok else 0,
                      None if ok else (skip or ENTRY_SKIP_TEXT.get(status, status)), _now()))
         have.add(key)
-        if t["kind"] == KIND_DISPUTE:
-            last_dispute[t["ticker"]] = t["signal_d"]
     with closing(_conn(store)) as con:
         con.executemany(
             "INSERT OR IGNORE INTO sig_paper(kind,ticker,name,signal_d,ref,sub,entry_date,"
@@ -608,7 +666,10 @@ def _score(store, cal: list[str], upto: str, stats: dict) -> None:
         pos_rows = _paper_rows(con, "WHERE enrolled=1 AND signal_d<=?", (upto,))
         done = {(r["paper_id"], r["rule"]) for r in con.execute(
             "SELECT paper_id, rule FROM sig_results").fetchall()}
-    need = [r for r in pos_rows if (r["id"], RULE_H20) not in done
+
+    def _hs(r):
+        return KIND_HORIZONS.get(r["kind"], (HOLD_DAYS,))
+    need = [r for r in pos_rows if any((r["id"], f"h{h}") not in done for h in _hs(r))
             or (r["kind"] == KIND_PULLBACK and (r["id"], RULE_MA) not in done)]
     if not need:
         return
@@ -618,22 +679,22 @@ def _score(store, cal: list[str], upto: str, stats: dict) -> None:
         store, calendar=[x for x in cal if x >= cal[max(0, pos.get(first, 0) - 5)]])
     cost = float(C.ROUND_TRIP_COST_PCT)
     out = []
-    ev = pd.DataFrame([{"ticker": r["ticker"], "event_date": r["signal_d"], "_pid": r["id"]}
-                       for r in need if (r["id"], RULE_H20) not in done])
-    if len(ev):
-        sc = E.score_events(ev, panel, horizons=(HOLD_DAYS,))
-        for r in sc.to_dict("records"):
-            st = r.get(f"status_{HOLD_DAYS}")
-            if st in (E.ST_PENDING, None):
+    all_h = sorted({h for r in need for h in _hs(r)})
+    ev = pd.DataFrame([{"ticker": r["ticker"], "event_date": r["signal_d"], "_pid": r["id"],
+                        "_kind": r["kind"]} for r in need])
+    sc = E.score_events(ev, panel, horizons=tuple(all_h)) if len(ev) else pd.DataFrame()
+    for r in sc.to_dict("records") if len(sc) else []:
+        for h in KIND_HORIZONS.get(r["_kind"], (HOLD_DAYS,)):
+            rule = f"h{h}"
+            st = r.get(f"status_{h}")
+            if (int(r["_pid"]), rule) in done or st in (E.ST_PENDING, None):
                 continue
-            net = r.get(f"net_{HOLD_DAYS}")
-            ret = r.get(f"ret_{HOLD_DAYS}")
-            px = r.get(f"exit_price_{HOLD_DAYS}")
-            out.append((int(r["_pid"]), RULE_H20, r.get(f"exit_date_{HOLD_DAYS}"),
+            net, ret, px = r.get(f"net_{h}"), r.get(f"ret_{h}"), r.get(f"exit_price_{h}")
+            out.append((int(r["_pid"]), rule, r.get(f"exit_date_{h}"),
                         float(px) if px is not None and np.isfinite(px) else None, st,
                         float(ret) if ret is not None and np.isfinite(ret) else None,
                         float(net) if net is not None and np.isfinite(net) else None,
-                        HOLD_DAYS, _now()))
+                        h, _now()))
     for r in need:
         if r["kind"] != KIND_PULLBACK or (r["id"], RULE_MA) in done:
             continue
@@ -651,7 +712,7 @@ def _score(store, cal: list[str], upto: str, stats: dict) -> None:
 
 
 def update_tracking(store, upto: str) -> dict:
-    """목록에 오른 눌림목·감지된 분쟁 공시 → 편입 → 확정 성적. 멱등(이미 있는 행은 그대로)."""
+    """목록에 오른 눌림목·감지된 분쟁 공시·첫 보도 → 편입 → 확정 성적. 멱등(이미 있는 행은 그대로)."""
     upto = str(upto)[:10]
     cal = [x for x in E.trading_calendar(store) if x <= upto]
     stats: dict = {"upto": upto}
@@ -659,23 +720,33 @@ def update_tracking(store, upto: str) -> dict:
         return stats
     _enroll(store, cal, upto, stats)
     _score(store, cal, upto, stats)
+    from . import dispute_news as DN
+    if DN.enabled():
+        stats["news_filing_links"] = DN.link_filings(store)
     return stats
 
 
 def maybe_daily(store, trade_date: str) -> dict | None:
     """daily 스캔 뒤에 부른다. 플래그가 전부 OFF 면 None(아무것도 하지 않는다).
-    **예외를 올리지 않는다** — 스캔·추천 기록은 이미 커밋돼 있다."""
-    if not (pullback_on() or dispute_on()) or not trade_date:
+    **예외를 올리지 않는다** — 스캔·추천 기록은 이미 커밋돼 있다. 한 부분이 실패해도
+    나머지는 계속하고, 실패는 out["errors"] 에 남긴다(호출부가 관리자에게 한 줄 알린다)."""
+    from . import dispute_news as DN
+    if not (pullback_on() or dispute_on() or DN.enabled()) or not trade_date:
         return None
     out: dict = {}
+    errors: list[str] = []
     t0 = time.perf_counter()
-    try:
-        if pullback_on():
-            out["pullback"] = record_pullback(store, trade_date)
-        out["tracking"] = update_tracking(store, trade_date)
-    except Exception as exc:  # noqa: BLE001 - 기록 전용
-        log.warning("신호 후보 기록 실패 — 건너뜁니다 (%s: %s)", type(exc).__name__, exc)
-        out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    for name, on, fn in (("pullback", pullback_on(), lambda: record_pullback(store, trade_date)),
+                         ("tracking", True, lambda: update_tracking(store, trade_date))):
+        if not on:
+            continue
+        try:
+            out[name] = fn()
+        except Exception as exc:  # noqa: BLE001 - 기록 전용
+            log.exception("신호 후보 기록 실패(%s) — 건너뜁니다: %s", name, exc)
+            errors.append(f"{name}: {type(exc).__name__}: {exc}"[:160])
+    if errors:
+        out["errors"] = errors
     out["elapsed_sec"] = round(time.perf_counter() - t0, 2)
     return out
 
@@ -703,18 +774,95 @@ def half_drops(store, d: str, tickers: list[str]) -> dict[str, float]:
     return out
 
 
-def reco_block(store, d: str, rows: list[dict]) -> tuple[list[str], dict]:
+MSG_LIMIT = 3900          # 한 메시지 상한(텔레그램 4,096 · notify 의 분할 기준 3,968 보다 작게)
+
+
+def pack_messages(chunks: list[list[str]], limit: int = MSG_LIMIT) -> list[str]:
+    """줄 묶음(제목 · 유형별 구역 · 맨 아래 줄)을 메시지로 나눈다.
+
+    한 구역(유형 제목 + 내용)은 같은 메시지에 둔다. 구역 하나가 상한을 넘으면 그 구역만
+    줄 단위로 나누고 유형 제목을 "(이어서)" 로 되풀이한다. 상한을 안 넘으면 메시지는 1개다.
+    """
+    def size(ls):
+        return sum(len(x) + 1 for x in ls)
+    msgs: list[list[str]] = []
+    cur: list[str] = []
+    for ch in chunks:
+        if not ch:
+            continue
+        if size(ch) > limit:
+            head, body = ch[0], ch[1:]
+            if cur and size(cur) + len(head) + 1 + (len(body[0]) + 1 if body else 0) > limit:
+                msgs.append(cur)
+                cur = []
+            part = cur + [head]
+            n_body = 0
+            for ln in body:
+                if n_body and size(part) + len(ln) + 1 > limit:
+                    msgs.append(part)
+                    part, n_body = [f"{head} (이어서)"], 0
+                part.append(ln)
+                n_body += 1
+            cur = part
+            continue
+        if cur and size(cur) + size(ch) > limit:
+            msgs.append(cur)
+            cur = []
+        cur = cur + ch
+    if cur:
+        msgs.append(cur)
+    return ["\n".join(m) for m in msgs]
+
+
+def _dispute_note() -> str:
+    mean = int(C.DISPUTE_NOTE_MEAN_PCT)
+    sign = MINUS if mean < 0 else "+"
+    return (f"(과거 {int(C.DISPUTE_NOTE_YEARS)}년: 공시 뒤 20일 평균 {sign}{abs(mean)}%, "
+            f"10번 중 {int(C.DISPUTE_NOTE_UP_OF_10)}번 오름)")
+
+
+def reco_block(store, d: str, rows: list[dict], note: str | None = None) -> tuple[list[str], dict]:
     """"오늘 기록된 추천" 합친 메시지(플래그가 하나라도 켜졌을 때).
 
     rows = 그날 recos (rank 순, paper_render.recorded_recos). recos 는 읽기만 한다.
+    순서: 【점수】 → 【눌림목】 → 【경영권 분쟁 첫 보도】 → 【경영권 분쟁 공시 · 주의】 → 맨 아래 줄.
+    **한 부분이 실패해도 나머지는 나간다.** 실패한 부분은 빼고 info["errors"] 에 남긴다 —
+    【점수】 줄은 recos 만으로 만들어 항상 나간다.
     """
+    from html import escape  # noqa: F401 - stock_label 이 이스케이프한다
+    from . import dispute_news as DN
     from .renderer import stock_label
     d = str(d)[:10]
     info: dict = {}
-    pulls = listed_pullbacks(store, d) if pullback_on() else []
+    errors: list[str] = []
+
+    def safe(name, fn, default):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - 표시는 발송을 막지 않는다
+            log.exception("신호 표시 실패(%s) — 그 부분만 뺍니다: %s", name, exc)
+            errors.append(f"{name}: {type(exc).__name__}: {exc}"[:160])
+            return default
+
+    pulls = safe("눌림목", lambda: listed_pullbacks(store, d), []) if pullback_on() else []
     pmap = {str(p["ticker"]): p for p in pulls}
-    halves = half_drops(store, d, [r["ticker"] for r in rows]) if halfdrop_on() else {}
-    lines = [f"━━ 오늘 기록된 추천 (기준일 {d[5:]}) ━━", f"【점수 {len(rows)}】"]
+    halves = (safe("반토막 경고", lambda: half_drops(store, d, [r["ticker"] for r in rows]), {})
+              if halfdrop_on() else {})
+    dis = safe("경영권 분쟁 공시", lambda: recent_disputes(store, d), []) if dispute_on() else []
+    news_rows, news_lines, news_tag = [], [], set()
+    if news_on():
+        news_rows = safe("경영권 분쟁 첫 보도", lambda: DN.to_show(store, d), [])
+        news_lines = safe("경영권 분쟁 첫 보도", lambda: DN.show_lines(store, d, news_rows), None)
+        if news_lines is None:
+            news_rows, news_lines = [], []
+        news_tag = safe("경영권 분쟁 첫 보도", lambda: DN.recent_first_tickers(store, d), set()) \
+            | {str(r["ticker"]) for r in news_rows}
+    filing_tag = {str(x["ticker"]) for x in dis}
+
+    def tags(t: str) -> str:
+        return (" 🔔분쟁 보도" if t in news_tag else "") + (" ⚠분쟁 공시" if t in filing_tag else "")
+
+    title = f"━━ 오늘 기록된 추천 (기준일 {d[5:]}) ━━"
     items = []
     for r in rows:
         s = stock_label(r["name"], r["ticker"])
@@ -722,49 +870,71 @@ def reco_block(store, d: str, rows: list[dict]) -> tuple[list[str], dict]:
             s += f" ⚠{_pct_drop(halves[r['ticker']])}"
         if r["ticker"] in pmap:
             s += f" (눌림목 {int(pmap[r['ticker']]['ma'])}일선)"
-        items.append(s)
-    lines.append(" · ".join(items) if items else "없음")
+        items.append(s + tags(str(r["ticker"])))
+    sections: list[list[str]] = [[f"【점수 {len(rows)}】", " · ".join(items) if items else "없음"]]
     if halfdrop_on():
         info["half_drop"] = sorted(halves)
     if pullback_on():
-        lines.append(f"【눌림목 {len(pulls)}】")
-        lines += [f"{stock_label(p['name'], p['ticker'])} {int(p['ma'])}일선 · "
-                  f"{_pct_drop(p['drop_pct'])}" for p in pulls] or ["없음"]
+        sections.append([f"【눌림목 {len(pulls)}】",
+                         *([f"{stock_label(p['name'], p['ticker'])} {int(p['ma'])}일선 · "
+                            f"{_pct_drop(p['drop_pct'])}{tags(str(p['ticker']))}" for p in pulls]
+                           or ["없음"])])
         info["pullback"] = [str(p["ticker"]) for p in pulls]
+    if news_on():
+        if news_rows:
+            sections.append([f"【경영권 분쟁 첫 보도 {len(news_rows)}】", *news_lines])
+        info["news"] = [str(r["ticker"]) for r in news_rows]
+        info["news_ids"] = [int(r["id"]) for r in news_rows]
     if dispute_on():
-        dis = recent_disputes(store, d)
         if dis:
-            lines.append(f"【경영권 분쟁 {len(dis)}】")
-            lines += [f"{stock_label(x['name'], x['ticker'])} "
-                      f"{DISPUTE_LABEL.get(x['kind'], x['kind'])} {str(x['rcept_dt'])[5:]}"
-                      for x in dis]
+            sections.append([f"【경영권 분쟁 공시 · 주의 {len(dis)}】", _dispute_note(),
+                             *[f"{stock_label(x['name'], x['ticker'])} "
+                               f"{DISPUTE_LABEL.get(x['kind'], x['kind'])} {str(x['rcept_dt'])[5:]}"
+                               for x in dis]])
         info["dispute"] = [str(x["ticker"]) for x in dis]
-    return lines, info
+    if errors:
+        info["errors"] = errors
+    chunks = [[title], *sections] + ([[note]] if note else [])
+    info["messages"] = pack_messages(chunks)
+    return [ln for ch in chunks for ln in ch], info
 
 
-def type_lines(store, upto: str) -> list[str]:
-    """주간 성적표·주간 파일의 유형별 줄. 켜진 유형만. 표본 20건 미만은 "표본 부족"."""
+def _cell_line(label: str, g: pd.DataFrame, extra: str = "") -> str:
+    c = E.stat_cell(g["net"] if len(g) else [])
+    if not c.get("enough"):
+        return f"• {label}: 표본 부족 (n={c.get('n', 0)})"
+    return (f"• {label}: 평균 {c['mean']:+.2f}% · 중앙 {c['median']:+.2f}% · "
+            f"승률 {c['win']:.0f}% (n={c['n']}){extra}")
+
+
+def type_lines(store, upto: str, scope: str = "send") -> list[str]:
+    """주간 성적표(scope="send")·주간 파일(scope="file")의 유형별 줄. 켜진 유형만.
+    표본 20건 미만은 "표본 부족". 분쟁 첫 보도는 파일에만 싣는다."""
+    from . import dispute_news as DN
     out: list[str] = []
-    kinds = [k for k, on in ((KIND_PULLBACK, pullback_on()), (KIND_DISPUTE, dispute_on())) if on]
+    kinds = [k for k, on in ((KIND_PULLBACK, pullback_on()), (KIND_DISPUTE, dispute_on()),
+                             (KIND_NEWS, scope == "file" and DN.line_on())) if on]
     if not kinds:
         return out
+    upto = str(upto)[:10]
     with closing(_conn(store)) as con:
         res = pd.read_sql_query(
             "SELECT p.kind, r.rule, r.net, r.days, r.status FROM sig_results r "
-            "JOIN sig_paper p ON p.id = r.paper_id WHERE r.exit_date<=?", con,
-            params=(str(upto)[:10],))
+            "JOIN sig_paper p ON p.id = r.paper_id WHERE r.exit_date<=?", con, params=(upto,))
+        news_n = con.execute(
+            "SELECT COUNT(*), SUM(shown), SUM(filing_after_dt IS NOT NULL) FROM sig_dispute_news "
+            "WHERE kind='first' AND (show_skip IS NULL OR shown=1) AND substr(detected,1,10)<=?",
+            (upto,)).fetchone() if KIND_NEWS in kinds else None
     res = res[res["status"].isin([E.ST_OK, E.ST_HALTED])] if len(res) else res
     for k in kinds:
-        rules = ((RULE_H20, f"{HOLD_DAYS}거래일 보유"),) + (
-            ((RULE_MA, "평균선 이탈 종료"),) if k == KIND_PULLBACK else ())
-        for rule, lab in rules:
-            g = res[(res["kind"] == k) & (res["rule"] == rule)] if len(res) else res
-            c = E.stat_cell(g["net"] if len(g) else [])
-            if not c.get("enough"):
-                out.append(f"• {KIND_LABEL[k]} · {lab}: 표본 부족 (n={c.get('n', 0)})")
-                continue
-            extra = (f" · 평균 보유 {g['days'].astype(float).mean():.1f}거래일"
-                     if rule == RULE_MA else "")
-            out.append(f"• {KIND_LABEL[k]} · {lab}: 평균 {c['mean']:+.2f}% · 중앙 "
-                       f"{c['median']:+.2f}% · 승률 {c['win']:.0f}% (n={c['n']}){extra}")
+        if k == KIND_NEWS:
+            out.append(f"• {KIND_LABEL[k]} · 감지 {int(news_n[0] or 0)}건 (표시 {int(news_n[1] or 0)}건 · "
+                       f"뒤에 분쟁 공시가 나온 것 {int(news_n[2] or 0)}건)")
+        for h in KIND_HORIZONS[k]:
+            g = res[(res["kind"] == k) & (res["rule"] == f"h{h}")] if len(res) else res
+            out.append(_cell_line(f"{KIND_LABEL[k]} · {h}거래일 보유", g))
+        if k == KIND_PULLBACK:
+            g = res[(res["kind"] == k) & (res["rule"] == RULE_MA)] if len(res) else res
+            extra = (f" · 평균 보유 {g['days'].astype(float).mean():.1f}거래일" if len(g) else "")
+            out.append(_cell_line(f"{KIND_LABEL[k]} · 평균선 이탈 종료", g, extra))
     return out

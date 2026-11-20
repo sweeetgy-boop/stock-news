@@ -294,8 +294,16 @@ def reco_line_block(store, d: str) -> tuple[list[str], dict]:
     # 켜지면 합친 메시지로 바꾼다. 전부 OFF 면 아래 기존 문단 그대로다.
     from . import signals as S
     if S.any_on():
-        lines, sinfo = S.reco_block(store, d, rows)
-        return [*lines, RECO_LINE_NOTE], {**info, "signals": sinfo}
+        try:
+            lines, sinfo = S.reco_block(store, d, rows, note=RECO_LINE_NOTE)
+        except Exception as exc:  # noqa: BLE001 - 신호 기능이 통째로 실패해도 【점수】 는 나간다
+            log.exception("신호 표시 전체 실패 — 【점수】 만 싣습니다: %s", exc)
+            lines = [f"━━ 오늘 기록된 추천 (기준일 {d[5:]}) ━━", f"【점수 {len(rows)}】",
+                     " · ".join(stock_label(r["name"], r["ticker"]) for r in rows) or "없음",
+                     RECO_LINE_NOTE]
+            sinfo = {"errors": [f"표시 전체: {type(exc).__name__}: {exc}"[:160]],
+                     "messages": ["\n".join(lines)]}
+        return lines, {**info, "signals": sinfo}
     if not rows:
         return [RECO_LINE_EMPTY], info
     return [f"━━ 오늘 기록된 추천 {len(rows)} (기준일 {d[5:]}) ━━",
@@ -590,11 +598,12 @@ def _cum_lines(pd_, m_all: pd.DataFrame, H: int) -> tuple[list[str], dict]:
     return [l1, l2], info
 
 
-def _signal_type_lines(store, upto: str) -> list[str]:
-    """[S] 눌림목·경영권 분쟁 유형별 줄. 플래그가 꺼져 있으면 빈 목록(지금과 같다)."""
+def _signal_type_lines(store, upto: str, scope: str = "send") -> list[str]:
+    """[S] 눌림목·경영권 분쟁 유형별 줄. 플래그가 꺼져 있으면 빈 목록(지금과 같다).
+    scope="file" 이면 분쟁 첫 보도 줄도 싣는다(주간 파일 전용)."""
     try:
         from . import signals as S
-        return S.type_lines(store, upto)
+        return S.type_lines(store, upto, scope=scope)
     except Exception as exc:  # noqa: BLE001 - 부가 줄
         log.warning("신호 유형별 줄 실패 — 생략: %s", exc)
         return []
@@ -791,7 +800,7 @@ def sunday_detail(pd_, trade_d: str, asof) -> str:
            f"다음 거래일 시가 편입 · 왕복 {C.ROUND_TRIP_COST_PCT:g}%p 차감)",
            f"[만기분 누적 ({H}거래일, n={len(m_all)})]"]
     _st = getattr(pd_, "store", None)
-    sig = _signal_type_lines(_st, trade_d) if _st is not None else []
+    sig = _signal_type_lines(_st, trade_d, scope="file") if _st is not None else []
     sig = ["[신호 유형별 · 수익률(비용 차감)]", *sig] if sig else []
     if m_all.empty:
         out.append("• 만기된 추적 종목 없음")

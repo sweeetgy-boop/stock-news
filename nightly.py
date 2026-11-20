@@ -308,6 +308,11 @@ JOBS: dict[str, Job] = {
     "flash": Job("flash", "flash", "\u26a1",
                  _one("flash", ["--mode", "flash", *FLASH_EXTRA_ARGS]),
                  once_per_day=False, quiet_ok=True, cron="*/5 9-15 * * 1-5"),
+    # [S] 장중 30분 간격 경영권 분쟁 첫 보도 확인(DISPUTE_NEWS_INSTANT). 마커도 완료
+    # 알림도 없다. **Hermes 에 등록하지 않았다** — 플래그를 켜기로 할 때 등록한다.
+    "dispute-watch": Job("dispute-watch", "분쟁 보도 확인", "\U0001f514",
+                         _one("dispute-watch", ["--mode", "dispute-watch"]),
+                         once_per_day=False, quiet_ok=True, cron="*/30 9-15 * * 1-5"),
 }
 
 

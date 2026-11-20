@@ -385,9 +385,12 @@ def run(check, near, tmp):
         assert full[1] == "【점수 4】" and "(눌림목" not in full[2]             # 810001 은 목록 밖(max)
         k = full.index("【눌림목 5】")
         assert full[k + 1] == f"{stock_label(names['810003'], '810003')} 20일선 · 고점 −0%"
-        j = full.index("【경영권 분쟁 1】")
-        assert full[j + 1] == f"{stock_label(names['810013'], '810013')} 경영권 분쟁 소송 {d[5:]}"
+        j = full.index("【경영권 분쟁 공시 · 주의 1】")
+        assert full[j + 1] == "(과거 8년: 공시 뒤 20일 평균 \u22123%, 10번 중 3번 오름)", full[j + 1]
+        assert full[j + 2] == f"{stock_label(names['810013'], '810013')} 경영권 분쟁 소송 {d[5:]}"
         assert j == k + 6 and full[-1] == R.RECO_LINE_NOTE
+        assert full[2].endswith(f"{stock_label(names['810013'], '810013')} ⚠분쟁 공시"), full[2]
+        assert i2["signals"]["messages"] == ["\n".join(full)]           # 상한 안이면 메시지 1개
         assert i2["signals"]["dispute"] == ["810013"]                         # 유니버스 밖 810009 는 없음
         text = "\n".join(full)
         assert "매수" not in text.replace("공개매수", "") and "매도" not in text
@@ -437,7 +440,7 @@ def run(check, near, tmp):
             _back(snap)
         assert len(few) == 2 and all("표본 부족" in x for x in few), few
         assert few[0].startswith("• 눌림목 · 20거래일 보유: 표본 부족 (n=")
-        assert len(both) == 3 and both[2].startswith("• 경영권 분쟁 · 20거래일 보유: 표본 부족")
+        assert len(both) == 3 and both[2].startswith("• 경영권 분쟁 공시 · 20거래일 보유: 표본 부족")
         assert many[0] == "• 눌림목 · 20거래일 보유: 평균 +1.50% · 중앙 +1.50% · 승률 54% (n=24)", many[0]
         assert many[1].endswith("(n=24) · 평균 보유 5.0거래일"), many[1]
         assert "표본 부족 (n=0)" in early[0] and "(n=24)" in early[1]         # 그날까지 끝난 것만

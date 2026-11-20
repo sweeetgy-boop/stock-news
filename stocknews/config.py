@@ -956,14 +956,27 @@ DAILY_RECO_LINE_MODES = ("off", "all", "admin", "separate")
 #   HALF_DROP_WARN  점수 방식(recos) 종목 중 종가가 직전 250봉 고가 최고값보다 50% 넘게
 #                   낮은 종목 이름 뒤에 "⚠고점 −x%" 를 붙인다.
 # 표시는 DAILY_RECO_LINE 이 off 가 아닐 때만 나간다(받는 사람도 그 설정을 따른다).
+#   DISPUTE_NEWS_LINE    뉴스 수집 때 기사 제목에서 경영권 분쟁 "첫 보도"를 감지해
+#                   sig_dispute_news 에 기록하고, 종이 추적에 편입하고, 【경영권 분쟁 첫 보도】 를
+#                   싣는다. 켜면 뉴스 수집이 분쟁 관련 Google 검색 6개를 더 던진다.
+#   DISPUTE_NEWS_INSTANT 장중 확인 잡(dispute-watch)이 첫 보도를 바로 별도 메시지로 보낸다.
+#                   **구현만 해 두었다 — 예약 등록도, 운영 플래그도 켜지 않았다.**
 PULLBACK_LIST = False
 DISPUTE_LIST = False
 HALF_DROP_WARN = False
+DISPUTE_NEWS_LINE = False
+DISPUTE_NEWS_INSTANT = False
 PULLBACK_MAX_DROP = 0.15         # 종가가 직전 250봉 최고가보다 이 비율 넘게 낮으면 눌림목에서 제외
 PULLBACK_MAX_PER_DAY = 5
 PULLBACK_COOLDOWN_DAYS = 20      # 목록에 오른 종목을 다시 올리지 않는 거래일 수
 HALF_DROP_LIMIT = 0.50
 DISPUTE_LOOKBACK_DAYS = 3        # 뉴스 수집 때 DART 목록을 되돌아보는 달력 일수
+DISPUTE_SEED_DAYS = 190          # 처음 켠 날 한 번 되돌아보는 달력 일수(120거래일 이상 · 첫 보도 판정용)
+# 【경영권 분쟁 공시 · 주의】 아래 한 줄의 숫자. 2026-11-20 조사(research/dispute · 2019~2026 ·
+# 운영 배제 범위 370건): 공시 뒤 20거래일 평균 −2.95%, 오른 비율 33.5%.
+DISPUTE_NOTE_YEARS = 8
+DISPUTE_NOTE_MEAN_PCT = -3       # 20거래일 평균(%) — 반올림
+DISPUTE_NOTE_UP_OF_10 = 3        # 10번 중 오른 횟수
 DISPUTE_MAX_PAGES = 15           # 유형별 목록 페이지 상한(100건/쪽 · 수시공시 하루 약 100건)
 # (S 구역 끝)
 
@@ -1183,6 +1196,8 @@ ENV_OVERRIDE_FLAGS: dict[str, type] = {
     "PULLBACK_LIST": bool,
     "DISPUTE_LIST": bool,
     "HALF_DROP_WARN": bool,
+    "DISPUTE_NEWS_LINE": bool,
+    "DISPUTE_NEWS_INSTANT": bool,
 }
 # str 플래그가 받을 수 있는 값. 첫 값이 OFF 다.
 ENV_FLAG_CHOICES: dict[str, tuple[str, ...]] = {

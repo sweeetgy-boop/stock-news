@@ -76,6 +76,8 @@ KNOWN_KEYS: tuple[str, ...] = (
     "PULLBACK_LIST",
     "DISPUTE_LIST",
     "HALF_DROP_WARN",
+    "DISPUTE_NEWS_LINE",
+    "DISPUTE_NEWS_INSTANT",
 )
 
 # 값을 절대 출력하면 안 되는 키. 부분 마스킹조차 하지 않는다.

@@ -300,7 +300,10 @@ CREATE TABLE IF NOT EXISTS indicator_log (
 #                listed=1 이 그날 목록에 오른 종목(하루 최대 5 · 재등재 제한 통과).
 # sig_dispute  : 감지된 경영권 분쟁 공시. 접수번호 키(INSERT OR IGNORE).
 # sig_paper    : 종이 추적 편입(유형별). **추가 전용.** recos·paper_* 와 섞지 않는다.
-# sig_results  : 확정 성적. rule = h20(20거래일 보유) / ma_exit(평균선 이탈 종료). 추가 전용.
+# sig_results  : 확정 성적. rule = h5/h20/h60(보유 거래일) / ma_exit(평균선 이탈 종료). 추가 전용.
+# sig_dispute_news       : 경영권 분쟁 보도 사건(종목별 · 60일 묶음). 표시 여부·뒤따른 공시를 갱신한다.
+# sig_dispute_news_items : 사건에 묶인 기사(뉴스 id 키 — 같은 기사를 두 번 세지 않는다).
+# sig_meta     : 신호 기능의 1회성 표시(분쟁 공시 초기 적재 등).
 DDL_S = """
 CREATE TABLE IF NOT EXISTS sig_pullback (
   d TEXT NOT NULL, ticker TEXT NOT NULL, name TEXT,
@@ -346,6 +349,32 @@ CREATE TABLE IF NOT EXISTS sig_results (
   ret REAL, net REAL, days INTEGER, created TEXT,
   PRIMARY KEY (paper_id, rule)
 );
+CREATE TABLE IF NOT EXISTS sig_dispute_news (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticker TEXT NOT NULL, name TEXT,
+  kind TEXT NOT NULL,             -- first(첫 보도) / after_filing(공시 뒤 보도)
+  first_news_id TEXT,
+  first_at TEXT NOT NULL,         -- 첫 기사 시각(KST)
+  title TEXT, source TEXT, url TEXT,
+  expr TEXT,                      -- 걸린 표현(유형 이름)
+  n_articles INTEGER NOT NULL DEFAULT 1,   -- 지금까지 같은 사건으로 묶인 기사 수
+  last_at TEXT,
+  detected TEXT,                  -- 감지 시각
+  prior_filing_dt TEXT,           -- 직전 120거래일 안 분쟁 공시 접수일(있으면 after_filing)
+  show_skip TEXT,                 -- 표시하지 않는 이유(공시 뒤 보도 / 소급 / 60일 안 표시). NULL = 표시 대상
+  shown INTEGER NOT NULL DEFAULT 0,
+  shown_at TEXT,
+  filing_after_dt TEXT,           -- 첫 기사 뒤 실제로 나온 첫 분쟁 공시
+  filing_after_no TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sig_dispute_news_ticker ON sig_dispute_news(ticker);
+CREATE TABLE IF NOT EXISTS sig_dispute_news_items (
+  news_id TEXT PRIMARY KEY,
+  ticker TEXT NOT NULL, expr TEXT, published TEXT,
+  event_id INTEGER, created TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sig_dispute_news_items_t ON sig_dispute_news_items(ticker, published);
+CREATE TABLE IF NOT EXISTS sig_meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TRIGGER IF NOT EXISTS sig_paper_no_upd BEFORE UPDATE ON sig_paper
 BEGIN SELECT RAISE(ABORT, 'sig_paper is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS sig_paper_no_del BEFORE DELETE ON sig_paper

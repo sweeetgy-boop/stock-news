@@ -6595,7 +6595,8 @@ def test_cron_jobs(tmp: Path):
         sys.modules.pop(spec.name, None)
 
     EXPECTED = {"nightly", "news", "brief-morning", "brief-evening",
-                "weekly", "flash"}
+                "weekly", "flash",
+                "dispute-watch"}
 
     def t_catalog():
         assert set(nl_mod.JOBS) == EXPECTED, set(nl_mod.JOBS)
@@ -6614,6 +6615,10 @@ def test_cron_jobs(tmp: Path):
             if name == "flash":
                 assert not job.once_per_day, "flash 에 마커를 켜면 하루 1회만 돈다"
                 assert job.quiet_ok, "flash 정상 알림은 하루 84건이 된다"
+            elif name == "dispute-watch":
+                # 2026-11-20: 장중 30분 간격 확인 잡(예약 미등록). flash 와 같은 이유.
+                assert not job.once_per_day, "dispute-watch 에 마커를 켜면 하루 1회만 돈다"
+                assert job.quiet_ok, "dispute-watch 정상 알림은 하루 14건이 된다"
             elif name == "weekly":
                 assert job.once_per_day, "weekly: 중복 방어가 없다"
                 assert job.quiet_ok, "weekly 는 정상 완료 알림을 보내지 않는다"

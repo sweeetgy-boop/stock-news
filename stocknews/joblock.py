@@ -53,6 +53,8 @@ MODE_TIMEOUTS: dict[str, int] = {
     "flags": 3600,        # DART 조회가 종목당 0.25초
     "daily": 1800,        # 30분
     "flash": 1200,
+    # [S] 장중 경영권 분쟁 첫 보도 확인. Google 검색 6개 + 감지 — 실측 10초 안쪽.
+    "dispute-watch": 300,
     "holidays": 120,
     "master": 900,
     "update": 900,
