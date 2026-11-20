@@ -22,10 +22,17 @@
 대신 세 단계로 판정한다.
 
   주말            -> 요일로 확정 (CLOSED_WEEKEND)
-  알려진 휴장일    -> DB 캐시 (CLOSED_HOLIDAY). 조회가 0건이면 기록된다
+  공휴일          -> holidays 테이블(천문연구원 API) 또는
+                     config.EXTRA_MARKET_HOLIDAYS. 프로브 생략 (CLOSED_HOLIDAY)
+  알려진 휴장일    -> DB 캐시 non_trading_days (CLOSED_HOLIDAY). 조회가 0건이면 기록된다
   시세가 있는 날   -> 거래일 확정 (TRADING)
   그 외 평일       -> UNKNOWN. 낙관적으로 거래일로 취급하되,
                      '확실히 휴장'을 요구하는 게이트는 통과시킨다
+
+공휴일 사전 필터는 **휴장을 앞당겨 확정할 뿐** 거래일을 확정하지 않는다.
+임시휴장·조기폐장은 API 에 없으므로 그 판정은 종전대로 기준 종목 프로브가
+한다. 테이블이 비어 있거나 API 가 죽어도 프로브로 넘어갈 뿐 판정은 막히지
+않는다.
 
 이 방식은 자기 학습형이다. 새 공휴일을 만나면 한 번 헛조회하고 기록한 뒤
 다음부터 건너뛴다.
@@ -34,6 +41,8 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time as dtime, timedelta, timezone
+
+from .holidays import holiday_name
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +59,8 @@ UNKNOWN = "UNKNOWN"
 
 __all__ = ["KRX_OPEN", "KRX_CLOSE", "TRADING", "CLOSED_WEEKEND",
            "CLOSED_HOLIDAY", "UNKNOWN", "now_kst", "as_date", "is_weekend",
-           "market_status", "is_definitely_closed", "last_trading_day",
+           "market_status", "market_status_reason", "is_definitely_closed",
+           "last_trading_day",
            "calendar_gap_days", "trading_days_between", "news_window_hours",
            "should_scan_intraday"]
 
@@ -71,17 +81,29 @@ def is_weekend(d) -> bool:
     return as_date(d).weekday() >= 5
 
 
-def market_status(store, d=None) -> str:
-    """그 날짜의 장 상태."""
+def market_status_reason(store, d=None) -> tuple[str, str]:
+    """(장 상태, 사유). 사유는 로그·리포트용 문자열이다.
+
+    순서가 곧 우선순위다. 공휴일 사전 필터가 non_trading_days 앞에 온다 —
+    공휴일이면 기준 종목 프로브를 부를 이유가 없다.
+    """
     day = as_date(d if d is not None else now_kst())
     if day.weekday() >= 5:
-        return CLOSED_WEEKEND
+        return CLOSED_WEEKEND, "주말"
     ds = day.isoformat()
+    name = holiday_name(store, ds)
+    if name:
+        return CLOSED_HOLIDAY, f"공휴일: {name}"
     if store.is_known_non_trading(ds):
-        return CLOSED_HOLIDAY
+        return CLOSED_HOLIDAY, "non_trading_days 기록"
     if store.has_price_date(ds):
-        return TRADING
-    return UNKNOWN
+        return TRADING, "시세 있음"
+    return UNKNOWN, "평일 · 공휴일 아님 · 시세 미확인"
+
+
+def market_status(store, d=None) -> str:
+    """그 날짜의 장 상태."""
+    return market_status_reason(store, d)[0]
 
 
 def is_definitely_closed(store, d=None) -> bool:
@@ -159,11 +181,11 @@ def should_scan_intraday(store, now: datetime | None = None
                          ) -> tuple[bool, str]:
     """장중 스캔(flash)을 돌려야 하는가. (실행여부, 사유) 반환."""
     now = now or now_kst()
-    status = market_status(store, now)
+    status, why = market_status_reason(store, now)
     if status == CLOSED_WEEKEND:
         return False, "주말 휴장"
     if status == CLOSED_HOLIDAY:
-        return False, "공휴일 휴장"
+        return False, f"휴장 ({why})"
     t = now.time()
     # 정규장 전후 여유를 둔다. 09:00 동시호가 직전과 마감 직후를 포함.
     if t < dtime(8, 50) or t > dtime(15, 40):

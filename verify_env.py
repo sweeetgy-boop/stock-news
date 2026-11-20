@@ -5,7 +5,22 @@ pip install 이 성공했다고 핀이 맞는 건 아니다. 다른 패키지의
 해석 과정에서 조용히 다른 버전이 올라가는 경우가 있어서, 실제로 무엇이
 import 되는지를 확인해야 한다.
 
+  hermes\\run.cmd verify        (권장 — 인터프리터를 래퍼가 고른다)
   python verify_env.py
+
+★ 인터프리터가 다르면 아무 검사도 하지 않는다
+---------------------------------------------
+이 스크립트는 **자기를 실행한 인터프리터**의 설치본과 대조한다. 그래서
+엉뚱한 파이썬으로 돌리면 그 환경 기준으로 '전부 일치' 가 나온다. 자기
+자신에 대해서는 항상 참인, 쓸모없는 통과다.
+
+2026-09-07 실측. 에이전트가 Hermes 번들 venv(Python 3.11)로 이걸 돌려
+'핀 일치 34/34 · 환경이 requirements.txt 와 정확히 일치합니다' 를 받고,
+그 결과를 근거로 numpy 핀을 2.5.2 -> 2.4.6 으로 낮췄다. 실제 배치는
+Python 3.12 로 돌고 있었고 numpy 2.5.x 는 3.12 이상을 요구한다. 통과
+문구가 오히려 틀린 판단의 근거가 됐다.
+
+그래서 첫 줄에서 버전을 확인하고, 다르면 즉시 exit 1 로 끝낸다.
 """
 from __future__ import annotations
 
@@ -15,6 +30,15 @@ from importlib import metadata
 from pathlib import Path
 
 REQ = Path(__file__).with_name("requirements.txt")
+
+# 이 프로젝트가 도는 파이썬. (major, minor) 가 정확히 일치해야 한다.
+#
+# 정확히 일치를 요구하는 이유는 requirements.txt 가 그 버전의 휠로
+# 고정돼 있기 때문이다. numpy 2.5.x 는 Requires-Python >=3.12 라
+# 3.11 에서는 설치 자체가 안 되고, 다른 마이너 버전에서는 cp3XX 확장
+# 모듈이 서로 맞지 않는다. 파이썬을 올릴 때는 이 값과 requirements.txt
+# 를 같이 올린다.
+REQUIRED_PY = (3, 12)
 
 # 배포명(distribution name) != import 이름인 것들
 IMPORT_NAME = {
@@ -53,8 +77,37 @@ def normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def check_interpreter() -> bool:
+    """실행 중인 파이썬이 REQUIRED_PY 인가. 아니면 사유를 찍는다."""
+    if sys.version_info[:2] == REQUIRED_PY:
+        return True
+    want = ".".join(str(v) for v in REQUIRED_PY)
+    got = ".".join(str(v) for v in sys.version_info[:2])
+    width = 60
+    print()
+    print("=" * width)
+    print(" 인터프리터가 다릅니다 — 검사를 중단합니다")
+    print("=" * width)
+    print(f"  필요   Python {want}")
+    print(f"  실행   Python {got}   {sys.executable}")
+    print()
+    print("  이 스크립트는 자기를 실행한 인터프리터의 설치본과")
+    print("  requirements.txt 를 대조합니다. 엉뚱한 인터프리터로 돌리면")
+    print("  그 환경 기준으로 '전부 일치' 가 나오고, 그 결과를 믿고 핀을")
+    print("  고치면 진짜 실행 환경이 깨집니다.")
+    print()
+    print("  2026-09-07 실측: Hermes 번들 venv(Python 3.11)로 돌려")
+    print("  '핀 일치 34/34' 를 받고 numpy 핀을 2.5.2 -> 2.4.6 으로")
+    print("  낮췄습니다. 실제 배치는 3.12 로 돌고 있었습니다.")
+    print()
+    print("  올바른 실행:  hermes\\run.cmd verify")
+    return False
+
+
 def main() -> int:
     print(f"Python {sys.version.split()[0]}  ({sys.executable})")
+    if not check_interpreter():
+        return 1
     if not REQ.exists():
         print(f"requirements.txt 를 찾을 수 없습니다: {REQ}")
         return 1
@@ -109,13 +162,27 @@ def main() -> int:
     print("=" * width)
     feature_fail = []
 
-    def feat(label, fn):
+    feature_warn = []
+
+    def feat(label, fn, *, fatal: bool = True):
+        """기능 1건 점검.
+
+        `fatal=False` 는 '기능이 죽었지만 폴백으로 동작한다'는 뜻이다.
+        하드 실패로 내면 고칠 수 없는 환경(예: OS 보안 정책)에서 rc=1 이
+        영구히 붙어 정작 진짜 실패를 가린다. 반대로 조용히 통과시키면
+        열화 사실을 아무도 모른다. 그래서 등급을 나눈다.
+        """
         try:
             fn()
             print(f"  OK    {label}")
         except Exception as exc:  # noqa: BLE001
-            feature_fail.append((label, f"{type(exc).__name__}: {exc}"))
-            print(f" FAIL   {label}  {type(exc).__name__}: {exc}")
+            detail = f"{type(exc).__name__}: {exc}"
+            if fatal:
+                feature_fail.append((label, detail))
+                print(f" FAIL   {label}  {detail}")
+            else:
+                feature_warn.append((label, detail))
+                print(f" 경고   {label}\n        {exc}")
 
     def f_bs4_xml():
         from bs4 import BeautifulSoup
@@ -157,6 +224,38 @@ def main() -> int:
         kst = timezone(timedelta(hours=9))
         assert datetime.now(kst).utcoffset() == timedelta(hours=9)
 
+    def f_charset_detector():
+        """requests 의 문자 인식 의존성이 실제로 로드되는가.
+
+        핀 대조는 `importlib.metadata` 로 버전만 읽는다. 그래서 설치는
+        돼 있는데 **로드가 막힌** 경우를 놓친다. 2026-08-28 실측:
+
+            ImportError: DLL load failed while importing cd:
+            애플리케이션 제어 정책에서 이 파일을 차단했습니다.
+
+        Windows 애플리케이션 제어 정책(WDAC/Smart App Control)이
+        `charset_normalizer` 의 컴파일 확장(`cd.cp312-win_amd64.pyd`)을
+        차단한 것이다. 패키지 파일은 전부 있고 순수 파이썬 폴백(`cd.py`)도
+        있지만 `__init__` 이 `.pyd` 를 먼저 잡아 ImportError 로 죽는다.
+
+        영향은 좁다. charset 헤더를 주는 응답(DART·키움 JSON)은 무관하고,
+        헤더가 없으면 requests 가 utf-8 로 폴백한다. 우리가 읽는 소스는
+        전부 UTF-8 이라 실害가 없다. 다만 '환경이 정확히 일치합니다'가
+        거짓이 되는 것을 막아야 한다.
+        """
+        import requests.compat as _rc
+        if getattr(_rc, "chardet", None) is not None:
+            return
+        try:
+            import charset_normalizer  # noqa: F401
+            return
+        except ImportError as exc:
+            raise AssertionError(
+                f"charset 인식 의존성 로드 실패 ({exc}). "
+                "응답 인코딩 자동 판별이 꺼집니다 (utf-8 폴백). "
+                "복구하려면: pip install --force-reinstall "
+                "--no-binary :all: charset-normalizer") from exc
+
     def f_stdlib_zip_xml():
         import io
         import zipfile
@@ -178,6 +277,45 @@ def main() -> int:
     feat("numpy add.at (매물대 POC)", f_numpy_addat)
     feat("timezone KST", f_zoneinfo)
     feat("zipfile + ElementTree (DART corpCode)", f_stdlib_zip_xml)
+    # 폴백(utf-8)이 있어 배치가 죽지는 않는다. 그래서 경고로만 낸다.
+    feat("requests charset 인식 (전이 의존성 로드)", f_charset_detector,
+         fatal=False)
+
+    # ── 설정 점검 ──
+    # 핀 버전이 맞아도 .env 가 없으면 발송 모드가 전부 exit 4 로 끝난다.
+    # 그게 '환경 검증' 에서 안 보이면 원인 추적이 오래 걸린다.
+    print("\n" + "=" * width)
+    print(" 설정 (.env)")
+    print("=" * width)
+    config_missing = []
+    try:
+        from stocknews.env import ENV_PATH, KNOWN_KEYS, load_env, mask
+        rep = load_env()
+        if rep["exists"]:
+            print(f"  OK    {ENV_PATH}  (파서: {rep['backend']})")
+        else:
+            print(f" MISS   {ENV_PATH} 없음")
+            print("        copy .env.example .env  후 값을 채우십시오")
+        if rep.get("unknown_keys"):
+            print(f"  경고  알 수 없는 키: {', '.join(rep['unknown_keys'])}")
+        import os as _os
+        for k in KNOWN_KEYS:
+            v = _os.environ.get(k)
+            src = " (.env)" if k in rep.get("applied", []) else (
+                " (OS 환경변수)" if v else "")
+            status = mask(k, v)
+            tag = "  OK  " if v else " ---- "
+            print(f" {tag}  {k:<22} {status}{src}")
+        for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+            if not _os.environ.get(k):
+                config_missing.append(k)
+        if config_missing:
+            print(f"\n  {', '.join(config_missing)} 미설정 — 발송 모드는 "
+                  "exit 4 로 끝납니다.")
+            print("  --dry-run 을 쓰면 토큰 없이도 콘솔로 확인할 수 있습니다.")
+    except Exception as exc:  # noqa: BLE001
+        print(f" FAIL   .env 점검 불가  {type(exc).__name__}: {exc}")
+        feature_fail.append((".env 점검", f"{type(exc).__name__}: {exc}"))
 
     # 선언 누락된 전이 의존성 경고
     print("\n" + "=" * width)
@@ -209,10 +347,17 @@ def main() -> int:
     bad = len(mismatch) + len(missing) + len(import_fail) + len(feature_fail)
     print(f" 핀 일치 {len(ok)}/{len(pins)}   불일치 {len(mismatch)}   "
           f"미설치 {len(missing)}")
-    print(f" import 실패 {len(import_fail)}   기능 실패 {len(feature_fail)}")
+    print(f" import 실패 {len(import_fail)}   기능 실패 {len(feature_fail)}"
+          f"   기능 경고 {len(feature_warn)}")
     print("-" * width)
-    if bad == 0:
+    if bad == 0 and not feature_warn:
         print("\n환경이 requirements.txt 와 정확히 일치합니다.")
+    elif bad == 0:
+        # '일치합니다' 를 그대로 찍으면 열화 사실이 묻힌다.
+        print("\n핀 버전은 일치하지만 열화된 기능이 있습니다:")
+        for label, detail in feature_warn:
+            print(f"  · {label}")
+            print(f"    {detail}")
     return 1 if bad else 0
 
 

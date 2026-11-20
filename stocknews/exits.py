@@ -13,8 +13,41 @@
          트레일링이어야 한다.
 
 우선순위 (작을수록 우선). 같은 날 여러 개가 걸리면 하나만 집행한다.
-  0 무효화 / 1 손절 / 2 트레일링 / 3 목표3차 / 4 목표2차
+  0 무효화 · 보유기간 만료 / 1 손절 / 2 트레일링 / 3 목표3차 / 4 목표2차
   5 목표1차 / 6 시간 / 7 순환매
+
+보유기간 규칙과 기존 8계층의 관계 (명시적 정의)
+-----------------------------------------------
+계층 0 은 두 규칙이 공유하고, 그 안의 순서는 고정이다.
+
+  0-a  무효화 (invalidation:*)   관리종목·자본잠식 등. 손익 무관 즉시 전량
+  0-b  보유기간 만료 (hold:expired)  MAX_HOLD_DAYS 도달 → 재평가
+
+무효화를 먼저 보는 이유: 둘 다 전량 청산이지만 무효화는 '지금 나가라'이고
+만료는 '유효기간이 끝났으니 다시 판단하라'다. 상장폐지 위험 종목에
+'재평가' 라고 알리면 긴급성이 사라진다.
+
+만료가 손절(계층 1)보다 앞서는 이유: 두 신호의 집행 내용이 같다(전량).
+따라서 순서가 손익을 바꾸지 않는다. 대신 만료 메시지에 그 시점의
+수익률과 손절선 접촉 여부를 함께 담아, 만료가 손절 상황을 가리지 않게 한다.
+
+MIN_HOLD_DAYS 게이트는 계층 2~7 에만 걸린다.
+
+  계층 0, 1   억제하지 않음. 무효화와 손절을 며칠간 막는 것은 최소보유일
+              규칙이 안전장치를 무력화하는 것이다.
+  계층 2~7    억제. 진입 직후의 흔들림에 반응해 나가면 그물을 던진
+              의미가 없다. 트레일링·목표·시간·순환매가 전부 여기다.
+
+보유 일수는 **거래일 기준**이다(`bars_held`). 진입일 봉을 1일로 센다.
+
+진입 시 손절 고정
+----------------
+`positions.stop_price` 는 진입 시 `entry_price × (1 - STOP_LOSS_PCT/100)`
+으로 확정 기록된다. 계층 1 의 가격 기준 손절은 **그 기록된 값만** 본다.
+예전에는 판정 시점의 ATR 로 손절폭을 다시 계산했는데, 그러면 변동성이
+커질 때 손절선이 함께 내려가 손절이 발동하지 않는다.
+
+수정 API 는 없다. 손절선을 옮길 수 있으면 손절은 규칙이 아니라 기분이 된다.
 
 상태 관리 원칙
 -------------
@@ -34,14 +67,16 @@ import numpy as np
 import pandas as pd
 
 from .config import Config, DEFAULT
-from .contracts import DONE_TAKE1, DONE_TAKE2, ExitDecision, Position
+from .contracts import (COOLDOWN_REASON, DONE_TAKE1, DONE_TAKE2,
+                        STOP_RULE_PREFIX, ExitDecision, Position)
 from .indicators import cross_series, moving_averages
 from .store import _now_kst
 
 log = logging.getLogger(__name__)
 
-__all__ = ["atr", "derive_state", "market_return_pct", "evaluate_position",
-           "evaluate_rotation", "run_exits"]
+__all__ = ["atr", "bars_held", "stop_price_for", "derive_state",
+           "market_return_pct", "evaluate_position", "evaluate_rotation",
+           "run_exits"]
 
 
 # 계층 0. 진입 전제가 붕괴한 경우. 손익과 무관하게 전량 청산한다.
@@ -69,6 +104,28 @@ def atr(ohlcv: pd.DataFrame, window: int = 14) -> float:
     tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
     v = tr.rolling(window).mean().iloc[-1]
     return float(v) if pd.notna(v) else float("nan")
+
+
+def stop_price_for(entry_price: float, cfg: Config = DEFAULT) -> float:
+    """진입 시 기록할 손절선. 진입가 대비 `STOP_LOSS_PCT` 아래.
+
+    포지션을 만드는 모든 경로가 이 함수를 써야 한다. 호출부마다 따로
+    계산하면 언젠가 한 곳이 달라지고, 그때 어느 쪽이 맞는지 알 수 없다.
+    """
+    return float(entry_price) * (1.0 - cfg.exit.stop_loss_pct / 100.0)
+
+
+def bars_held(pos: Position, ohlcv: pd.DataFrame) -> int:
+    """진입일 이후 경과 거래일. 진입일 봉을 1일로 센다.
+
+    달력일이 아니라 봉 개수로 세는 것이 핵심이다. 달력일로 세면 주말과
+    연휴에 카운터가 앞서가서, 실제로는 3거래일밖에 안 지난 포지션이
+    최소보유일을 통과하거나 만료 처리된다.
+    """
+    if ohlcv is None or len(ohlcv) == 0:
+        return 0
+    seg = ohlcv[ohlcv.index >= pd.Timestamp(pos.entry_date)]
+    return int(len(seg)) if len(seg) else 1
 
 
 def _tail_streak(mask: pd.Series) -> int:
@@ -119,7 +176,7 @@ def derive_state(pos: Position, ohlcv: pd.DataFrame,
         "peak_close": peak,
         "band_break_streak": int(band_streak),
         "ma_break_streak": int(ma_streak),
-        "bars_held": int(len(seg)),
+        "bars_held": bars_held(pos, ohlcv),
         "ma_long": float(ma_long_now) if pd.notna(ma_long_now) else float("nan"),
         "ma_trail": float(ma_short) if pd.notna(ma_short) else float("nan"),
         "defer_until": pos.defer_until,
@@ -196,7 +253,17 @@ def evaluate_position(pos: Position, ohlcv: pd.DataFrame,
         return _decide(pos, layer, rule, ratio, price, ret, reason, cfg,
                        urgent, detail)
 
-    # ── 계층 0. 무효화 ──
+    held = int(st["bars_held"])
+    # 기록된 손절선 접촉 여부. 만료 메시지에도 실어야 하므로 먼저 구한다.
+    stop_level = float(pos.stop_price) if pos.stop_price is not None else None
+    stop_hit = stop_level is not None and price <= stop_level
+    if stop_level is None:
+        # 조용히 넘어가면 그 포지션만 손절 없이 운용된다. open_position 이
+        # 필수로 받으므로 정상 경로에서는 나올 수 없는 상태다.
+        log.warning("%s(#%s) stop_price 가 없다 — 계층 1 고정 손절 미적용",
+                    pos.ticker, pos.id)
+
+    # ── 계층 0-a. 무효화 ──
     f = (flags or {}).get(pos.ticker) or {}
     for key, label in INVALIDATION:
         if f.get(key):
@@ -207,9 +274,32 @@ def evaluate_position(pos: Position, ohlcv: pd.DataFrame,
                       f"진입 전제 붕괴 — {label}{extra}. 손익 무관 전량 청산",
                       urgent=True, detail={"flag": key}), st
 
+    # ── 계층 0-b. 보유기간 만료 ──
+    # 어떤 규칙도 걸리지 않아 무한 보유되는 경로를 막는다. 집행 내용이
+    # 손절과 같으므로(전량) 순서가 손익을 바꾸지 않는다. 대신 손절선
+    # 접촉 여부를 함께 실어 만료가 손절 상황을 가리지 않게 한다.
+    if held >= ec.max_hold_days:
+        tail = f" · 손절선 {stop_level:,.0f}원 " + ("이탈" if stop_hit else "미접촉") \
+            if stop_level is not None else ""
+        return mk(0, "hold:expired", 1.0,
+                  f"보유기간 만료 — 재평가 ({held}/{ec.max_hold_days}거래일, "
+                  f"수익률 {ret:+.2f}%{tail}). 진입 근거의 유효기간이 "
+                  f"끝났다. 계속 들고 갈 이유를 새로 찾지 못하면 나온다",
+                  urgent=False,
+                  detail={"bars_held": held, "max_hold_days": ec.max_hold_days,
+                          "stop_price": stop_level, "stop_hit": stop_hit}), st
+
     # ── 계층 1. 손절 ──
     stop: ExitDecision | None = None
-    if pos.track == "VALUE":
+    # 1-a. 기록된 손절선. 전 트랙 공통이고 가장 먼저 본다.
+    #      판정 시점에 다시 계산하지 않는다 — 그게 이 규칙의 전부다.
+    if stop_hit:
+        stop = mk(1, "stop:fixed", 1.0,
+                  f"진입 시 기록한 손절선 {stop_level:,.0f}원 이탈 "
+                  f"(진입가 {pos.entry_price:,.0f}원 대비 "
+                  f"-{ec.stop_loss_pct:.0f}%)",
+                  urgent=True, detail={"stop_price": stop_level})
+    elif pos.track == "VALUE":
         if pos.in_band and pos.entry_band_lo:
             if st["band_break_streak"] >= ec.band_break_days:
                 stop = mk(1, "stop:band_break", 1.0,
@@ -218,18 +308,6 @@ def evaluate_position(pos: Position, ohlcv: pd.DataFrame,
                           f"평균단가 추정이 틀렸다는 증거",
                           urgent=True,
                           detail={"streak": st["band_break_streak"]})
-        else:
-            a = atr(ohlcv, ec.atr_window)
-            pct_stop = pos.entry_price * (1 - ec.hard_stop_pct / 100.0)
-            atr_stop = (pos.entry_price - a * ec.atr_mult
-                        if np.isfinite(a) else pct_stop)
-            # 더 낮은(느슨한) 쪽을 쓴다. 변동성 큰 종목에 여유를 준다.
-            level = min(pct_stop, atr_stop)
-            if price <= level:
-                stop = mk(1, "stop:hard", 1.0,
-                          f"밴드 밖 진입 손절선 {level:,.0f}원 이탈 "
-                          f"(고정 -{ec.hard_stop_pct:.0f}% / ATR×{ec.atr_mult})",
-                          urgent=True, detail={"level": level, "atr": a})
     else:  # TREND
         if st["ma_break_streak"] >= ec.ma_long_break_days:
             stop = mk(1, "stop:ma_long", 1.0,
@@ -267,6 +345,14 @@ def evaluate_position(pos: Position, ohlcv: pd.DataFrame,
             if pos.defer_until > today:
                 return None, st
         return stop, st
+
+    # ── 최소 보유일 게이트 ──
+    # 여기서부터(계층 2~7)는 MIN_HOLD_DAYS 이전에 발동하지 않는다.
+    # 계층 0·1 은 위에서 이미 판정을 끝냈으므로 이 게이트에 걸리지 않는다.
+    if held < ec.min_hold_days:
+        log.debug("%s 최소보유일 미달 (%d/%d) — 계층 2~7 억제",
+                  pos.ticker, held, ec.min_hold_days)
+        return None, st
 
     # ── 계층 2. 트레일링 (트랙 T) ──
     if pos.track == "TREND":
@@ -315,7 +401,6 @@ def evaluate_position(pos: Position, ohlcv: pd.DataFrame,
                   f"{credit_ratio_now:.2f}% 재급증 — 이번엔 우리가 "
                   f"청산당할 쪽이다"), st
 
-    held = st["bars_held"]
     if pos.track == "VALUE":
         if held >= ec.time_stop_v_days and ret < ec.time_stop_v_min_ret:
             return mk(6, "time:stall_v", 1.0,
@@ -356,6 +441,15 @@ def evaluate_rotation(positions: list, price_map: dict,
     top, top_chg, top_price = rows[0]
     _, bot_chg, _ = rows[-1]
     spread = top_chg - bot_chg
+
+    # 최소 보유일 게이트. 순환매는 계층 7 이라 억제 대상이다.
+    # 편차 계산에는 남겨둔다 — 포트폴리오 상태에는 그 종목도 포함되므로
+    # 빼면 편차 자체가 왜곡된다. 청산 대상에서만 뺀다.
+    held = bars_held(top, price_map.get(top.ticker))
+    if held < ec.min_hold_days:
+        log.info("순환매 보류: 최고 상승 %s 이 최소보유일 미달 (%d/%d)",
+                 top.ticker, held, ec.min_hold_days)
+        return []
 
     if spread < ec.rotation_min_spread_pct:
         log.info("순환매 보류: 편차 %.1f%% (<%.0f%%) — 현금 보존",
@@ -430,11 +524,24 @@ def run_exits(store, cfg: Config = DEFAULT,
             errors.append(("rotation", f"{type(exc).__name__}: {exc}"))
 
     decisions.sort(key=lambda d: (d.layer, -abs(d.ret_pct)))
+    cooled: list[str] = []
     for dec in decisions:
         try:
             store.record_exit_signal(dec, trade_date)
         except Exception as exc:  # noqa: BLE001
             errors.append((dec.ticker, f"기록 실패 {exc}"))
+        # 손절이 나면 그 자리에서 재진입 금지를 건다. flags 배치를 기다리면
+        # 그 사이에 도는 daily 가 같은 종목을 다시 추천한다.
+        if dec.rule.startswith(STOP_RULE_PREFIX):
+            try:
+                store.set_cooldown(dec.ticker, trade_date or dec.detail.get("d"),
+                                   COOLDOWN_REASON)
+                cooled.append(dec.ticker)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((dec.ticker, f"쿨다운 기록 실패 {exc}"))
+    if cooled:
+        log.info("재진입 금지 %d종목 (%d거래일): %s",
+                 len(cooled), cfg.exit.cooldown_days, ", ".join(cooled[:10]))
 
     store.log_run("exits", started, len(decisions), len(errors),
                   note=f"positions={len(positions)}, market={market_ret:.2f}%"
@@ -444,4 +551,4 @@ def run_exits(store, cfg: Config = DEFAULT,
              len(positions), len(decisions), len(errors))
     return {"positions": len(positions), "decisions": decisions,
             "errors": errors, "market_ret": market_ret,
-            "trade_date": trade_date}
+            "trade_date": trade_date, "cooldown_added": cooled}
