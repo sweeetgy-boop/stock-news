@@ -400,6 +400,11 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
     from .indicator_log import maybe_record_daily
     ind = maybe_record_daily(store, trade_date)
 
+    # [S] 신호 후보(눌림목 판정 · 종이 추적 갱신). PULLBACK_LIST / DISPUTE_LIST 가
+    # 켜졌을 때만 · 기록 전용 · 예외를 삼킨다. recos 저장 뒤라 점수·추천에 닿지 않는다.
+    from .signals import maybe_daily as _signals_daily
+    sig = _signals_daily(store, trade_date)
+
     # 배치 이력은 run_screen.main() 이 한 곳에서 기록한다(AGENTS 10장).
     # 여기서도 log_run 을 부르면 runs 에 daily 가 두 줄씩 남았다 — 하나는
     # TZ=UTC 자식에서 datetime.now() 라 9시간 어긋난 started 로.
@@ -411,6 +416,8 @@ def run_daily(store, cfg: Config = DEFAULT, top_n: int = 10,
            "index_confirm": idxc.summary}
     if risk_rep is not None:
         out["risk_metrics"] = risk_rep
+    if sig is not None:
+        out["signals"] = sig
     return out
 
 

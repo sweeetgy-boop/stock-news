@@ -943,6 +943,30 @@ DAILY_RECO_LINE = "off"
 DAILY_RECO_LINE_MODES = ("off", "all", "admin", "separate")
 # (DF 구역 끝)
 
+# ── [S] 신호 후보 (눌림목 · 경영권 분쟁 · 반토막 경고) — 2026-11-20 ──
+# (S 구역 시작)
+# 기록·표시 전용. 점수·추천 선정·recos 기록에 들어가지 않는다 (stocknews/signals.py).
+# 셋 다 OFF(기본) = 지금과 같다: 판정·기록·추적 없음, "오늘 기록된 추천" 메시지와
+# 주간 성적표가 바이트 단위로 같다.
+#   PULLBACK_LIST   매일 스캔 뒤 눌림목 후보를 판정해 sig_pullback 에 기록하고,
+#                   종이 추적(sig_paper)에 편입하고, "오늘 기록된 추천" 에 【눌림목】 을 싣는다.
+#   DISPUTE_LIST    뉴스 수집 때 경영권 분쟁 공시(소송 제기·공개매수 신고·주주 측 의결권
+#                   대리행사 권유)를 감지해 sig_dispute 에 기록하고, 종이 추적에 편입하고,
+#                   최근 5거래일 공시를 【경영권 분쟁】 으로 싣는다.
+#   HALF_DROP_WARN  점수 방식(recos) 종목 중 종가가 직전 250봉 고가 최고값보다 50% 넘게
+#                   낮은 종목 이름 뒤에 "⚠고점 −x%" 를 붙인다.
+# 표시는 DAILY_RECO_LINE 이 off 가 아닐 때만 나간다(받는 사람도 그 설정을 따른다).
+PULLBACK_LIST = False
+DISPUTE_LIST = False
+HALF_DROP_WARN = False
+PULLBACK_MAX_DROP = 0.15         # 종가가 직전 250봉 최고가보다 이 비율 넘게 낮으면 눌림목에서 제외
+PULLBACK_MAX_PER_DAY = 5
+PULLBACK_COOLDOWN_DAYS = 20      # 목록에 오른 종목을 다시 올리지 않는 거래일 수
+HALF_DROP_LIMIT = 0.50
+DISPUTE_LOOKBACK_DAYS = 3        # 뉴스 수집 때 DART 목록을 되돌아보는 달력 일수
+DISPUTE_MAX_PAGES = 15           # 유형별 목록 페이지 상한(100건/쪽 · 수시공시 하루 약 100건)
+# (S 구역 끝)
+
 # ── [E] 위험 정보 ──
 # (E 구역 시작)
 # 기록·표시 전용. 점수·등급·추천 선정에 들어가지 않는다 (stocknews/risk.py).
@@ -1156,6 +1180,9 @@ ENV_OVERRIDE_FLAGS: dict[str, type] = {
     "NEWS_V2": bool,
     "INDICATOR_LOG": bool,
     "DAILY_RECO_LINE": str,
+    "PULLBACK_LIST": bool,
+    "DISPUTE_LIST": bool,
+    "HALF_DROP_WARN": bool,
 }
 # str 플래그가 받을 수 있는 값. 첫 값이 OFF 다.
 ENV_FLAG_CHOICES: dict[str, tuple[str, ...]] = {

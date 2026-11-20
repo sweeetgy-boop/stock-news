@@ -290,6 +290,12 @@ def reco_line_block(store, d: str) -> tuple[list[str], dict]:
     d = str(d)[:10]
     rows = recorded_recos(store, d)
     info = {"d": d, "n": len(rows), "tickers": [r["ticker"] for r in rows]}
+    # [S] 신호 후보 플래그(PULLBACK_LIST · DISPUTE_LIST · HALF_DROP_WARN)가 하나라도
+    # 켜지면 합친 메시지로 바꾼다. 전부 OFF 면 아래 기존 문단 그대로다.
+    from . import signals as S
+    if S.any_on():
+        lines, sinfo = S.reco_block(store, d, rows)
+        return [*lines, RECO_LINE_NOTE], {**info, "signals": sinfo}
     if not rows:
         return [RECO_LINE_EMPTY], info
     return [f"━━ 오늘 기록된 추천 {len(rows)} (기준일 {d[5:]}) ━━",
@@ -584,6 +590,16 @@ def _cum_lines(pd_, m_all: pd.DataFrame, H: int) -> tuple[list[str], dict]:
     return [l1, l2], info
 
 
+def _signal_type_lines(store, upto: str) -> list[str]:
+    """[S] 눌림목·경영권 분쟁 유형별 줄. 플래그가 꺼져 있으면 빈 목록(지금과 같다)."""
+    try:
+        from . import signals as S
+        return S.type_lines(store, upto)
+    except Exception as exc:  # noqa: BLE001 - 부가 줄
+        log.warning("신호 유형별 줄 실패 — 생략: %s", exc)
+        return []
+
+
 def sunday_scorecard(store, asof, trade_d: str, pdata=None, index=None,
                      limit: int | None = None) -> tuple[str, dict]:
     """일요일 주간 성적표 (PAPER_TRACKING) — 주간 메시지는 이것 하나만 나간다.
@@ -635,7 +651,7 @@ def sunday_scorecard(store, asof, trade_d: str, pdata=None, index=None,
     else:
         s3_body = ["없음"]
     cum, cinfo = _cum_lines(pd_, m_all, H)
-    s4 = [f"━━ ④ 누적 성적 (만기 {H}거래일) ━━", *cum]
+    s4 = [f"━━ ④ 누적 성적 (만기 {H}거래일) ━━", *cum, *_signal_type_lines(store, trade_d)]
     s5 = [DISCLAIMER]
 
     def _join(blocks):
@@ -774,9 +790,12 @@ def sunday_detail(pd_, trade_d: str, asof) -> str:
            f"• 생성 {asof:%Y-%m-%d %H:%M:%S} · 발송 안 함 · 이벤트 기준(중복 제거 · "
            f"다음 거래일 시가 편입 · 왕복 {C.ROUND_TRIP_COST_PCT:g}%p 차감)",
            f"[만기분 누적 ({H}거래일, n={len(m_all)})]"]
+    _st = getattr(pd_, "store", None)
+    sig = _signal_type_lines(_st, trade_d) if _st is not None else []
+    sig = ["[신호 유형별 · 수익률(비용 차감)]", *sig] if sig else []
     if m_all.empty:
         out.append("• 만기된 추적 종목 없음")
-        return "\n".join(out)
+        return "\n".join(out + sig)
     c = E.stat_cell(m_all["net"])
     x = E.stat_cell(m_all["ex_idx"])
     pct, _rank = P.pooled_percentile(
@@ -805,7 +824,7 @@ def sunday_detail(pd_, trade_d: str, asof) -> str:
         pd.Series("국면 없음", index=mm.index)
     for k, g in mm.groupby(reg):
         out.append(f"• {k}: {E.fmt_cell(E.stat_cell(g['net']))}")
-    return "\n".join(out)
+    return "\n".join(out + sig)
 
 
 SUNDAY_DETAIL_HEAD = "━━ 일요일 성적표 상세"

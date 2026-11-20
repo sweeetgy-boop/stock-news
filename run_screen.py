@@ -974,6 +974,8 @@ def mode_daily(store: Store, args) -> int:
 
     if res.get("indicator_log") is not None:      # [H] 플래그 ON 일 때만
         SUMMARY["indicator_log"] = res["indicator_log"]
+    if res.get("signals") is not None:            # [S] 플래그 ON 일 때만
+        SUMMARY["signals"] = res["signals"]
     ok, failed = len(res["results"]), len(res["errors"])
     reg = res.get("regime") or {}
     SUMMARY["regime"] = {k: reg.get(k) for k in
@@ -1053,6 +1055,15 @@ def mode_weekly(store: Store, args) -> int:
             text += "\n\n" + paper_render.weekly_shadow_block(pd_, pd_.upto)
         except Exception as exc:  # noqa: BLE001 - 부가 표
             log.warning("그림자 청산 표 실패 — 생략: %s", exc)
+    # [S] 신호 유형별 성적 (PULLBACK_LIST / DISPUTE_LIST ON 일 때만 · 파일 전용)
+    try:
+        from stocknews import signals as _signals
+        sig_lines = _signals.type_lines(store, rep.get("trade_date") or "9999-12-31")
+        if sig_lines:
+            text += "\n\n" + "\n".join(
+                ["━━ 신호 유형별 성적 (기록 전용 · 종이 추적) ━━", *sig_lines])
+    except Exception as exc:  # noqa: BLE001 - 부가 표
+        log.warning("신호 유형별 성적 실패 — 생략: %s", exc)
     v2_text = _weekly_v2(store, args)
     SUMMARY["weekly_sent"] = False
     path = save_weekly_report(text, v2_text, rep.get("trade_date"))
@@ -1247,6 +1258,11 @@ def _collect_news(store: Store, args) -> dict:
                                         warns=dict(_ns.LAST_WARN))
     if alert:
         SUMMARY["news_source_alert"] = alert
+    # [S] 경영권 분쟁 공시 감지 (DISPUTE_LIST ON 일 때만 · 기록 전용 · 예외를 삼킨다).
+    from stocknews import signals as _signals
+    dis = _signals.maybe_collect_disputes(store)
+    if dis is not None:
+        SUMMARY["disputes"] = dis
     return res
 
 

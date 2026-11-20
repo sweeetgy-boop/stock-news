@@ -293,6 +293,71 @@ CREATE TABLE IF NOT EXISTS indicator_log (
 # (J 구역 끝)
 
 
+# ── [S] 신호 후보 (눌림목 · 경영권 분쟁) — 2026-11-20 ──
+# (S 구역 시작)
+# sig_pullback : 그날 눌림목 판정에 걸린 종목 전부(제외된 것도 skip 사유와 함께).
+#                (d, ticker) 키. 그날 행을 지우고 다시 쓴다(결정적 재계산).
+#                listed=1 이 그날 목록에 오른 종목(하루 최대 5 · 재등재 제한 통과).
+# sig_dispute  : 감지된 경영권 분쟁 공시. 접수번호 키(INSERT OR IGNORE).
+# sig_paper    : 종이 추적 편입(유형별). **추가 전용.** recos·paper_* 와 섞지 않는다.
+# sig_results  : 확정 성적. rule = h20(20거래일 보유) / ma_exit(평균선 이탈 종료). 추가 전용.
+DDL_S = """
+CREATE TABLE IF NOT EXISTS sig_pullback (
+  d TEXT NOT NULL, ticker TEXT NOT NULL, name TEXT,
+  ma INTEGER NOT NULL,            -- 해당한 평균선 중 가장 짧은 것 (20/40/60)
+  ma_value REAL,                  -- 그날 평균선 값
+  runs INTEGER, held INTEGER,     -- 직전 120봉의 닿음 묶음 수 / 지킨 묶음 수
+  ratio REAL,                     -- held / runs
+  close REAL, low REAL,
+  high250 REAL,                   -- 직전 250봉 고가 최고값(당일 제외)
+  drop_pct REAL,                  -- 종가가 그보다 낮은 비율(%). 신고가면 0
+  amt20 REAL,                     -- 최근 20봉 평균 거래대금
+  listed INTEGER NOT NULL DEFAULT 0,
+  rank INTEGER,
+  skip TEXT,                      -- drop / cooldown / max / bars
+  created TEXT,
+  PRIMARY KEY (d, ticker)
+);
+CREATE INDEX IF NOT EXISTS ix_sig_pullback_ticker ON sig_pullback(ticker);
+CREATE TABLE IF NOT EXISTS sig_dispute (
+  rcept_no TEXT PRIMARY KEY,
+  ticker TEXT NOT NULL, name TEXT,
+  kind TEXT NOT NULL,             -- lawsuit / tender / proxy
+  rcept_dt TEXT NOT NULL,         -- 공시 접수일
+  title TEXT, filer TEXT, source TEXT, detected TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sig_dispute_dt ON sig_dispute(rcept_dt);
+CREATE TABLE IF NOT EXISTS sig_paper (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,             -- pullback / dispute
+  ticker TEXT NOT NULL, name TEXT,
+  signal_d TEXT NOT NULL,         -- 신호일(눌림목 = 판정일, 분쟁 = 사건일)
+  ref TEXT,                       -- 눌림목 = 평균선(20/40/60), 분쟁 = 접수번호
+  sub TEXT,                       -- 분쟁 유형
+  entry_date TEXT, entry_price REAL, entry_status TEXT,
+  enrolled INTEGER NOT NULL DEFAULT 0,
+  skip_reason TEXT, created TEXT,
+  UNIQUE (kind, ticker, signal_d)
+);
+CREATE TABLE IF NOT EXISTS sig_results (
+  paper_id INTEGER NOT NULL,
+  rule TEXT NOT NULL,             -- h20 / ma_exit
+  exit_date TEXT, exit_price REAL, status TEXT,
+  ret REAL, net REAL, days INTEGER, created TEXT,
+  PRIMARY KEY (paper_id, rule)
+);
+CREATE TRIGGER IF NOT EXISTS sig_paper_no_upd BEFORE UPDATE ON sig_paper
+BEGIN SELECT RAISE(ABORT, 'sig_paper is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS sig_paper_no_del BEFORE DELETE ON sig_paper
+BEGIN SELECT RAISE(ABORT, 'sig_paper is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS sig_results_no_upd BEFORE UPDATE ON sig_results
+BEGIN SELECT RAISE(ABORT, 'sig_results is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS sig_results_no_del BEFORE DELETE ON sig_results
+BEGIN SELECT RAISE(ABORT, 'sig_results is append-only'); END;
+"""
+# (S 구역 끝)
+
+
 def apply(con: sqlite3.Connection) -> None:
     """v2 DDL·컬럼 추가를 멱등하게 적용한다."""
     g = globals()
