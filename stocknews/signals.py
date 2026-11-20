@@ -67,7 +67,7 @@ HOLD_DAYS = 20
 # 유형별 보유 거래일(확정 성적 rule = h<n>)
 KIND_HORIZONS = {KIND_PULLBACK: (20,), KIND_DISPUTE: (20,), KIND_NEWS: (5, 20, 60)}
 DISPUTE_SAME_DAYS = 120       # 같은 종목의 이 거래일 안 공시는 같은 분쟁
-DISPUTE_SHOW_DAYS = 5         # 표시: 최근 5거래일 안의 공시만
+DISPUTE_SHOW_DAYS = 20        # 표시: 최근 20거래일 안의 공시(설정 DISPUTE_SHOW_TDAYS 가 우선)
 MINUS = "−"
 
 
@@ -87,8 +87,21 @@ def news_on() -> bool:
     return bool(getattr(C, "DISPUTE_NEWS_LINE", False))
 
 
+def chart_on() -> bool:
+    return bool(getattr(C, "CHART_PICKS_LINE", False))
+
+
+def dividend_on() -> bool:
+    return bool(getattr(C, "DIVIDEND_LINE", False))
+
+
+def finrank_on() -> bool:
+    return bool(getattr(C, "FINANCE_RANK_LINE", False))
+
+
 def any_on() -> bool:
-    return pullback_on() or dispute_on() or halfdrop_on() or news_on()
+    return (pullback_on() or dispute_on() or halfdrop_on() or news_on()
+            or chart_on() or dividend_on() or finrank_on())
 
 
 def _now() -> str:
@@ -521,10 +534,12 @@ def maybe_collect_disputes(store) -> dict | None:
 
 
 def recent_disputes(store, d: str, cal: list[str] | None = None,
-                    days: int = DISPUTE_SHOW_DAYS) -> list[dict]:
-    """표시용: 접수일이 d 를 포함한 최근 days 거래일 안이고 d 의 운영 유니버스에 있는
-    종목. 종목당 가장 최근 공시 하나."""
+                    days: int | None = None) -> list[dict]:
+    """표시용: 접수일이 d 를 포함한 최근 days(기본 DISPUTE_SHOW_TDAYS = 20) 거래일 안이고
+    d 의 운영 유니버스에 있는 종목. 종목당 가장 최근 공시 하나 · 최근 공시 순.
+    (몇 개를 싣는지는 호출부가 DISPUTE_SHOW_MAX 로 자른다.)"""
     d = str(d)[:10]
+    days = int(getattr(C, "DISPUTE_SHOW_TDAYS", DISPUTE_SHOW_DAYS)) if days is None else int(days)
     cal = cal if cal is not None else E.trading_calendar(store)
     cal = [x for x in cal if x <= d]
     if not cal:
@@ -731,13 +746,21 @@ def maybe_daily(store, trade_date: str) -> dict | None:
     **예외를 올리지 않는다** — 스캔·추천 기록은 이미 커밋돼 있다. 한 부분이 실패해도
     나머지는 계속하고, 실패는 out["errors"] 에 남긴다(호출부가 관리자에게 한 줄 알린다)."""
     from . import dispute_news as DN
-    if not (pullback_on() or dispute_on() or DN.enabled()) or not trade_date:
+    if not (pullback_on() or dispute_on() or DN.enabled() or dividend_on()) or not trade_date:
         return None
     out: dict = {}
     errors: list[str] = []
     t0 = time.perf_counter()
+    def _dividend():
+        from . import dividend as DV
+        res = DV.record(store, trade_date)
+        if res.get("status") != "ok":
+            errors.append(f"dividend: 자료 없음 — {res.get('reason') or '?'}"[:160])
+        return res
     for name, on, fn in (("pullback", pullback_on(), lambda: record_pullback(store, trade_date)),
-                         ("tracking", True, lambda: update_tracking(store, trade_date))):
+                         ("tracking", pullback_on() or dispute_on() or DN.enabled(),
+                          lambda: update_tracking(store, trade_date)),
+                         ("dividend", dividend_on(), _dividend)):
         if not on:
             continue
         try:
@@ -817,20 +840,71 @@ def pack_messages(chunks: list[list[str]], limit: int = MSG_LIMIT) -> list[str]:
 def _dispute_note() -> str:
     mean = int(C.DISPUTE_NOTE_MEAN_PCT)
     sign = MINUS if mean < 0 else "+"
-    return (f"(과거 {int(C.DISPUTE_NOTE_YEARS)}년: 공시 뒤 20일 평균 {sign}{abs(mean)}%, "
-            f"10번 중 {int(C.DISPUTE_NOTE_UP_OF_10)}번 오름)")
+    return (f"(과거 {int(C.DISPUTE_NOTE_YEARS)}년: 공시 뒤 20일 평균 {sign}{abs(mean)}% · "
+            f"숫자는 수익률 %)")
 
 
-def reco_block(store, d: str, rows: list[dict], note: str | None = None) -> tuple[list[str], dict]:
+def dispute_base_day(rcept_dt: str, cal: list[str]) -> str | None:
+    """표시용 사건일 = 접수일(휴장일이면 그 뒤 첫 거래일). "공시 후" 는 이날 종가 대비다.
+    (종이 추적의 사건일은 접수일 다음 거래일 — dispute_event_day. 표시는 접수일 종가부터 잰다.)"""
+    r = str(rcept_dt)[:10]
+    for x in cal:
+        if x >= r:
+            return x
+    return None
+
+
+def chart_pick_lines(ctx: dict, jobs: list, div_tag) -> list[str]:
+    """【최종 추천 · 차트 첨부】 — 종목마다 두 줄. jobs = 차트 앨범 대상(앨범 순서)."""
+    from . import pricectx as PX
+    from .renderer import stock_label
+    lim = float(C.HALF_DROP_LIMIT)
+    out = []
+    for j in jobs:
+        t = str(j.ticker)
+        rec = ctx.get(t)
+        warn = "⚠" if rec and _exceeds(rec.get("drop", float("nan")), lim) else ""
+        out.append(f"{warn}{stock_label(j.name, t)}{div_tag(t)} "
+                   f"{PX.won((rec or {}).get('close'))} · 오늘 {PX.pct((rec or {}).get('r1'))} · "
+                   f"{PX.high_text(rec)}")
+        out.append(PX.ret_line(rec))
+    return out
+
+
+def dispute_lines(store, d: str, dis: list[dict], ctx: dict, cal: list[str]) -> list[str]:
+    """【경영권 분쟁 공시 · 주의】 — 종목마다 두 줄 + 맨 아래 과거 수치 한 줄."""
+    from . import pricectx as PX
+    from .renderer import stock_label
+    out = []
+    for x in dis:
+        t = str(x["ticker"])
+        rec = ctx.get(t)
+        base = dispute_base_day(x["rcept_dt"], cal)
+        if base is None or base >= d:
+            after = "공시 당일"
+        else:
+            after = f"공시 후 {PX.pct(PX.since_close(rec, base))}"
+        out.append(f"{stock_label(x['name'], t)} {DISPUTE_LABEL.get(x['kind'], x['kind'])} "
+                   f"{str(x['rcept_dt'])[5:]} · {after}")
+        out.append(PX.ret_line(rec))
+    out.append(_dispute_note())
+    return out
+
+
+def reco_block(store, d: str, rows: list[dict], note: str | None = None,
+               chart_rows=None) -> tuple[list[str], dict]:
     """"오늘 기록된 추천" 합친 메시지(플래그가 하나라도 켜졌을 때).
 
     rows = 그날 recos (rank 순, paper_render.recorded_recos). recos 는 읽기만 한다.
-    순서: 【점수】 → 【눌림목】 → 【경영권 분쟁 첫 보도】 → 【경영권 분쟁 공시 · 주의】 → 맨 아래 줄.
+    chart_rows = 그날 저녁 브리핑 ① 대상(weekday_block 의 new_rows) — 차트 앨범과 같은 입력.
+    순서: 【최종 추천 · 차트 첨부】 → 【점수】 → 【눌림목】 → 【고배당】 → 【재무 순위 상위】 →
+          【경영권 분쟁 첫 보도】 → 【경영권 분쟁 공시 · 주의】 → 맨 아래 줄.
     **한 부분이 실패해도 나머지는 나간다.** 실패한 부분은 빼고 info["errors"] 에 남긴다 —
     【점수】 줄은 recos 만으로 만들어 항상 나간다.
     """
     from html import escape  # noqa: F401 - stock_label 이 이스케이프한다
     from . import dispute_news as DN
+    from . import pricectx as PX
     from .renderer import stock_label
     d = str(d)[:10]
     info: dict = {}
@@ -848,49 +922,114 @@ def reco_block(store, d: str, rows: list[dict], note: str | None = None) -> tupl
     pmap = {str(p["ticker"]): p for p in pulls}
     halves = (safe("반토막 경고", lambda: half_drops(store, d, [r["ticker"] for r in rows]), {})
               if halfdrop_on() else {})
-    dis = safe("경영권 분쟁 공시", lambda: recent_disputes(store, d), []) if dispute_on() else []
-    news_rows, news_lines, news_tag = [], [], set()
+    dis_all = safe("경영권 분쟁 공시", lambda: recent_disputes(store, d), []) if dispute_on() else []
+    dis = dis_all[:max(0, int(getattr(C, "DISPUTE_SHOW_MAX", 5)))]
+    news_rows: list[dict] = []
+    news_tag: set = set()
     if news_on():
         news_rows = safe("경영권 분쟁 첫 보도", lambda: DN.to_show(store, d), [])
-        news_lines = safe("경영권 분쟁 첫 보도", lambda: DN.show_lines(store, d, news_rows), None)
-        if news_lines is None:
-            news_rows, news_lines = [], []
         news_tag = safe("경영권 분쟁 첫 보도", lambda: DN.recent_first_tickers(store, d), set()) \
             | {str(r["ticker"]) for r in news_rows}
-    filing_tag = {str(x["ticker"]) for x in dis}
+    filing_tag = {str(x["ticker"]) for x in dis_all}
+
+    # 차트 앨범 대상 — 앨범을 고르는 함수를 그대로 부른다(새 기준 없음).
+    jobs: list = []
+    if chart_on():
+        def _jobs():
+            from . import chart as ch
+            return ch.brief_targets(chart_rows)
+        jobs = safe("최종 추천", _jobs, [])
+    pick_set = {str(j.ticker) for j in jobs}
+
+    # 고배당 · 재무 순위
+    div = None
+    if dividend_on():
+        def _div():
+            from . import dividend as DV
+            return DV.block(store, d)
+        div = safe("고배당", _div, None)
+    dmap = (div or {}).get("map") or {}
+    fin = None
+    if finrank_on():
+        def _fin():
+            from . import finrank as FR
+            return FR.block()
+        fin = safe("재무 순위", _fin, None)
+
+    def div_tag(t: str) -> str:
+        return f" (고배당 {dmap[t]:.1f}%)" if t in dmap else ""
+
+    # 가격 맥락(최종 추천 · 분쟁 공시 · 첫 보도) — 한 번에 읽는다.
+    need = pick_set | {str(x["ticker"]) for x in dis} | {str(r["ticker"]) for r in news_rows}
+    ctx = safe("가격 맥락", lambda: PX.context(store, d, need), {}) if need else {}
 
     def tags(t: str) -> str:
         return (" 🔔분쟁 보도" if t in news_tag else "") + (" ⚠분쟁 공시" if t in filing_tag else "")
 
     title = f"━━ 오늘 기록된 추천 (기준일 {d[5:]}) ━━"
+    sections: list[list[str]] = []
+    if chart_on():
+        if jobs:
+            lines = safe("최종 추천", lambda: chart_pick_lines(ctx, jobs, div_tag), None)
+            if lines:
+                sections.append([f"【최종 추천 · 차트 첨부 {len(jobs)}】", *lines])
+            else:
+                pick_set = set()
+        info["chart_picks"] = [str(j.ticker) for j in jobs] if pick_set else []
     items = []
     for r in rows:
-        s = stock_label(r["name"], r["ticker"])
-        if r["ticker"] in halves:
-            s += f" ⚠{_pct_drop(halves[r['ticker']])}"
-        if r["ticker"] in pmap:
-            s += f" (눌림목 {int(pmap[r['ticker']]['ma'])}일선)"
-        items.append(s + tags(str(r["ticker"])))
-    sections: list[list[str]] = [[f"【점수 {len(rows)}】", " · ".join(items) if items else "없음"]]
+        t = str(r["ticker"])
+        s = ("📈" if t in pick_set else "") + stock_label(r["name"], t) + div_tag(t)
+        if t in halves:
+            s += f" ⚠{_pct_drop(halves[t])}"
+        if t in pmap:
+            s += f" (눌림목 {int(pmap[t]['ma'])}일선)"
+        items.append(s + tags(t))
+    sections.append([f"【점수 {len(rows)}】", " · ".join(items) if items else "없음"])
     if halfdrop_on():
         info["half_drop"] = sorted(halves)
     if pullback_on():
         sections.append([f"【눌림목 {len(pulls)}】",
-                         *([f"{stock_label(p['name'], p['ticker'])} {int(p['ma'])}일선 · "
+                         *([f"{stock_label(p['name'], p['ticker'])}{div_tag(str(p['ticker']))} "
+                            f"{int(p['ma'])}일선 · "
                             f"{_pct_drop(p['drop_pct'])}{tags(str(p['ticker']))}" for p in pulls]
                            or ["없음"])])
         info["pullback"] = [str(p["ticker"]) for p in pulls]
+    if dividend_on():
+        if div is None:
+            sections.append(["【고배당 0】", "자료 없음"])
+            info["dividend"] = {"status": "error"}
+        else:
+            sections.append(list(div["lines"]))
+            info["dividend"] = div.get("info") or {}
+            if div.get("error"):
+                errors.append(f"고배당: {div['error']}"[:160])
+    if finrank_on():
+        if fin:
+            sections.append(list(fin["lines"]))
+            info["finance_rank"] = fin.get("tickers") or []
+        else:
+            info["finance_rank"] = []
+            if not any(e.startswith("재무 순위") for e in errors):
+                errors.append("재무 순위: 자료 없음")
     if news_on():
         if news_rows:
-            sections.append([f"【경영권 분쟁 첫 보도 {len(news_rows)}】", *news_lines])
+            lines = safe("경영권 분쟁 첫 보도",
+                         lambda: DN.show_lines(store, d, news_rows, ctx=ctx), None)
+            if lines:
+                sections.append([f"【경영권 분쟁 첫 보도 {len(news_rows)}】", *lines])
+            else:
+                news_rows = []
         info["news"] = [str(r["ticker"]) for r in news_rows]
         info["news_ids"] = [int(r["id"]) for r in news_rows]
     if dispute_on():
         if dis:
-            sections.append([f"【경영권 분쟁 공시 · 주의 {len(dis)}】", _dispute_note(),
-                             *[f"{stock_label(x['name'], x['ticker'])} "
-                               f"{DISPUTE_LABEL.get(x['kind'], x['kind'])} {str(x['rcept_dt'])[5:]}"
-                               for x in dis]])
+            def _dl():
+                cal = [x for x in E.trading_calendar(store) if x <= d]
+                return dispute_lines(store, d, dis, ctx, cal)
+            lines = safe("경영권 분쟁 공시", _dl, None)
+            if lines:
+                sections.append([f"【경영권 분쟁 공시 · 주의 {len(dis)}】", *lines])
         info["dispute"] = [str(x["ticker"]) for x in dis]
     if errors:
         info["errors"] = errors

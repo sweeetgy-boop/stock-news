@@ -375,6 +375,28 @@ CREATE TABLE IF NOT EXISTS sig_dispute_news_items (
 );
 CREATE INDEX IF NOT EXISTS ix_sig_dispute_news_items_t ON sig_dispute_news_items(ticker, published);
 CREATE TABLE IF NOT EXISTS sig_meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS sig_dispute_instant (   -- 첫 보도 즉시 알림(사건당 한 번 · 같은 종목은 60일 안 한 번)
+  event_id INTEGER PRIMARY KEY, ticker TEXT NOT NULL, name TEXT,
+  sent_at TEXT NOT NULL, day TEXT NOT NULL,          -- 보낸 시각 · 그 날짜(하루 상한 계산)
+  via TEXT, price_ok INTEGER
+);
+CREATE TABLE IF NOT EXISTS sig_dividend_data (     -- 고배당: 그날 받은 종목별 값과 판정
+  d TEXT NOT NULL, ticker TEXT NOT NULL, name TEXT, sector TEXT,
+  close REAL, high250 REAL,
+  fy TEXT,                        -- 가장 최근 확정 사업연도 (예: 202512)
+  dps0 REAL, dps1 REAL, dps2 REAL,   -- 주당 배당금: 최근 · 1년 전 · 2년 전
+  eps REAL, op REAL,              -- 최근 연도 EPS(원) · 영업이익(억원)
+  yield_pct REAL, payout_pct REAL,
+  ok INTEGER NOT NULL DEFAULT 0, fail TEXT,          -- 조건 통과 여부 · 탈락 사유
+  stop TEXT,                      -- "그만 사는 신호" 사유(없으면 NULL)
+  PRIMARY KEY (d, ticker)
+);
+CREATE TABLE IF NOT EXISTS sig_dividend_list (     -- 고배당: 날짜별 목록(상위 10)
+  d TEXT NOT NULL, rank INTEGER NOT NULL, ticker TEXT NOT NULL, name TEXT,
+  yield_pct REAL, sector TEXT,
+  PRIMARY KEY (d, rank)
+);
+CREATE INDEX IF NOT EXISTS ix_sig_dividend_list_t ON sig_dividend_list(ticker, d);
 CREATE TRIGGER IF NOT EXISTS sig_paper_no_upd BEFORE UPDATE ON sig_paper
 BEGIN SELECT RAISE(ABORT, 'sig_paper is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS sig_paper_no_del BEFORE DELETE ON sig_paper

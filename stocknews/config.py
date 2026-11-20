@@ -978,6 +978,30 @@ DISPUTE_NOTE_YEARS = 8
 DISPUTE_NOTE_MEAN_PCT = -3       # 20거래일 평균(%) — 반올림
 DISPUTE_NOTE_UP_OF_10 = 3        # 10번 중 오른 횟수
 DISPUTE_MAX_PAGES = 15           # 유형별 목록 페이지 상한(100건/쪽 · 수시공시 하루 약 100건)
+# ── 2026-11-20 저녁 추가 (최종 추천 구역 · 분쟁 줄 주가 흐름 · 즉시 알림 · 고배당 · 재무 순위) ──
+#   CHART_PICKS_LINE  추천 메시지 맨 위 【최종 추천 · 차트 첨부 n】. 대상 = 그날 차트 앨범 대상
+#                     (chart.brief_targets — 앨범이 쓰는 선정 함수 그대로). 종목마다 두 줄.
+#   DIVIDEND_LINE     【고배당 n】. 매일 스캔 뒤 네이버 금융(종목별 연간 재무 API)에서 받아
+#                     sig_dividend_* 에 저장하고 조건을 통과한 상위 10종목을 싣는다.
+#   FINANCE_RANK_LINE 【재무 순위 상위 10】. stocknews/finance_rank.json(연구 폴더에서 만든
+#                     목록 · 월 1회 손으로 갱신)을 읽어 싣는다.
+CHART_PICKS_LINE = False
+DIVIDEND_LINE = False
+FINANCE_RANK_LINE = False
+DISPUTE_SHOW_TDAYS = 20          # 【경영권 분쟁 공시 · 주의】 에 싣는 기간(거래일)
+DISPUTE_SHOW_MAX = 5             # 그 구역에 싣는 종목 수 상한(최근 공시 순)
+DISPUTE_INSTANT_MAX_PER_DAY = 5  # 첫 보도 즉시 알림 하루 상한
+DISPUTE_INSTANT_FAIL_ALERT = 3   # dispute-watch 가 이만큼 연속 실패하면 관리자에게 한 줄
+DIVIDEND_TOP = 10
+DIVIDEND_MAX_PAYOUT = 80.0       # 배당성향(%) 상한
+DIVIDEND_SECTOR_SHARE = 0.30     # 한 업종 비중 상한(10종목이면 3종목)
+DIVIDEND_MIN_HIGH_RATIO = 0.50   # 종가 ÷ 250거래일 최고가 하한
+DIVIDEND_STOP_PAYOUT = 100.0     # "그만 사는 신호" 배당성향(%)
+DIVIDEND_STOP_DAYS = 60          # 최근 이 달력 일수 안에 목록에 있던 종목까지 신호를 본다
+DIVIDEND_MIN_COVERAGE = 0.50     # 유니버스 중 자료를 받은 비율이 이보다 낮으면 "자료 없음"
+DIVIDEND_WORKERS = 4             # 동시 요청 수
+DIVIDEND_TIMEOUT = 8.0           # 요청 1건 제한 시간(초)
+FINANCE_RANK_TOP = 10
 # (S 구역 끝)
 
 # ── [E] 위험 정보 ──
@@ -1198,6 +1222,9 @@ ENV_OVERRIDE_FLAGS: dict[str, type] = {
     "HALF_DROP_WARN": bool,
     "DISPUTE_NEWS_LINE": bool,
     "DISPUTE_NEWS_INSTANT": bool,
+    "CHART_PICKS_LINE": bool,
+    "DIVIDEND_LINE": bool,
+    "FINANCE_RANK_LINE": bool,
 }
 # str 플래그가 받을 수 있는 값. 첫 값이 OFF 다.
 ENV_FLAG_CHOICES: dict[str, tuple[str, ...]] = {

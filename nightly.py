@@ -267,6 +267,10 @@ class Job:
     # 예정 시각보다 이만큼(초) 넘게 늦으면 돌지 않고 '건너뜀'. 0 = 제한 없음.
     # 브리핑 전용이다 — 새벽 2시 반에 '저녁 브리핑'이 나가면 안 된다.
     max_late_sec: float = 0.0
+    # 2 이상이면 실패를 바로 알리지 않고 연속 실패 수를 세어, 이 횟수째(와 그 배수)에만
+    # 관리자에게 한 줄 알린다. 락에 막혀 못 돈 회차(rc 3)는 조용히 건너뛰고 세지 않는다.
+    # dispute-watch 전용 — 30분마다 도는 부가 잡이 한 번 실패했다고 알릴 일이 아니다.
+    fail_alert_after: int = 1
 
     @property
     def marker_path(self) -> str:
@@ -309,10 +313,11 @@ JOBS: dict[str, Job] = {
                  _one("flash", ["--mode", "flash", *FLASH_EXTRA_ARGS]),
                  once_per_day=False, quiet_ok=True, cron="*/5 9-15 * * 1-5"),
     # [S] 장중 30분 간격 경영권 분쟁 첫 보도 확인(DISPUTE_NEWS_INSTANT). 마커도 완료
-    # 알림도 없다. **Hermes 에 등록하지 않았다** — 플래그를 켜기로 할 때 등록한다.
+    # 알림도 없다. 실패·락 겹침은 조용히 건너뛰고 3회 연속 실패했을 때만 알린다.
     "dispute-watch": Job("dispute-watch", "분쟁 보도 확인", "\U0001f514",
                          _one("dispute-watch", ["--mode", "dispute-watch"]),
-                         once_per_day=False, quiet_ok=True, cron="*/30 9-15 * * 1-5"),
+                         once_per_day=False, quiet_ok=True, cron="*/30 9-15 * * 1-5",
+                         fail_alert_after=3),
 }
 
 
@@ -687,6 +692,26 @@ def _judge(step: Step, rc: int | None, err: str,
     if detail:
         return "fail", detail, detail
     return "fail", f"rc={rc}" + (f" {reason}" if reason else ""), ""
+
+
+def fail_streak(job: "Job", failed: bool, locked: bool = False, root: Path | None = None) -> int:
+    """fail_alert_after 잡의 연속 실패 수를 갱신하고 돌려준다. 성공이면 0 으로 되돌린다.
+    락에 막힌 회차(locked)는 그대로 둔다. 파일을 못 쓰면 조용히 넘어간다(잡을 죽이지 않는다)."""
+    path = (root or REPO) / "data" / f"cron_failstreak_{job.name}.json"
+    try:
+        n = int(json.loads(path.read_text(encoding="utf-8")).get("streak", 0))
+    except (OSError, ValueError, AttributeError):
+        n = 0
+    if locked:
+        return n
+    n = n + 1 if failed else 0
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"streak": n, "at": f"{now_kst():%Y-%m-%d %H:%M:%S}"}),
+                        encoding="utf-8")
+    except OSError:
+        pass
+    return n
 
 
 def _locked_note(payload: dict, what: str = "DB 락") -> str:
@@ -1130,11 +1155,23 @@ def main(argv: list[str] | None = None) -> int:
         fails = [r for r in results if r["state"] == "fail"]
         rc_final = 2 if fails else 0
         text = noted(_summary(job, started, finished, results, job_dry))
+        alert_fail = bool(fails)
+        why_quiet = "quiet_ok 잡 · 실패 없음"
+        if job.fail_alert_after > 1:
+            # 락에 막힌 회차는 세지 않는다(조용히 건너뜀). 진짜 실패만 연속으로 센다.
+            real = [r for r in fails if r["rc"] != EXIT_LOCKED]
+            streak = fail_streak(job, bool(real), locked=bool(fails) and not real)
+            alert_fail = bool(real) and streak > 0 and streak % job.fail_alert_after == 0
+            if real:
+                log(f"연속 실패 {streak}회 (알림은 {job.fail_alert_after}회째마다)")
+                text = f"{text}\n연속 실패 {streak}회"
+                why_quiet = f"연속 실패 {streak}회 — {job.fail_alert_after}회째에만 알림"
+            elif fails:
+                why_quiet = "락 겹침 — 조용히 건너뜀"
         # quiet_ok 잡은 실패일 때만 알린다. flash 는 5분마다 돌아서
         # 정상 보고를 매번 보내면 하루 84건이 나간다.
-        sent = _notify(text, log, notify_on and (bool(fails) or not job.quiet_ok),
-                       why="--no-telegram" if not notify_on
-                           else "quiet_ok 잡 · 실패 없음")
+        sent = _notify(text, log, notify_on and (alert_fail or not job.quiet_ok),
+                       why="--no-telegram" if not notify_on else why_quiet)
         if sent is False:
             rc_final = 2
         # 부분 실패(exit 2)·부분 완료도 마커는 남긴다. nightly.py 의 설계

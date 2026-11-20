@@ -146,6 +146,22 @@ def select_targets(jobs: list[ChartJob], cfg: Config = DEFAULT) -> list[ChartJob
     return ok[:max(0, int(c.max_count))]
 
 
+def brief_rows(new_rows):
+    """평일 저녁 브리핑 ① 대상(dict 목록) → 차트 앨범 입력(DataFrame · rank = ① 의 번호).
+    앨범(run_screen._brief_evening_v2)과 추천 메시지의 【최종 추천 · 차트 첨부】 가 같이 쓴다."""
+    if not new_rows:
+        return None
+    rows = pd.DataFrame(list(new_rows))
+    rows["rank"] = range(1, len(rows) + 1)      # ① 의 번호와 같게
+    return rows
+
+
+def brief_targets(new_rows, cfg: Config = DEFAULT) -> list[ChartJob]:
+    """평일 저녁 브리핑 차트 앨범의 대상(앨범 순서). 앨범이 쓰는 함수 그대로:
+    brief_rows → jobs_from_rows → select_targets. 새 선정 기준을 두지 않는다."""
+    return select_targets(jobs_from_rows(brief_rows(new_rows)), cfg)
+
+
 def watchlist_jobs(scans, cfg: Config = DEFAULT) -> list[ChartJob]:
     """저녁 브리핑 관심종목 앨범 대상. scans 는 **한 스캔일**의 행이다.
 

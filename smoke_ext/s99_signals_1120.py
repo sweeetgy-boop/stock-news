@@ -386,8 +386,11 @@ def run(check, near, tmp):
         k = full.index("【눌림목 5】")
         assert full[k + 1] == f"{stock_label(names['810003'], '810003')} 20일선 · 고점 −0%"
         j = full.index("【경영권 분쟁 공시 · 주의 1】")
-        assert full[j + 1] == "(과거 8년: 공시 뒤 20일 평균 \u22123%, 10번 중 3번 오름)", full[j + 1]
-        assert full[j + 2] == f"{stock_label(names['810013'], '810013')} 경영권 분쟁 소송 {d[5:]}"
+        # 종목마다 두 줄(공시 줄 · 1·3·5·10일 줄) + 맨 아래 과거 수치 한 줄 (2026-11-20 저녁 변경)
+        assert full[j + 1] == (f"{stock_label(names['810013'], '810013')} 경영권 분쟁 소송 {d[5:]}"
+                               f" · 공시 당일"), full[j + 1]
+        assert full[j + 2].startswith(" 1일 ") and " · 10일 " in full[j + 2], full[j + 2]
+        assert full[j + 3] == "(과거 8년: 공시 뒤 20일 평균 \u22123% · 숫자는 수익률 %)", full[j + 3]
         assert j == k + 6 and full[-1] == R.RECO_LINE_NOTE
         assert full[2].endswith(f"{stock_label(names['810013'], '810013')} ⚠분쟁 공시"), full[2]
         assert i2["signals"]["messages"] == ["\n".join(full)]           # 상한 안이면 메시지 1개

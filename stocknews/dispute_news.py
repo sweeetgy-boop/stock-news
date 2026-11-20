@@ -421,11 +421,16 @@ def _pct(v: float) -> str:
     return f"{v:+.1f}%".replace("-", "\u2212")
 
 
-def show_lines(store, d: str, rows: list[dict], with_returns: bool = True) -> list[str]:
-    """종목마다 한 줄: 종목명(종목코드) "기사 제목(링크)" MM-DD HH:MM · 오늘 ±x% · 20일 ±y%."""
+def show_lines(store, d: str, rows: list[dict], with_returns: bool = True,
+               ctx: dict | None = None) -> list[str]:
+    """종목마다 두 줄: 종목명(종목코드) "기사 제목(링크)" MM-DD HH:MM · 오늘 ±x%
+                       1일 ±a · 3일 ±b · 5일 ±c · 10일 ±d
+    ctx = pricectx.context 결과(없으면 여기서 읽는다). with_returns=False 면 첫 줄만."""
     from html import escape
+    from . import pricectx as PX
     from .renderer import stock_label
-    rets = returns_for(store, d, [r["ticker"] for r in rows]) if with_returns else {}
+    if with_returns and ctx is None:
+        ctx = PX.context(store, d, [r["ticker"] for r in rows])
     lines = []
     for r in rows:
         title = escape(_short(r["title"]), quote=False)
@@ -436,10 +441,153 @@ def show_lines(store, d: str, rows: list[dict], with_returns: bool = True) -> li
         s = f'{stock_label(r["name"], r["ticker"])} "{title}"'
         if at is not None:
             s += f" {at:%m-%d %H:%M}"
-        rr = rets.get(r["ticker"], {})
-        if "day" in rr and np.isfinite(rr["day"]):
-            s += f" · 오늘 {_pct(rr['day'])}"
-        if "d20" in rr and np.isfinite(rr["d20"]):
-            s += f" · 20일 {_pct(rr['d20'])}"
-        lines.append(s)
+        if with_returns:
+            rec = (ctx or {}).get(str(r["ticker"]))
+            s += f" · 오늘 {PX.pct((rec or {}).get('r1'))}"
+            lines.append(s)
+            lines.append(PX.ret_line(rec))
+        else:
+            lines.append(s)
     return lines
+
+
+# ══════════════════════════ 즉시 알림 (DISPUTE_NEWS_INSTANT) ══════════════════════════
+# 거래일 09:00~15:30 은 30분 잡(dispute-watch), 그 밖에는 뉴스 수집 회차에서 부른다.
+# 사건(첫 보도)당 한 번 · 같은 종목은 60일 안에 한 번 · 하루 DISPUTE_INSTANT_MAX_PER_DAY 건.
+# 켜기 전에 감지된 것은 보내지 않는다(sig_meta.instant_since 이후에 감지된 것만).
+# 보냈다고 '표시함'(shown)으로 적지 않는다 — 그날 밤 추천 메시지에는 그대로 실린다.
+INSTANT_SINCE_KEY = "instant_since"
+INSTANT_FRESH_HOURS = 24          # 감지된 지 이 시간이 지난 것은 즉시 알림으로 보내지 않는다
+QUOTE_URL = "https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
+
+
+def _meta(store, k: str, v: str | None = None) -> str | None:
+    with closing(_conn(store)) as con:
+        if v is not None:
+            con.execute("INSERT INTO sig_meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE "
+                        "SET v=excluded.v", (k, v))
+            con.commit()
+            return v
+        r = con.execute("SELECT v FROM sig_meta WHERE k=?", (k,)).fetchone()
+        return r[0] if r else None
+
+
+def instant_candidates(store, d: str | None, now: datetime | None = None) -> tuple[list[dict], dict]:
+    """지금 즉시 알림을 보낼 첫 보도(첫 기사 시각 순)와 집계. 플래그가 꺼져 있으면 ([], {})."""
+    if not instant_on():
+        return [], {}
+    now = now or _now()
+    info: dict = {"candidates": 0}
+    since = _meta(store, INSTANT_SINCE_KEY)
+    if not since:
+        _meta(store, INSTANT_SINCE_KEY, now.isoformat(timespec="seconds"))
+        info["since_set"] = True          # 켠 뒤 첫 회차 — 과거분은 보내지 않는다
+        return [], info
+    if not d:
+        return [], info
+    # 운영 유니버스 = d 이하의 가장 최근 스캔일(밤 news 단계는 그날 스캔보다 먼저 돈다).
+    with closing(_conn(store)) as con:
+        sd = con.execute("SELECT MAX(d) FROM scans WHERE d<=?", (str(d)[:10],)).fetchone()[0]
+    uni = _universe(store, sd) if sd else {}
+    lo = max(since, (now - timedelta(hours=INSTANT_FRESH_HOURS)).isoformat(timespec="seconds"))
+    day = now.strftime("%Y-%m-%d")
+    cut = (now - timedelta(days=SAME_EVENT_DAYS)).isoformat(timespec="seconds")
+    with closing(_conn(store)) as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM sig_dispute_news WHERE kind=? AND show_skip IS NULL AND detected>=? "
+            "AND id NOT IN (SELECT event_id FROM sig_dispute_instant) ORDER BY first_at, id",
+            (KIND_FIRST, lo)).fetchall()]
+        recent = {str(r[0]) for r in con.execute(
+            "SELECT ticker FROM sig_dispute_instant WHERE sent_at>=?", (cut,)).fetchall()}
+        today = con.execute("SELECT COUNT(*) FROM sig_dispute_instant WHERE day=?",
+                            (day,)).fetchone()[0]
+    out, seen = [], set(recent)
+    for r in rows:
+        t = str(r["ticker"])
+        if t not in uni or t in seen:
+            continue
+        seen.add(t)
+        r["name"] = uni.get(t) or r.get("name")
+        out.append(r)
+    info["candidates"] = len(out)
+    room = max(0, int(getattr(C, "DISPUTE_INSTANT_MAX_PER_DAY", 5)) - int(today))
+    if len(out) > room:
+        info["capped"] = len(out) - room
+    info["sent_today"] = int(today)
+    return out[:room], info
+
+
+def fetch_now(ticker: str, get=None, timeout: float = 5.0) -> dict | None:
+    """그 종목 하나의 현재가(네이버 금융 실시간 조회 1건). 실패하면 None — 알림은 그대로 보낸다."""
+    try:
+        if get is None:
+            import requests
+            r = requests.get(QUOTE_URL.format(code=str(ticker)),
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+            r.raise_for_status()
+            j = r.json()
+        else:
+            j = get(str(ticker))
+        x = (j.get("datas") or [None])[0] or {}
+        pct = float(str(x.get("fluctuationsRatioRaw") or x.get("fluctuationsRatio")).replace(",", ""))
+        price = float(str(x.get("closePriceRaw") or x.get("closePrice")).replace(",", ""))
+        if not np.isfinite(pct) or not np.isfinite(price) or price <= 0:
+            return None
+        return {"price": price, "pct": pct}
+    except Exception as exc:  # noqa: BLE001 - 부가 정보
+        log.warning("현재가 조회 실패(%s) — '지금' 항목 없이 보냅니다: %s", ticker, type(exc).__name__)
+        return None
+
+
+def _filing_text(store, ticker: str, now: datetime) -> str:
+    from .signals import DISPUTE_LABEL
+    lo = (now - timedelta(days=190)).strftime("%Y-%m-%d")       # 약 120거래일
+    with closing(_conn(store)) as con:
+        r = con.execute("SELECT rcept_dt, kind FROM sig_dispute WHERE ticker=? AND rcept_dt>=? "
+                        "ORDER BY rcept_dt DESC LIMIT 1", (str(ticker), lo)).fetchone()
+    if not r:
+        return "분쟁 공시 없음"
+    return f"분쟁 공시 있음({str(r[0])[5:]} {DISPUTE_LABEL.get(r[1], r[1])})"
+
+
+def instant_text(store, d: str | None, r: dict, quote: dict | None, now: datetime | None = None,
+                 ctx: dict | None = None) -> str:
+    """즉시 알림 본문. quote 가 없으면 "지금" 줄만 뺀다."""
+    from html import escape
+    from . import pricectx as PX
+    from .renderer import stock_label
+    now = now or _now()
+    title = escape(_short(r["title"], 80), quote=False)
+    url = str(r.get("url") or "").strip()
+    if url.startswith(("http://", "https://")):
+        title = f'<a href="{escape(url, quote=True)}">{title}</a>'
+    at = _ts(r["first_at"])
+    src = escape(str(r.get("source") or "").strip(), quote=False)
+    when = " · ".join(x for x in (src, f"{at:%m-%d %H:%M}" if at is not None else "") if x)
+    lines = ["🔔 <b>경영권 분쟁 첫 보도</b>", stock_label(r["name"], r["ticker"]), f'"{title}"']
+    if when:
+        lines.append(when)
+    lines.append(f"관련 기사 {int(r.get('n_articles') or 1)}건 · {_filing_text(store, r['ticker'], now)}")
+    if quote:
+        lines.append(f"지금 {PX.pct(quote['pct'])} ({now:%H:%M} 조회)")
+    if d:
+        if ctx is None:
+            ctx = PX.context(store, d, [r["ticker"]])
+        lines.append(PX.ret_line(ctx.get(str(r["ticker"]))).strip() + f" ({str(d)[5:]} 종가까지)")
+    mean = int(C.DISPUTE_NOTE_MEAN_PCT)
+    lines.append(f"과거 {int(C.DISPUTE_NOTE_YEARS)}년: 분쟁 공시 뒤에 샀을 때 20일 평균 "
+                 f"{'−' if mean < 0 else '+'}{abs(mean)}%")
+    lines.append("첫 보도 기준 성적은 기록 중 · 검증 중")
+    return "\n".join(lines)
+
+
+def record_instant(store, r: dict, when: datetime | None = None, via: str = "",
+                   price_ok: bool = False) -> None:
+    when = when or _now()
+    with closing(_conn(store)) as con:
+        con.execute("INSERT OR IGNORE INTO sig_dispute_instant(event_id,ticker,name,sent_at,day,"
+                    "via,price_ok) VALUES(?,?,?,?,?,?,?)",
+                    (int(r["id"]), str(r["ticker"]), r.get("name"),
+                     when.isoformat(timespec="seconds"), when.strftime("%Y-%m-%d"), via,
+                     1 if price_ok else 0))
+        con.commit()

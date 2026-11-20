@@ -1306,6 +1306,11 @@ def _collect_news(store: Store, args) -> dict:
         SUMMARY["dispute_news"] = {**dn_info, **det}
         _signal_alert("news · 분쟁 첫 보도", [det.get("error"), dn_info.get("collect_error")],
                       bool(args.dry_run))
+        # [S] 즉시 알림 — 장중 30분 잡 밖의 회차(06:00 · 21:30 · 23:00)에서 감지된 것.
+        ins = _instant_alerts(store, args, "news")
+        if ins is not None:
+            SUMMARY["dispute_instant"] = ins
+            _signal_alert("news · 첫 보도 즉시 알림", [ins.get("error")], bool(args.dry_run))
     return res
 
 
@@ -1342,13 +1347,50 @@ def mode_news(store: Store, args) -> int:
     return EXIT_OK
 
 
+def _instant_alerts(store: Store, args, via: str) -> dict | None:
+    """[S] 경영권 분쟁 첫 보도 즉시 알림 (DISPUTE_NEWS_INSTANT). 꺼져 있으면 None.
+
+    새 첫 보도마다 별도 메시지 1건을 **전체 수신자**에게 보낸다(종목 정보다). 그 종목 하나의
+    현재가를 받아 "지금 ±x%" 를 싣고, 못 받으면 그 줄만 뺀다. 보낸 것은 sig_dispute_instant 에
+    적는다(사건당 한 번). '표시함'으로 적지 않으므로 그날 밤 추천 메시지에는 그대로 실린다.
+    **예외를 올리지 않는다** — 뉴스 수집·브리핑을 죽이지 않는다.
+    """
+    from stocknews import dispute_news as _dnews
+    if not _dnews.instant_on():
+        return None
+    out: dict = {"via": via, "sent": 0}
+    try:
+        d = store.last_price_date()
+        d = str(d)[:10] if d else None
+        cands, info = _dnews.instant_candidates(store, d)
+        out.update(info)
+        tickers = []
+        for r in cands:
+            quote = _dnews.fetch_now(r["ticker"])
+            text = _dnews.instant_text(store, d, r, quote)
+            sent = _emit(text, args.dry_run)
+            if sent and not args.dry_run:
+                _dnews.record_instant(store, r, via=via, price_ok=bool(quote))
+            if sent or args.dry_run:
+                out["sent"] += 1
+                tickers.append(str(r["ticker"]))
+            else:
+                out["failed"] = out.get("failed", 0) + 1
+        if tickers:
+            out["tickers"] = tickers
+    except Exception as exc:  # noqa: BLE001 - 부가 알림
+        out["error"] = f"{type(exc).__name__}: {exc}"[:160]
+        log.exception("첫 보도 즉시 알림 실패 — 건너뜁니다: %s", exc)
+    return out
+
+
 def mode_dispute_watch(store: Store, args) -> int:
-    """[S] 장중 경영권 분쟁 첫 보도 확인 (DISPUTE_NEWS_INSTANT). **예약 등록 없음.**
+    """[S] 장중 경영권 분쟁 첫 보도 확인 (DISPUTE_NEWS_INSTANT · 평일 09:00~15:30 30분 간격).
 
     분쟁 관련 Google 검색 6개만 받아 정리하고(뉴스 표에 저장), 첫 보도를 감지한다.
-    새 첫 보도가 있으면 바로 별도 메시지 1건을 전체 수신자에게 보낸다(종목 정보다).
-    플래그가 꺼져 있거나 거래일 09:00~15:30 밖이면 아무것도 하지 않는다. 시세를 받지
-    않으므로 등락률은 싣지 않는다.
+    새 첫 보도가 있으면 바로 별도 메시지를 전체 수신자에게 보낸다(_instant_alerts).
+    플래그가 꺼져 있거나 거래일 09:00~15:30 밖이면 아무것도 하지 않는다.
+    수집·감지가 실패하면 예외로 끝난다(rc 1) — nightly 가 연속 실패를 세어 3회째에만 알린다.
     """
     from stocknews import dispute_news as _dnews
     if not _dnews.instant_on():
@@ -1357,7 +1399,7 @@ def mode_dispute_watch(store: Store, args) -> int:
     asof = now_kst()
     ok, why = should_scan_intraday(store, asof)
     t = asof.strftime("%H:%M")
-    if ok and not ("09:00" <= t <= "15:30"):
+    if ok and not ("09:00" <= t <= "15:35"):
         ok, why = False, f"장시간 밖 ({t})"
     if not ok and not args.ignore_window:
         SUMMARY.update({"skipped": True, "reason": why, "sent": 0})
@@ -1366,21 +1408,15 @@ def mode_dispute_watch(store: Store, args) -> int:
     raw = _dnews.collect_watch()
     res = process_and_store(store, raw)
     det = _dnews.detect(store)
-    d = store.last_price_date()
-    rows = _dnews.to_show(store, d) if d else []
     SUMMARY.update({"requests": len(_dnews.WATCH_QUERIES), "collected": res["collected"],
-                    "stored": res["stored"], "detect": det, "new": len(rows), "sent": 0,
-                    "work_sec": round(time.time() - t0, 1)})
-    if not rows:
-        return EXIT_OK
-    lines = [f"🔔 <b>[경영권 분쟁 첫 보도]</b> {asof:%m-%d %H:%M}",
-             *_dnews.show_lines(store, d, rows, with_returns=False),
-             "※ 기록용 알림 · 검증 중"]
-    sent = _emit("\n".join(lines), args.dry_run)
-    if sent and not args.dry_run:
-        _dnews.mark_shown(store, [int(r["id"]) for r in rows])
-    SUMMARY["sent"] = len(rows) if (sent or args.dry_run) else 0
-    SUMMARY["tickers"] = [str(r["ticker"]) for r in rows]
+                    "stored": res["stored"], "detect": det, "sent": 0})
+    ins = _instant_alerts(store, args, "watch") or {}
+    SUMMARY["instant"] = ins
+    SUMMARY["sent"] = ins.get("sent", 0)
+    SUMMARY["tickers"] = ins.get("tickers", [])
+    SUMMARY["work_sec"] = round(time.time() - t0, 1)
+    if ins.get("error"):
+        raise RuntimeError(f"즉시 알림 실패: {ins['error']}")
     return EXIT_OK
 
 
@@ -1570,8 +1606,8 @@ def _brief_evening_v2(store, args) -> int:
             store, d, info["new_tickers"], paper.KIND_NEW)
     _daily_reco_line(store, args, d, info, brief_sent=sent)
     if info.get("new_rows"):
-        rows = pd.DataFrame(info["new_rows"])
-        rows["rank"] = range(1, len(rows) + 1)      # ① 의 번호와 같게
+        from stocknews.chart import brief_rows
+        rows = brief_rows(info["new_rows"])         # rank = ① 의 번호 (【최종 추천】 과 같은 입력)
         _send_charts(store, args, d, rows=rows, key="new_charts", prefix="N")
     if show_watch:
         _send_watch_charts(store, args)
@@ -1627,7 +1663,7 @@ def _daily_reco_line(store, args, d: str, info: dict, brief_sent=None) -> None:
             _after(info["reco_line"].get("signals"), brief_sent)
         return
     try:
-        lines, rinfo = paper_render.reco_line_block(store, d)
+        lines, rinfo = paper_render.reco_line_block(store, d, chart_rows=info.get("new_rows"))
         text = "\n".join(lines)
         sig = rinfo.get("signals")
         msgs = (sig or {}).get("messages") or [text]

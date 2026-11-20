@@ -96,7 +96,7 @@ def run(check, near, tmp):
             assert getattr(C, f) is False and C.ENV_OVERRIDE_FLAGS[f] is bool and f in KNOWN_KEYS, f
         assert not DN.enabled() and DN.maybe_detect(st) is None
         assert (C.DISPUTE_NOTE_YEARS, C.DISPUTE_NOTE_MEAN_PCT, C.DISPUTE_NOTE_UP_OF_10) == (8, -3, 3)
-        assert G._dispute_note() == "(과거 8년: 공시 뒤 20일 평균 −3%, 10번 중 3번 오름)"
+        assert G._dispute_note() == "(과거 8년: 공시 뒤 20일 평균 −3% · 숫자는 수익률 %)"
         assert "dispute-watch" in RS.MODES and "dispute-watch" in RS._WRITE_MODES
         assert "dispute-watch" in MODE_TIMEOUTS
         import nightly
@@ -213,14 +213,15 @@ def run(check, near, tmp):
         title = l4.split('">')[1].split("</a>")[0]
         assert 30 <= len(title) <= 40 and title.endswith("…"), (len(title), title)
         at = datetime.fromisoformat(d + "T21:40:00") - timedelta(hours=3)
-        assert f'</a>" {at:%m-%d %H:%M} · 오늘 +' in l4 and " · 20일 +" in l4, l4
-        assert "<a " not in lines[1] or True
+        assert f'</a>" {at:%m-%d %H:%M} · 오늘 +' in l4 and "20일" not in l4, l4
+        assert lines[1].startswith(" 1일 +") and " · 3일 " in lines[1] and " · 10일 " in lines[1]
+        assert len(lines) == 4 and "<a " in lines[2] and lines[3].startswith(" 1일 ")   # 종목마다 두 줄
         k = full.index("【경영권 분쟁 첫 보도 2】")
         assert full[0] == f"━━ 오늘 기록된 추천 (기준일 {d[5:]}) ━━" and full[1] == "【점수 2】"
         assert full[2] == (f"{stock_label(names['820004'], '820004')} 🔔분쟁 보도 · "
                            f"{stock_label(names['820005'], '820005')} 🔔분쟁 보도"), full[2]
         assert full[3] == "【눌림목 0】" and full[4] == "없음" and k == 5
-        assert full[k + 1] == lines[0] and full[k + 2] == lines[1] and full[-1] == R.RECO_LINE_NOTE
+        assert full[k + 1:k + 5] == lines and full[-1] == R.RECO_LINE_NOTE
         assert "【경영권 분쟁 공시" not in "\n".join(full)                       # 최근 5거래일 공시 없음 → 줄 생략
         assert info["signals"]["news"] == ["820004", "820005"] and len(info["signals"]["news_ids"]) == 2
         text = "\n".join(full)
@@ -229,8 +230,8 @@ def run(check, near, tmp):
         assert off[:2] == full[:2] and "news" not in ioff["signals"]
         # 가격이 없는 날이면 등락률 항목만 빠진다
         nop = DN.show_lines(st, "2030-01-02", rows)
-        assert "오늘" not in nop[0] and "20일" not in nop[0] and nop[0].endswith(f"{at:%m-%d %H:%M}")
-    check(S, "표시: 제목 40자·링크·시각·등락률 · 순서 · 🔔 표시 · OFF 면 줄 없음 · 등락률 없으면 생략",
+        assert nop[0].endswith(f"{at:%m-%d %H:%M} · 오늘 -") and nop[1] == " 1일 - · 3일 - · 5일 - · 10일 -"
+    check(S, "표시: 제목 40자·링크·시각·등락률 · 두 줄 · 순서 · 🔔 표시 · OFF 면 줄 없음 · 못 구하면 '-'",
           show_and_message)
 
     def shown_once():
@@ -454,9 +455,6 @@ def run(check, near, tmp):
             assert RS.mode_dispute_watch(st, types.SimpleNamespace(dry_run=False, ignore_window=False)) == 0
             assert RS.SUMMARY["skipped"] is True and RS.SUMMARY["reason"] == "주말 휴장" and not sent
             RS.SUMMARY.clear()
-            with closing(sqlite3.connect(st.path)) as con:      # 아직 표시하지 않은 첫 보도 하나를 둔다
-                con.execute("UPDATE sig_dispute_news SET shown=0, shown_at=NULL WHERE first_news_id='n12'")
-                con.commit()
             assert RS.mode_dispute_watch(st, types.SimpleNamespace(dry_run=False, ignore_window=True)) == 0
             summ = dict(RS.SUMMARY)
         finally:
@@ -464,11 +462,10 @@ def run(check, near, tmp):
             RS.SUMMARY.clear()
             _back(snap)
         assert summ["requests"] == len(DN.WATCH_QUERIES) == summ["collected"] == 6
-        assert len(sent) == 1 and sent[0].startswith("🔔 <b>[경영권 분쟁 첫 보도]</b>")
-        assert "오늘 " not in sent[0] and "매수" not in sent[0].replace("공개매수", "")
-        assert summ["sent"] >= 1 and DN.to_show(st, d) == [] or True
-        assert _q("SELECT shown FROM sig_dispute_news WHERE first_news_id='n12'")[0]["shown"] == 1
-    check(S, "장중 확인 잡: 창 밖이면 건너뜀 · 검색 6개 · 새 첫 보도만 별도 메시지 · 표시 기록", instant_job)
+        # 켠 뒤 첫 회차: 기준 시각만 적고 과거분은 보내지 않는다(형식·한 번만·상한은 s99_zzpicks 에서 본다)
+        assert summ["instant"].get("since_set") is True and summ["sent"] == 0 and not sent
+        assert _q("SELECT v FROM sig_meta WHERE k='instant_since'")
+    check(S, "장중 확인 잡: 창 밖이면 건너뜀 · 검색 6개 · 켠 뒤 첫 회차는 과거분을 보내지 않음", instant_job)
 
     def watch_fetch():
         urls = []

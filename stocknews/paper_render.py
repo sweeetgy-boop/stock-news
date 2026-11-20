@@ -279,7 +279,7 @@ def recorded_recos(store, d: str) -> list[dict]:
                 for r in cur.fetchall()]
 
 
-def reco_line_block(store, d: str) -> tuple[list[str], dict]:
+def reco_line_block(store, d: str, chart_rows=None) -> tuple[list[str], dict]:
     """"오늘 기록된 추천 10" — 제목 · 한 문단 · 안내 한 줄.
 
     그날 recos 에 기록된 전 종목을 순위순으로 "종목명(종목코드)" 를 가운뎃점으로
@@ -295,7 +295,8 @@ def reco_line_block(store, d: str) -> tuple[list[str], dict]:
     from . import signals as S
     if S.any_on():
         try:
-            lines, sinfo = S.reco_block(store, d, rows, note=RECO_LINE_NOTE)
+            lines, sinfo = S.reco_block(store, d, rows, note=RECO_LINE_NOTE,
+                                        chart_rows=chart_rows)
         except Exception as exc:  # noqa: BLE001 - 신호 기능이 통째로 실패해도 【점수】 는 나간다
             log.exception("신호 표시 전체 실패 — 【점수】 만 싣습니다: %s", exc)
             lines = [f"━━ 오늘 기록된 추천 (기준일 {d[5:]}) ━━", f"【점수 {len(rows)}】",
@@ -457,7 +458,7 @@ def weekday_block(store, d: str, *, paper_on: bool | None = None,
     sec0: list[str] = []
     rinfo = None
     if reco_line:
-        sec0, rinfo = reco_line_block(store, d)
+        sec0, rinfo = reco_line_block(store, d, chart_rows=new)
         rinfo["len"] = len("\n".join(sec0))
     try:
         ex = v2_hooks.exclusion_line(store, d)
