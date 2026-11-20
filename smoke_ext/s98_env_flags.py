@@ -35,6 +35,9 @@ def run(check, near, tmp):
             v = getattr(C, n)
             assert isinstance(v, typ), (n, v)
             # 기본값이 OFF 여야 개발 클론·스모크가 플래그 없이 기존 출력을 낸다.
+            if typ is str:      # 선택형: 첫 값이 OFF
+                assert v == C.ENV_FLAG_CHOICES[n][0] == "off", (n, v)
+                continue
             assert v in (False, 0), f"{n} 기본값이 OFF 가 아니다: {v!r}"
     check(S, "목록 = KNOWN_KEYS 부분집합 · 기본값 전부 OFF", defaults_off)
 

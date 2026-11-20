@@ -924,6 +924,19 @@ PAPER_ALT_STOP_MAX_PCT = 15.0
 PAPER_ALT_MA_CONFIRM_DAYS = 2
 PAPER_ALT_TRAIL_PCT = 15.0
 PAPER_ALT_TRAIL_ARM_PCT = 10.0
+# [F] 평일 저녁 브리핑 "오늘 기록된 추천 10" 한 문단 (2026-11-20).
+#     그날 recos 에 기록된 전 종목을 순위순으로 "종목명(종목코드)" 를 가운뎃점
+#     으로 이은 한 문단. 발송 필터(시퀀스 제외 · 재추천 제한)로 ① 에서 빠진
+#     종목도 그대로 싣는다 — 기록용 목록이다. recos 는 읽기만 한다. 점수·추천
+#     선정·recos 기록·추적 편입(발송 기록)과 무관하다.
+#       "off"   넣지 않는다. 브리핑 텍스트가 지금과 바이트 단위로 같다.
+#       "all"   브리핑 안, "① 오늘 새 추천" 바로 위 — 전체 수신자.
+#       "admin" 브리핑은 그대로 두고, 관리자 채팅(TELEGRAM_CHAT_ID 첫
+#               수신자)에만 별도 메시지 1건.
+#     종목 부분(①②③④)이 있는 경로(PAPER_TRACKING 또는 DAILY_LIST_V2)에서만
+#     동작한다. 모듈: stocknews/paper_render.py (reco_line_*)
+DAILY_RECO_LINE = "off"
+DAILY_RECO_LINE_MODES = ("off", "all", "admin")
 # (DF 구역 끝)
 
 # ── [E] 위험 정보 ──
@@ -1121,6 +1134,9 @@ BRIEF_MAX_LATE_HOURS = 3
 # 운영별로 갈라 쓰지 않으려는 것이다(개발 클론 .env 에는 없으므로 OFF).
 #   bool : 1/true/yes/on -> 켬, 0/false/no/off -> 끔 (대소문자 무시)
 #   int  : 0 이상의 정수
+#   선택 : ENV_FLAG_CHOICES 에 적힌 낱말 중 하나 (대소문자 무시).
+#          0/false/no/off 는 "off". 1/true 같은 값은 받지 않는다 —
+#          누구에게 보낼지가 갈리는 플래그라 뜻이 모호한 값으로 켜지 않는다.
 # 그 밖의 값은 무시하고(기본값 유지) 보고에 남긴다 — 오타 하나로 플래그가
 # 엉뚱하게 켜지지 않게. `stocknews.env.load_env` 가 .env 적용 직후 부른다.
 # 끄려면 .env 에서 그 줄을 지우거나 0 으로 둔다.
@@ -1135,6 +1151,11 @@ ENV_OVERRIDE_FLAGS: dict[str, type] = {
     "RISK_INFO": bool,
     "NEWS_V2": bool,
     "INDICATOR_LOG": bool,
+    "DAILY_RECO_LINE": str,
+}
+# str 플래그가 받을 수 있는 값. 첫 값이 OFF 다.
+ENV_FLAG_CHOICES: dict[str, tuple[str, ...]] = {
+    "DAILY_RECO_LINE": DAILY_RECO_LINE_MODES,
 }
 _ENV_TRUE = frozenset({"1", "true", "yes", "on"})
 _ENV_FALSE = frozenset({"0", "false", "no", "off"})
@@ -1162,6 +1183,16 @@ def apply_env_flags(environ=None) -> dict:
                 val = True
             elif low in _ENV_FALSE:
                 val = False
+            else:
+                out["invalid"][name] = s
+                continue
+        elif typ is str:
+            choices = ENV_FLAG_CHOICES[name]
+            low = s.lower()
+            if low in choices:
+                val = low
+            elif low in _ENV_FALSE:
+                val = choices[0]
             else:
                 out["invalid"][name] = s
                 continue

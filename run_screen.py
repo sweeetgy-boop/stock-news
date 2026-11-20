@@ -1328,6 +1328,15 @@ def mode_brief_evening(store: Store, args) -> int:
     if _cfg.PAPER_TRACKING or _cfg.DAILY_LIST_V2:
         return _brief_evening_v2(store, args)
 
+    from stocknews import paper_render as _pr
+    if _pr.reco_line_mode() != "off":
+        # ① 이 없는 예전 경로다. 넣을 자리가 없으므로 넣지 않고 알린다.
+        log.warning("DAILY_RECO_LINE=%s 무시 — 종목 부분(①)이 있는 경로"
+                    "(PAPER_TRACKING 또는 DAILY_LIST_V2)에서만 동작합니다",
+                    _pr.reco_line_mode())
+        SUMMARY["reco_line"] = {"mode": _pr.reco_line_mode(),
+                                "skipped": "no_stock_block"}
+
     picks = None
     foot = None
     rec = store.reco_history(days=1)
@@ -1458,6 +1467,7 @@ def _brief_evening_v2(store, args) -> int:
     if sent and info.get("new_tickers"):
         SUMMARY["sends_recorded"] = paper.record_sends(
             store, d, info["new_tickers"], paper.KIND_NEW)
+    _daily_reco_line(store, args, d, info)
     if info.get("new_rows"):
         rows = pd.DataFrame(info["new_rows"])
         rows["rank"] = range(1, len(rows) + 1)      # ① 의 번호와 같게
@@ -1465,6 +1475,35 @@ def _brief_evening_v2(store, args) -> int:
     if show_watch:
         _send_watch_charts(store, args)
     return EXIT_OK
+
+
+def _daily_reco_line(store, args, d: str, info: dict) -> None:
+    """DAILY_RECO_LINE — "오늘 기록된 추천 10" 한 문단의 집계와 관리자 발송.
+
+    all   : 문단은 이미 브리핑 안(① 바로 위)에 있다. 여기서는 집계만 싣는다.
+    admin : 브리핑은 그대로다. 같은 문단을 관리자 채팅에만 별도 메시지로 보낸다.
+    off   : 아무것도 하지 않는다(SUMMARY 도 그대로).
+    recos 는 읽기만 한다. 발송 기록(paper.record_sends)과 무관하다 — 이 목록에
+    실렸다고 추적에 편입되지 않는다. 실패해도 브리핑(이미 나감)에는 영향이 없다.
+    """
+    from stocknews import paper_render
+    mode = paper_render.reco_line_mode()
+    if mode == "off":
+        return
+    if mode == "all":
+        if info.get("reco_line"):
+            SUMMARY["reco_line"] = {"mode": mode, **info["reco_line"]}
+        return
+    try:
+        lines, rinfo = paper_render.reco_line_block(store, d)
+        text = "\n".join(lines)
+        SUMMARY["reco_line"] = {"mode": mode, **rinfo, "len": len(text)}
+        SUMMARY["reco_line"]["sent"] = _emit_admin(text, args.dry_run)
+    except Exception as exc:  # noqa: BLE001 - 부가 메시지다
+        SUMMARY.setdefault("reco_line", {"mode": mode})["error"] = (
+            f"{type(exc).__name__}: {exc}"[:200])
+        log.warning("기록된 추천 목록(관리자) 발송 실패 — 브리핑은 이미 "
+                    "끝났습니다 (%s)", SUMMARY["reco_line"]["error"])
 
 
 def _paper_sunday(store, args, asof, trade_d: str | None) -> int:

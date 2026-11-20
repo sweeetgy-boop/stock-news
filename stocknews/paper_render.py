@@ -9,6 +9,9 @@
                     상위 3 · 하위 3 (PAPER_TRACKING)
      PAPER_TRACKING 꺼짐 → ②③ 대신 유지 종목 "추천 유지 n일째" 한 줄씩
   ④ B 의 "오늘 제외" 한 줄 (훅이 None 이면 생략)
+  DAILY_RECO_LINE=all 이면 ① 바로 위에 "오늘 기록된 추천 10" 한 문단
+  (그날 recos 전부 · 순위순 · 발송 필터와 무관). admin 이면 이 블록에는 넣지
+  않고 run_screen 이 관리자 채팅에 따로 보낸다.
 
 문장 생성·해석·전망을 넣지 않는다. 숫자와 조건 이름만 적는다.
 """
@@ -29,7 +32,8 @@ log = logging.getLogger(__name__)
 
 __all__ = ["weekday_enabled", "contributions", "reasons_for", "slot_perf",
            "weekday_block", "sunday_scorecard", "curve_chart",
-           "weekly_shadow_block", "sunday_detail", "TEXT_LIMIT", "SEND_LIMIT"]
+           "weekly_shadow_block", "sunday_detail", "TEXT_LIMIT", "SEND_LIMIT",
+           "reco_line_mode", "recorded_recos", "reco_line_block"]
 
 TEXT_LIMIT = 4096
 # 실제로 한 메시지에 담는 상한. notify._split 이 이 길이를 넘으면 줄 경계에서
@@ -251,6 +255,46 @@ def slot_perf(pd_: "P.PaperData", d: str) -> dict[str, str]:
 
 
 # ══════════════════════════ 평일 블록 ══════════════════════════
+RECO_LINE_NOTE = "※ 순위순 · 기록용 목록 · 검증 중"
+RECO_LINE_EMPTY = "오늘 기록된 추천 없음"
+
+
+def reco_line_mode() -> str:
+    """DAILY_RECO_LINE 의 현재 값: "off" · "all" · "admin". 모르는 값은 "off"."""
+    m = str(getattr(C, "DAILY_RECO_LINE", "off") or "off").strip().lower()
+    return m if m in ("all", "admin") else "off"
+
+
+def recorded_recos(store, d: str) -> list[dict]:
+    """그 거래일 recos 전부 (rank 순). **읽기 전용** — 발송 필터를 거치지 않는다."""
+    import sqlite3
+    from contextlib import closing
+    with closing(sqlite3.connect(store.path, timeout=30.0)) as con:
+        cur = con.execute(
+            "SELECT rank, ticker, name FROM recos WHERE d=? ORDER BY rank",
+            (str(d)[:10],))
+        return [{"rank": int(r[0]), "ticker": str(r[1] or ""), "name": r[2]}
+                for r in cur.fetchall()]
+
+
+def reco_line_block(store, d: str) -> tuple[list[str], dict]:
+    """"오늘 기록된 추천 10" — 제목 · 한 문단 · 안내 한 줄.
+
+    그날 recos 에 기록된 전 종목을 순위순으로 "종목명(종목코드)" 를 가운뎃점으로
+    잇는다(줄바꿈·번호 없음). 시퀀스 제외·재추천 제한으로 ① 에서 빠진 종목도
+    그대로 들어간다. 제목의 수는 실제 기록 건수다. 그날 기록이 없으면
+    "오늘 기록된 추천 없음" 한 줄만 낸다.
+    """
+    d = str(d)[:10]
+    rows = recorded_recos(store, d)
+    info = {"d": d, "n": len(rows), "tickers": [r["ticker"] for r in rows]}
+    if not rows:
+        return [RECO_LINE_EMPTY], info
+    return [f"━━ 오늘 기록된 추천 {len(rows)} (기준일 {d[5:]}) ━━",
+            " · ".join(stock_label(r["name"], r["ticker"]) for r in rows),
+            RECO_LINE_NOTE], info
+
+
 def _new_section(store, d: str, rows: list[dict], perf: dict, paper_on: bool,
                  stale: str | None) -> list[str]:
     out = [f"━━ ① 오늘 새 추천 ({len(rows)}) · 기준일 {d} ━━"]
@@ -365,12 +409,15 @@ def _tracking_section(pd_, d: str, topn: int) -> tuple[list[str], dict]:
 
 
 def weekday_block(store, d: str, *, paper_on: bool | None = None,
-                  pdata=None, index=None, limit_room: int = TEXT_LIMIT
-                  ) -> tuple[str, dict]:
+                  pdata=None, index=None, limit_room: int = TEXT_LIMIT,
+                  reco_line: bool | None = None) -> tuple[str, dict]:
     """평일 저녁 종목 부분 텍스트와 부가 정보.
 
     info: new_rows(① 대상 dict), new_tickers, tracking, stale
+          reco_line(넣었을 때만: d · n · tickers · len)
     limit_room: 브리핑 나머지(뉴스)와 합쳐 4,096자를 넘으면 ③을 먼저 줄인다.
+    reco_line : ① 바로 위 "오늘 기록된 추천 10" 문단. None = DAILY_RECO_LINE
+                이 all 일 때만. 넣지 않으면 텍스트가 예전과 같다.
     """
     from . import v2_hooks
     paper_on = bool(getattr(C, "PAPER_TRACKING", False)) if paper_on is None \
@@ -389,6 +436,13 @@ def weekday_block(store, d: str, *, paper_on: bool | None = None,
     new = [r for r in rows if r.get("is_new_event")]
     perf = slot_perf(pd_, d)
     sec1 = _new_section(store, d, new, perf, paper_on, stale)
+    if reco_line is None:
+        reco_line = reco_line_mode() == "all"
+    sec0: list[str] = []
+    rinfo = None
+    if reco_line:
+        sec0, rinfo = reco_line_block(store, d)
+        rinfo["len"] = len("\n".join(sec0))
     try:
         ex = v2_hooks.exclusion_line(store, d)
     except Exception:  # noqa: BLE001
@@ -396,8 +450,10 @@ def weekday_block(store, d: str, *, paper_on: bool | None = None,
     sec4 = [f"━━ ④ 오늘 제외 ━━", f"• {_e(ex)}"] if ex else []
     info: dict = {"new_rows": new, "new_tickers": [str(r["ticker"]) for r in new],
                   "stale": stale, "rows": len(rows)}
+    if rinfo is not None:
+        info["reco_line"] = rinfo
     if not paper_on:
-        parts = [sec1, _keep_section(rows), sec4]
+        parts = [sec0, sec1, _keep_section(rows), sec4]
         text = "\n\n".join("\n".join(p) for p in parts if p)
         return text + "\n" + FOOTER_LITE, info
     sec2 = _matured_section(pd_, d)
@@ -405,7 +461,8 @@ def weekday_block(store, d: str, *, paper_on: bool | None = None,
     floor = max(0, min(topn, int(getattr(C, "PAPER_SUMMARY_MIN_TOPN", 0))))
     while True:
         sec3, tinfo = _tracking_section(pd_, d, topn)
-        text = "\n\n".join("\n".join(p) for p in (sec1, sec2, sec3, sec4) if p) \
+        text = "\n\n".join("\n".join(p)
+                           for p in (sec0, sec1, sec2, sec3, sec4) if p) \
             + "\n" + FOOTER
         if len(text) <= limit_room or topn <= floor:
             break
